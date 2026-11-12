@@ -25,7 +25,7 @@ _LIKING_JS = """
         let card = a.closest("div[class*='listing'], article, li") || a.parentElement;
         let text = card ? card.innerText : "";
         out.push({url: href, text: (text || "").slice(0, 600)});
-        if (out.length >= 24) break;
+        if (out.length >= 40) break;
     }
     return out;
 }
@@ -37,9 +37,92 @@ def _slug(city: str, state: str) -> str:
     return s
 
 
+_PRICE_TOKEN = re.compile(
+    r"\$\s*[\d,]+(?:\.\d+)?"
+    r"(?:\s*-\s*\$?\s*[\d,]+(?:\.\d+)?)?"
+    r"(?:\s*(?:/\s*(?:month|mo|year|yr)|/?\s*sf\s*/\s*(?:year|yr|month|mo)"
+    r"|per\s+month|per\s+year))?",
+    re.I)
+
+
+# "Rental Rate: $6.84 SF/YR" / "Lease Rate - $21.00" 这类带标签的字段最可信
+_PRICE_LABEL_RE = re.compile(
+    r"(?:rental\s+rate|lease\s+rate|asking\s+rate|\brate\b|\brent\b)\s*[:\-]\s*([^\n]{0,40})",
+    re.I)
+# 金额后面跟着这些词，说明不是租金而是描述文本/体量数字
+_PRICE_BAD_TAIL = re.compile(
+    r"^\s*(?:\.\d+\s*)?(?:billion|million|bill\b|thousand|per\s+hour|hour|considera|"
+    r"redevelop|[MBKmbk]\b)", re.I)
+
+
+def _pick_price(text: str) -> str:
+    """从一段文本里挑第一个「像租金」的金额，跳过描述性数字。"""
+    for m in _PRICE_TOKEN.finditer(text or ""):
+        tail = (text or "")[m.end():m.end() + 20]
+        if _PRICE_BAD_TAIL.match(tail):
+            continue
+        return re.sub(r"\s+", " ", m.group(0)).strip()
+    return ""
+
+
 def _parse_price(text: str) -> str:
-    m = re.search(r"(\$[\d,]+(\.\d+)?\s*(/mo|/month|/yr|/SF/YR|SF/YR)?[^\n]{0,20})", text, re.I)
-    return m.group(1).strip() if m else ""
+    """抓价格文案：优先读 "Rental Rate / Lease Rate / Rate / Rent" 后的金额，
+    否则取第一个非描述性的「金额 + 单位」。
+
+    排除的坑（都是实测踩到的）：
+      - "$1.5 billion in considera..."、"$30M redevelopment"（描述里的体量数字）
+      - "$85 per hour."（不是租金）
+      - "$91,572\\t\\nWarehouse Employees"（旧正则 \\s* 跨行把标题吞进来）
+    """
+    text = text or ""
+    for m in _PRICE_LABEL_RE.finditer(text):
+        token = _pick_price(m.group(1))
+        if token:
+            return token
+    return _pick_price(text)
+
+
+def monthly_price(price_text: str, area: str = "") -> float | None:
+    """把 LoopNet 价格文案换算成「每月总租金」，用于价格区间硬约束。
+
+    LoopNet 出租房源价格有几种口径：
+      - $X /SF/YR（每平方英尺每年）→ X × 面积 ÷ 12
+      - $X /YR（每年总价）→ X ÷ 12
+      - $X /MO 或无单位 → 原值
+    返回 None 表示无法判断（不参与区间过滤）。"""
+    m = re.search(r"\$\s*([\d,]+(?:\.\d+)?)", price_text or "")
+    if not m:
+        return None
+    try:
+        val = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    low = (price_text or "").lower()
+    try:
+        area_n = float(re.sub(r"[^\d.]", "", str(area))) if area else 0.0
+    except ValueError:
+        area_n = 0.0
+    # 每平方英尺口径：必须结合面积才能得到「该房源总月租」
+    #   总月租 = 每英尺价格 × 面积 ÷ 12（$/SF/YR）
+    #   总月租 = 每英尺价格 × 面积      （$/SF/MO）
+    if re.search(r"sf\s*/\s*mo", low):
+        return val * area_n if area_n else None
+    if re.search(r"sf\s*/\s*yr", low):
+        return val * area_n / 12 if area_n else None
+    # "$6 per rentable square" / "$30 per square foot" 同样是每英尺单价（LoopNet 惯例按年）
+    if re.search(r"(?:per|/)\s*(?:rentable\s+)?(?:square(?:\s*(?:foot|feet))?|sq\.?\s*ft|sf)\b", low):
+        return val * area_n / 12 if area_n else None
+    if re.search(r"/\s*sf\b", low):          # 只写 $/SF（LoopNet 惯例是每年）
+        return val * area_n / 12 if area_n else None
+    if "/yr" in low or "per year" in low or "annual" in low:
+        return val / 12
+    if "/mo" in low or "per month" in low or "monthly" in low:
+        return val
+    if val < 100:
+        # "$6" 这种没单位的小数字，几乎都是被截断的 $/SF/YR 单价，
+        # 当成"月租 $6"会把超预算房源放进来 → 判为无法判断，转人工
+        return None
+    return val
 
 
 def _parse_address(text: str, city: str, state: str) -> str:
@@ -55,13 +138,70 @@ def _parse_address(text: str, city: str, state: str) -> str:
     return ""
 
 
+_AREA_UNIT = (r"(?:sq\.?\s*ft|sqft|sf|sq\s*ft|square\s*(?:feet|foot)|"
+              r"rentable\s+square\s*(?:feet|foot))")
+_AREA_RANGE_RE = re.compile(
+    rf"(?<![.\d$])(\d[\d,]*)\s*-\s*\$?\s*(\d[\d,]*)\s*{_AREA_UNIT}\b", re.I)
+# "14K SF" / "2.5k sq ft"
+_AREA_K_RE = re.compile(rf"(?<![.\d$])(\d+(?:\.\d+)?)\s*[kK]\s*{_AREA_UNIT}\b", re.I)
+# "0.5 acre" / "2.3 acres"（1 acre ≈ 43,560 SF）
+_ACRE_RE = re.compile(r"(?<![.\d$])(\d+(?:\.\d+)?)\s*(?:acres?|ac)\b", re.I)
+_SQFT_PER_ACRE = 43560
+_AREA_RE = re.compile(rf"(?<![.\d$])(\d[\d,]*)\s*{_AREA_UNIT}\b", re.I)
+# 紧跟在数字后的 "/YR"、"SF/YR"、"/MO" 是单价单位，不是面积
+_PRICE_SUFFIX_RE = re.compile(r"\s*/\s*(?:sf\s*/?\s*)?(?:yr|year|mo|month)\b", re.I)
+# 带标签的面积字段最可信："Available Space: 14,000 SF" / "Building Size - 2.5 acres"
+_AREA_LABEL_RE = re.compile(
+    r"(?:available\s+space|available\s+sf|total\s+space|building\s+size|"
+    r"rentable\s+(?:area|space)|\bsize\b)\s*[:\-]?\s*([^\n]{0,30})", re.I)
+
+
 def _parse_area(text: str) -> str:
-    r"""面积（SF）：匹配 "1,234 SF" / "678 SqFt" / "1200 sq ft" 等。
-    注意 (?<![.\d])：排除 "$20.40 SF/YR"（单价里的 40 SF）这种误匹配。"""
-    m = re.search(r"(?<![.\d])(\d[\d,]*)\s*(?:sq\.?\s*ft|sqft|sf|sq\s*ft)\b", text, re.I)
-    if not m:
-        return ""
-    return m.group(1).replace(",", "").rstrip(".")
+    r"""面积（SF）：从网站文案里抓 "1,234 SF" / "678 SqFt" / "1200 sq ft"。
+
+    重要：这是**网页文本解析**，不是 AI 估算。单价 "$42 SF/YR" 里的 42 必须排除，
+    否则 42 会被当成 42 SF 面积，进而把月租算成 42×42/12≈$147，让超预算房源混进来。
+    区间 "3,000 - 5,000 SF" 取上限（宁可按大面积算租金，避免低估）。"""
+    # 带标签的字段最可信："Available Space: 14,000 SF" / "Building Size - 2.5 acres"
+    for lab in _AREA_LABEL_RE.finditer(text or ""):
+        val = _parse_area_plain(lab.group(1))
+        if val:
+            return val
+    return _parse_area_plain(text)
+
+
+def _parse_area_plain(text: str) -> str:
+    """不带标签的面积解析（被 _parse_area 复用）。"""
+    m = _AREA_RANGE_RE.search(text or "")
+    if m:
+        a, b = m.group(1).replace(",", ""), m.group(2).replace(",", "")
+        try:
+            return str(max(int(a), int(b)))
+        except ValueError:
+            pass
+    # "14K SF" → 14000
+    m = _AREA_K_RE.search(text or "")
+    if m:
+        try:
+            return str(int(round(float(m.group(1)) * 1000)))
+        except ValueError:
+            pass
+    for m in _AREA_RE.finditer(text or ""):
+        head = (text or "")[max(0, m.start() - 2):m.start()]
+        tail = (text or "")[m.end():m.end() + 14]
+        if head.rstrip().endswith("$"):        # "$42 SF"
+            continue
+        if _PRICE_SUFFIX_RE.match(tail):       # "42 SF/YR"、"42 SF/MO"
+            continue
+        return m.group(1).replace(",", "").rstrip(".")
+    # "0.5 acre" → 21780 SF（只在地块面积语境里出现，放最后兜底）
+    m = _ACRE_RE.search(text or "")
+    if m:
+        try:
+            return str(int(round(float(m.group(1)) * _SQFT_PER_ACRE)))
+        except ValueError:
+            pass
+    return ""
 
 
 def _parse_phone(text: str) -> str:
@@ -108,6 +248,9 @@ def _detail_candidate(page, url: str, city: str = "", state: str = "") -> dict:
 
 
 _BLOCK_KEYWORDS = ("are you a robot", "access denied", "unusual traffic", "captcha")
+# 页码越界时 LoopNet 的 404 文案
+_NOT_FOUND_KEYWORDS = ("we can't find what you're looking for", "might have been moved",
+                       "page not found")
 
 
 def _warmup(page) -> None:
@@ -188,6 +331,29 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
                                "（SOP：Clash Verge → 系统代理 → 凤凰城）后重试；"
                                "或在界面粘房源链接走手动兜底",
                     "candidates": [], "screenshot": search_shot or "", "total_pages": 0}
+        # 第 1 页 404 先重试一次：Akamai 抖一下也会返回 404，
+        # 只有连试两次都 404 才能判定"这个搜索地区不存在"
+        if page_no == 1 and any(k in body for k in _NOT_FOUND_KEYWORDS):
+            page.wait_for_timeout(2000)
+            _warmup(page)
+            browser.goto_retry(page, url, timeout=45000, wait=6000, retries=1)
+            search_shot = browser.shot(page, f"{tag}_loopnet_retry") or search_shot
+            body = page.evaluate("() => document.body.innerText").lower()
+        # 页码超出真实总页数时 LoopNet 返回 404 页（"we can't find what you're
+        # looking for"）：明确告知上层，避免把 404 当成"本页没有候选"继续抽。
+        if any(k in body for k in _NOT_FOUND_KEYWORDS):
+            # 第 1 页就 404 = 这个搜索地区本身不存在（LoopNet 只支持城市级，
+            # 实测 "ALASKA, AK" / "alaska" 都是 404，"anchorage-ak" 才有结果）
+            if page_no == 1:
+                return {"status": "fail",
+                        "message": f"LoopNet 找不到 {city}, {state} 的搜索结果：只支持城市级搜索，"
+                                   f"请填具体城市（如 Anchorage），不要填州名/地区名",
+                        "candidates": [], "screenshot": search_shot or "",
+                        "total_pages": 0, "not_found": True}
+            return {"status": "warn",
+                    "message": f"LoopNet 第 {page_no} 页不存在（已超出真实总页数）",
+                    "candidates": [], "screenshot": search_shot or "",
+                    "total_pages": max(page_no - 1, 0), "not_found": True}
         cards = page.evaluate(_LIKING_JS) or []
         total_pages = _parse_total_pages(page) if cards else 0
     except Exception as e:
@@ -251,9 +417,47 @@ def candidates_from_urls(urls: list) -> dict:
             "candidates": candidates, "screenshot": shot or ""}
 
 
+_SPACES_JS = r"""
+() => {
+    const out = [];
+    for (const tr of document.querySelectorAll("table tr")) {
+        const cells = [...tr.children].map(td => (td.innerText || "").trim());
+        if (cells.length < 3) continue;
+        const joined = cells.join(" ");
+        if (/^space/i.test(cells[0]) && /size/i.test(joined)) continue;   // 表头
+        const sizeIdx = cells.findIndex(c => /^[\d,.]+\s*(SF|sq\.?\s*ft|sqft)/i.test(c));
+        const rateIdx = cells.findIndex(c => /^\$/.test(c));
+        if (sizeIdx < 0 || rateIdx < 0) continue;
+        out.push({name: cells[0], size: cells[sizeIdx], rate: cells[rateIdx]});
+        if (out.length >= 20) break;
+    }
+    return out;
+}
+"""
+
+
+def _parse_spaces(page) -> list:
+    """详情页「可用套间/空间」表：每行 = 套间名 + 面积 + 单价。
+    例：["3rd Floor, Ste 302", "Office", "384 SF", "$28.00 /SF/YR", ...]
+        ["33rd Floor, Ste 3320", "Office", "200 SF", "--", "$1,750 /MO", ...]"""
+    try:
+        rows = page.evaluate(_SPACES_JS) or []
+    except Exception:
+        return []
+    spaces = []
+    for r in rows:
+        size = _parse_area(r.get("size", ""))
+        rate = _parse_price(r.get("rate", ""))
+        if not size or not rate:
+            continue
+        spaces.append({"name": r.get("name", ""), "size": size, "rate": rate,
+                       "monthly": monthly_price(rate, size)})
+    return spaces
+
+
 def fetch_broker_info(listing_url: str) -> dict:
-    """详情页补抓 价格/经纪人/电话/邮箱/面积（含 JSON-LD 与 mailto）。"""
-    info = {"price": "", "agent": "", "phone": "", "email": "", "area": ""}
+    """详情页补抓 价格/经纪人/电话/邮箱/面积 + 各套间面积与单价（spaces）。"""
+    info = {"price": "", "agent": "", "phone": "", "email": "", "area": "", "spaces": []}
     if not listing_url:
         return info
     page = browser.new_page()
@@ -264,6 +468,7 @@ def fetch_broker_info(listing_url: str) -> dict:
         info["agent"] = _parse_broker(text)
         info["phone"] = _parse_phone(text)
         info["area"] = _parse_area(text)
+        info["spaces"] = _parse_spaces(page)   # 逐套间的面积/单价，价格判定必须用它
         # JSON-LD 里的经纪人信息
         try:
             lds = page.evaluate(

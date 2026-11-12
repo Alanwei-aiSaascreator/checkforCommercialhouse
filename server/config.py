@@ -13,10 +13,12 @@ SHOTS_DIR.mkdir(parents=True, exist_ok=True)
 # 可选代理（httpx / Playwright 共用）；留空不用代理
 PROXY_URL = os.environ.get("PROXY_URL", "")
 
-# Smarty（US Street Address API）免费额度：每天 100 次查询
+# Smarty（US Street Address API）
+# 本地日限额默认放开（不再卡 100/天，按用户要求"不设额度限制、一直跑到目标数"）；
+# 真实余量由 Smarty 账户决定，套餐用尽时 API 返回 402，程序会识别并提示。
 SMARTY_AUTH_ID = os.environ.get("SMARTY_AUTH_ID", "")
 SMARTY_AUTH_TOKEN = os.environ.get("SMARTY_AUTH_TOKEN", "")
-SMARTY_DAILY_LIMIT = int(os.environ.get("SMARTY_DAILY_LIMIT", "100"))
+SMARTY_DAILY_LIMIT = int(os.environ.get("SMARTY_DAILY_LIMIT", "1000000"))
 
 # DeepSeek 视觉模型（OpenAI 兼容接口）
 # 注意：实测 deepseek-v4-pro 不支持图像（返回 [Unsupported Image]），
@@ -28,10 +30,9 @@ DEEPSEEK_VISION_MODEL = os.environ.get("DEEPSEEK_VISION_MODEL", "deepseek-flash"
 # OpenCorporates 查重阈值：同址注册公司数 ≤ 5 视为通过
 OPENCORPORATES_LIMIT = int(os.environ.get("OPENCORPORATES_LIMIT", "5"))
 
-# LoopNet 翻页策略：顺序翻页总撞在历史核查过的前几页（整页已收录地址），
-# 改为「假定总页数池里随机抽页」——默认 100 页里每轮随机抽 10 页。
-LOOPNET_PAGE_POOL = int(os.environ.get("LOOPNET_PAGE_POOL", "100"))
-LOOPNET_MAX_PAGES = int(os.environ.get("LOOPNET_MAX_PAGES", "10"))
+# LoopNet 翻页策略：不再限制页数——先探出该搜索条件的真实总页数，
+# 再把「所有未检查过的页」打乱顺序全部遍历（跨任务记住已查页码）。
+# （旧的 LOOPNET_PAGE_POOL / LOOPNET_MAX_PAGES 已废弃）
 
 
 def _load_config_json() -> None:

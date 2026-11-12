@@ -153,8 +153,8 @@
       </div>
       <div style="overflow-x:auto">
         <table>
-          <thead><tr><th>时间</th><th>地址</th><th>价格</th><th>面积(SF)</th><th>四步结果</th><th>结论</th><th>截图</th><th>操作</th></tr></thead>
-          <tbody id="recordsBody"><tr><td colspan="8" class="empty">加载中...</td></tr></tbody>
+          <thead><tr><th>时间</th><th>地址</th><th>电话</th><th>价格</th><th>面积(SF)</th><th>四步结果</th><th>结论</th><th>截图</th><th>操作</th></tr></thead>
+          <tbody id="recordsBody"><tr><td colspan="9" class="empty">加载中...</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -249,6 +249,11 @@ $("#startBtn").onclick = async () => {
     target: +$("#target").value || 3, listing_urls: $("#listingUrls").value.trim(),
   };
   if (!body.city || !body.state) return alert("请填写城市和州缩写");
+  // LoopNet 只支持城市级搜索：填州名/地区名（如 ALASKA）会直接 404
+  const US_STATES = "ALABAMA ALASKA ARIZONA ARKANSAS CALIFORNIA COLORADO CONNECTICUT DELAWARE FLORIDA GEORGIA HAWAII IDAHO ILLINOIS INDIANA IOWA KANSAS KENTUCKY LOUISIANA MAINE MARYLAND MASSACHUSETTS MICHIGAN MINNESOTA MISSISSIPPI MISSOURI MONTANA NEBRASKA NEVADA NEWHAMPSHIRE NEWJERSEY NEWMEXICO NEWYORK NORTHCAROLINA NORTHDAKOTA OHIO OKLAHOMA OREGON PENNSYLVANIA RHODEISLAND SOUTHCAROLINA SOUTHDAKOTA TENNESSEE TEXAS UTAH VERMONT VIRGINIA WASHINGTON WESTVIRGINIA WISCONSIN WYOMING".split(" ");
+  if (US_STATES.includes(body.city.toUpperCase().replace(/[\s_-]/g, ""))) {
+    return alert(`「${body.city}」是州名，LoopNet 只支持城市级搜索。\n请填具体城市（如 Anchorage），州缩写填 ${body.state}。`);
+  }
   const r = await fetch("/api/tasks", {method: "POST", headers: {"Content-Type": "application/json"},
                                        body: JSON.stringify(body)});
   if (!r.ok) return alert((await r.json()).detail || "启动失败");
@@ -317,7 +322,7 @@ async function loadRecords() {
   if (cf) qs.set("conclusion", cf);
   const recs = await (await fetch("/api/records?" + qs.toString())).json();
   const tb = $("#recordsBody");
-  if (!recs.length) { tb.innerHTML = `<tr><td colspan="8" class="empty">暂无记录</td></tr>`; return; }
+  if (!recs.length) { tb.innerHTML = `<tr><td colspan="9" class="empty">暂无记录</td></tr>`; return; }
   tb.innerHTML = recs.map(r => {
     const badge = r.conclusion === "通过" ? "badge-pass" : r.conclusion === "不通过" ? "badge-fail" : "badge-pending";
     // 只展示三类：双绿验证卡 / LoopNet 房源图 / 查重截图（街景图入档但不在此展示）
@@ -333,7 +338,8 @@ async function loadRecords() {
     return `<tr>
       <td style="white-space:nowrap">${esc((r.created_at || "").replace("T", " "))}</td>
       <td class="addr"><a href="${esc(r.listing_url)}" target="_blank" rel="noopener">${esc(r.address)}</a>
-        ${r.agent ? `<div class="steps">${esc(r.agent)}${r.phone ? " · " + esc(r.phone) : ""}${r.email ? " · " + esc(r.email) : ""}</div>` : ""}</td>
+        ${r.agent ? `<div class="steps">${esc(r.agent)}${r.email ? " · " + esc(r.email) : ""}</div>` : ""}</td>
+      <td style="white-space:nowrap">${esc(r.phone || "—")}</td>
       <td style="white-space:nowrap">${esc(r.price || "—")}</td>
       <td style="white-space:nowrap">${esc(r.area || "—")}</td>
       <td class="steps">${esc(r.step1 || "")}<br>${esc(r.step2 || "")}<br>${esc(r.step3 || "")}<br>${esc(r.step4 || "")}</td>

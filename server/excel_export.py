@@ -24,6 +24,21 @@ _IMG_W = 150  # 内嵌图显示宽度（像素）
 _ROW_H = 100  # 截图行高（像素换算 pt：px * 0.75）
 
 
+def _price_display(price: str, area: str) -> str:
+    """价格列直接写「该套间/该房源一个月多少钱」。
+    挂牌价常见 $16.00 SF/YR 这种每英尺单价，甲方看不懂；
+    按 面积 × 每英尺单价 ÷ 12 折成月租显示（算不出则保留原文）。"""
+    try:
+        from .steps.loopnet import monthly_price
+
+        monthly = monthly_price(price, area)
+    except Exception:
+        monthly = None
+    if monthly is None:
+        return price or ""
+    return f"${monthly:,.0f}/月"
+
+
 def _classify_shots(screenshots: list) -> tuple:
     """把记录的截图列表归到 smarty / 街景 / 查重 三类（各取第一张）。"""
     s_shot = sv_shot = oc_shot = ""
@@ -85,7 +100,7 @@ def export_records(records: list, sheet_name: str = "核查通过记录",
             "",                      # 编码（内部编码，留空由人工补）
             i,                       # 序号
             r.get("address", ""),
-            r.get("price", ""),
+            _price_display(r.get("price", ""), r.get("area", "")),
             r.get("area", ""),
             r.get("agent", ""),
             r.get("phone", ""),

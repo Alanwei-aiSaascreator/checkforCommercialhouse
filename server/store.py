@@ -55,6 +55,12 @@ CREATE TABLE IF NOT EXISTS failed_addresses (
     reason TEXT DEFAULT '',
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS searched_pages (
+    search_key TEXT NOT NULL,     -- city|state|价格区间
+    page INTEGER NOT NULL,
+    visited_at TEXT NOT NULL,
+    PRIMARY KEY (search_key, page)
+);
 """
 
 # 允许 update_record 更新的列
@@ -243,6 +249,46 @@ def delete_record(record_id: int) -> bool:
             con.close()
 
 
+# ---------- 已检查页记忆（同一搜索条件不重复翻同一页） ----------
+
+def page_key(city: str, state: str, price_min: int, price_max: int) -> str:
+    return f"{str(city).strip().lower()}|{str(state).strip().lower()}|{int(price_min)}-{int(price_max)}"
+
+
+def page_seen_set(key: str) -> set:
+    """该搜索条件下已经翻过的页码（跨任务持久化）。"""
+    con = _con()
+    try:
+        rows = con.execute("SELECT page FROM searched_pages WHERE search_key=?", (key,)).fetchall()
+        return {r[0] for r in rows}
+    finally:
+        con.close()
+
+
+def page_mark(key: str, page_no: int) -> None:
+    with _lock:
+        con = _con()
+        try:
+            con.execute(
+                "INSERT OR REPLACE INTO searched_pages (search_key, page, visited_at) VALUES (?,?,?)",
+                (key, int(page_no), datetime.now().isoformat(timespec="seconds")))
+            con.commit()
+        finally:
+            con.close()
+
+
+def page_reset(key: str) -> int:
+    """把该条件的翻页记录清空（所有页都查过时重置一轮）。"""
+    with _lock:
+        con = _con()
+        try:
+            cur = con.execute("DELETE FROM searched_pages WHERE search_key=?", (key,))
+            con.commit()
+            return cur.rowcount
+        finally:
+            con.close()
+
+
 # ---------- 历史清理 ----------
 
 def history_stats() -> dict:
@@ -271,6 +317,7 @@ def clear_history(include_known: bool = False, include_smarty_cache: bool = Fals
             out = {
                 "records": con.execute("DELETE FROM records").rowcount,
                 "failed": con.execute("DELETE FROM failed_addresses").rowcount,
+                "searched_pages": con.execute("DELETE FROM searched_pages").rowcount,
                 "known": 0,
                 "smarty_cache": 0,
             }
@@ -324,6 +371,19 @@ def import_known_addresses(addresses, source: str = "") -> int:
         finally:
             con.close()
     return n
+
+
+def remove_known_address(address: str) -> bool:
+    """从收录表移除单条（误收录/误通过时纠错用）。"""
+    with _lock:
+        con = _con()
+        try:
+            cur = con.execute("DELETE FROM known_addresses WHERE address_norm=?",
+                              (normalize(address),))
+            con.commit()
+            return cur.rowcount > 0
+        finally:
+            con.close()
 
 
 def list_known() -> list[dict]:

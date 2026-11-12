@@ -1,6 +1,7 @@
 """核查流水线：查重前置 → 步骤1-4 → 结论归档。"""
 import queue
 import random
+import re
 import threading
 import traceback
 from datetime import datetime
@@ -55,39 +56,58 @@ class TaskRunner:
         seen_addrs: set = set()
 
         def _auto_candidate_stream():
-            """自动搜索：先访问第 1 页探测真实总页数，再从总页数里随机抽页，
+            """自动搜索：先探出真实总页数，然后把「所有未检查过的页」打乱顺序全部遍历，
             每页先把"已收录/失败档案"的地址剔除，只产出全新候选。
 
-            为什么随机抽：顺序翻页（1/2/3...）永远落在历史核查过的前几页，
-            整页都是已收录地址 → 实际有效页数极少、目标数量跑不满（用户反馈）。
-            随机抽样把撞到旧页的概率按比例摊薄。
-            总访问页数上限 = 单轮页数 × 2，避免把整池页数扫空。
+            - 不再抽固定数量页：一次排队全部页，顺序随机（用户要求"全查但顺序随机"）
+            - 跨任务记住查过的页，下次从没查过的页里随机排在前面
+            - 一直跑到「达到目标通过数」或「所有页都跑完」为止
             """
-            per_page = max(target * 6, 12)
-            batch = max(config.LOOPNET_MAX_PAGES, 1)      # 每轮随机抽几页
-            max_visits = batch * 2                        # 单个任务总访问页数上限
+            per_page = 40                                 # LoopNet 每页 40 条，整页取满
+            skey = store.page_key(city, state, price_min, price_max)
+            seen_pages = store.page_seen_set(skey)        # 历史任务翻过的页（跨任务记忆）
             used: set = set()
             visits = 0
             total_pages = 0
-            plan = [1]                                    # 第 1 页顺带探测总页数
-            while not self.stopped and approved < target and visits < max_visits:
+            reset_done = False
+            plan: list = []
+            while not self.stopped and approved < target:
                 if not plan:
-                    pool = total_pages or max(config.LOOPNET_PAGE_POOL, 1)
-                    remaining = [p for p in range(1, pool + 1) if p not in used]
-                    if not remaining:
-                        return
-                    plan = random.sample(remaining, min(batch, len(remaining)))
-                    self.emit(f"步骤1：LoopNet 随机抽 {len(plan)} 页（共 {pool} 页）："
-                              + "、".join(f"第{p}页" for p in plan)
-                              + f"，每页上限 {per_page}")
+                    if not total_pages:
+                        # 用第 1 页探总页数（只为读分页条，不代表优先查第 1 页）
+                        plan = [1]
+                        self.emit("步骤1：先用第 1 页探测该搜索条件共有多少页...")
+                    else:
+                        remaining = [p for p in range(1, total_pages + 1)
+                                     if p not in used and p not in seen_pages]
+                        if not remaining:
+                            if reset_done:
+                                self.emit(f"LoopNet 共 {total_pages} 页已全部遍历，"
+                                          f"未再产出全新候选", "warn")
+                                return
+                            # 所有页都检查过：清空翻页记忆，再随机重跑一轮（只重置一次）
+                            reset = store.page_reset(skey)
+                            seen_pages.clear()
+                            used.clear()
+                            reset_done = True
+                            self.emit(f"该搜索条件共 {total_pages} 页都检查过了，重置翻页记录"
+                                      f"（清掉 {reset} 条），重新随机遍历", "warn")
+                            continue
+                        plan = remaining
+                        random.shuffle(plan)
+                        self.emit(f"步骤1：LoopNet 全部 {total_pages} 页按随机顺序遍历"
+                                  f"（本轮 {len(plan)} 页，已跳过检查过的 {len(seen_pages)} 页）："
+                                  + "、".join(f"第{p}页" for p in plan))
                 produced = 0
                 for page_no in list(plan):
-                    if self.stopped or approved >= target or visits >= max_visits:
+                    if self.stopped or approved >= target:
                         return
+                    if total_pages and page_no > total_pages:
+                        continue
                     used.add(page_no)
                     visits += 1
                     self.emit(f"步骤1：LoopNet 采集候选（第 {page_no}/{total_pages or '?'} 页，"
-                              f"已访问 {visits}/{max_visits}）...")
+                              f"已访问 {visits} 页）...")
                     r1 = loopnet.search_candidates(city, state, price_min, price_max,
                                                    limit=per_page, tag=f"task{self.task_id}",
                                                    page=page_no)
@@ -95,6 +115,26 @@ class TaskRunner:
                               "pass" if r1["status"] == "pass" else "warn")
                     if visits == 1 and r1["screenshot"]:
                         self.events.put({"__screenshot__": {"step": "step1", "path": r1["screenshot"]}})
+                    # 反爬拦截：后面的页同样过不去，继续抽只是空转
+                    if r1["status"] == "fail" and "拦截" in r1["message"]:
+                        self.emit("LoopNet 被反爬拦截，停止自动搜索", "error")
+                        return
+                    # 第 1 页就 404 = 搜索地区本身无效（如把州名当城市填），
+                    # 再抽 20 页只是重复 404，直接终止并给出可操作提示
+                    if r1.get("not_found") and page_no == 1:
+                        self.emit(r1["message"], "error")
+                        return
+                    # 404 页：说明抽样超出真实总页数 → 收窄页池，别再碰更高的页
+                    if r1.get("not_found"):
+                        real = int(r1.get("total_pages") or 0) or max(page_no - 1, 0)
+                        if real and (not total_pages or real < total_pages):
+                            total_pages = real
+                            self.emit(f"  实测第 {page_no} 页为 404，真实总页数收窄为 "
+                                      f"{total_pages} 页，后续只抽 1-{total_pages}", "warn")
+                        continue
+                    # 正常页（非 404）落库为「已检查」，后续任务随机跳页时直接跳过
+                    store.page_mark(skey, page_no)
+                    seen_pages.add(page_no)
                     if not total_pages and r1.get("total_pages"):
                         total_pages = int(r1["total_pages"])
                         self.emit(f"  LoopNet 该搜索条件下共 {total_pages} 页（约 40 条/页）")
@@ -122,6 +162,60 @@ class TaskRunner:
                 plan = []
                 if produced == 0 and not self.stopped and approved < target:
                     self.emit("本轮随机页均无全新候选，重新抽下一批页...", "warn")
+
+        _JUNK_PRICE = re.compile(r"\b(bill|billion|million|hour|considera|redevelop)\b", re.I)
+
+        def _price_state(cand: dict):
+            """价格硬约束三态：('pass', 月租) / ('over', 月租) / ('unknown', None)。
+
+            为什么必须自己算：LoopNet 出租房源的搜索价格过滤是 $/SF/YR 口径
+            （pr=0-2000 表示每平方英尺每年 0-2000 美元），不是月租总价。
+            一栋 14,000 SF、$6.54/SF/YR 的仓库能通过 LoopNet 过滤，
+            实际月租 ≈ $7,631，远超 $2000/月（实测踩坑：4437 Supply Ct, Austin）。
+            'unknown' = 价格没抓到 / 抓到的是描述里的金额（"...billion"/"per hour"）/
+            $/SF/YR 但面积缺失 → 无法判断是否在预算内。"""
+            price_txt = (cand.get("price") or "").strip()
+            if not price_txt or _JUNK_PRICE.search(price_txt):
+                return "unknown", None
+            monthly = loopnet.monthly_price(price_txt, cand.get("area", ""))
+            if monthly is None:
+                return "unknown", None
+            if price_min <= monthly <= price_max:
+                return "pass", monthly
+            return "over", monthly
+
+        def _suite_no(name: str) -> str:
+            """从 "3rd Floor, Ste 302A" 里取套间号 302A。"""
+            m = re.search(r"(?:ste|suite|unit)\s*\.?\s*#?\s*([A-Za-z0-9][A-Za-z0-9-]*)",
+                          name or "", re.I)
+            return m.group(1) if m else ""
+
+        def _suite_hint_addr(address: str, suite_no: str) -> str:
+            """把套间号拼进楼栋地址："1150 N State St, Chicago, IL" + 302A →
+            "1150 N State St Ste 302A, Chicago, IL"（Smarty 可直接验证）。"""
+            if not suite_no:
+                return ""
+            parts = [p.strip() for p in str(address).split(",")]
+            head = f"{parts[0]} Ste {suite_no}"
+            return head + (", " + ", ".join(parts[1:]) if len(parts) > 1 else "")
+
+        def _verify_suites(addrs, record_id: int, shots: list):
+            """逐一验证套间地址，命中双绿即返回该地址；额度耗尽则终止任务。"""
+            for s_addr in addrs or []:
+                if self.stopped:
+                    return None
+                self.emit(f"  验证 {s_addr}")
+                r = smarty.verify_address(s_addr, tag=f"r{record_id}")
+                shots.append(r.get("screenshot", ""))
+                if r["status"] == "quota":
+                    self.emit(r["message"], "error")
+                    self.stopped = True
+                    return None
+                if r["status"] == "pass":
+                    self.emit(f"  ✓ Suite 地址双绿通过：{s_addr}", "pass")
+                    return s_addr
+                self.emit(f"  ✗ {r['message'][:60]}")
+            return None
 
         if manual_urls:
             self.emit(f"检测到 {len(manual_urls)} 条手动房源链接，跳过自动搜索（反爬兜底模式）...")
@@ -155,6 +249,15 @@ class TaskRunner:
                 self.emit(f"命中失败档案（{f_reason[:60]}），快速跳过 → {addr}", "warn")
                 continue
 
+            # 价格粗判：卡片上的面积常是「整栋/整层可租面积」，直接按它折算会把
+            # 预算内的小套间误杀（实测 1150 N State：整层 1,440 SF × $30 = $3,600，
+            # 但 Ste 302A 336 SF × $28 ≈ $784 完全在预算内）。
+            # 因此只要粗判不通过，就必须进详情页看「套间表」再定。
+            pstate, pmonthly = _price_state(cand)
+            need_detail = (not cand.get("agent") or not cand.get("phone")
+                           or not cand.get("email") or not cand.get("price")
+                           or not cand.get("area") or pstate != "pass")
+
             record_id = store.insert_record({
                 "address": addr, "price": cand.get("price", ""),
                 "agent": cand.get("agent", ""), "phone": cand.get("phone", ""),
@@ -164,13 +267,13 @@ class TaskRunner:
                 "screenshots": [],  # SOP：LoopNet 搜索页截图不入档
             })
             shots = []
+            spaces: list = []
 
             # SOP：价格/中介姓名/联系方式/面积都是硬性字段——搜索卡片缺哪个就去详情页补抓
-            if (not cand.get("agent") or not cand.get("phone")
-                    or not cand.get("email") or not cand.get("price")
-                    or not cand.get("area")):
-                self.emit("补抓价格/经纪人姓名/电话/邮箱/面积（详情页）...")
+            if cand.get("listing_url") and need_detail:
+                self.emit("补抓详情页（价格/经纪人/面积/套间表）...")
                 info = loopnet.fetch_broker_info(cand.get("listing_url", ""))
+                spaces = info.get("spaces") or []
                 for k in ("agent", "phone", "email", "price", "area"):
                     if info.get(k) and not cand.get(k):
                         cand[k] = info[k]
@@ -185,6 +288,56 @@ class TaskRunner:
                               f" | 面积：{cand.get('area') or '未知'} SF")
                 else:
                     self.emit("  详情页未解析到价格/经纪人信息，字段留空（自动流程继续）", "warn")
+                if spaces:
+                    self.emit("  解析到可租套间：" + "、".join(
+                        f"{s['name']} {s['size']} SF" for s in spaces[:6])
+                        + f"（共 {len(spaces)} 个）")
+
+            # 价格判定：有套间 → 按「套间月租」判断（选最小且落在预算内的那间）；
+            # 没有套间 → 才按整栋/整层面积判断
+            fitted = [(s["monthly"], s) for s in spaces
+                      if s.get("monthly") is not None
+                      and price_min <= s["monthly"] <= price_max]
+            if spaces:
+                if not fitted:
+                    priced = [s for s in spaces if s.get("monthly") is not None]
+                    if not priced:
+                        note = "套间价格无法换算成月租，需人工核对"
+                        store.update_record(record_id, conclusion="待人工", notes=note)
+                        self.emit(f"  {note} → 转人工，继续下一个", "warn")
+                        continue
+                    cheapest = min(priced, key=lambda s: s["monthly"])
+                    note = (f"所有套间均超预算：最小 {cheapest['name']} {cheapest['size']} SF "
+                            f"≈ ${cheapest['monthly']:,.0f}/月（要求 ≤${price_max}/月）")
+                    store.update_record(record_id, conclusion="不通过", notes=note)
+                    self.emit(f"  {note} → 淘汰该房源", "warn")
+                    continue
+                # 预算内取「面积最大」的那间（同样合规，空间更实用）
+                monthly, sp = max(fitted, key=lambda x: int(x[1]["size"]))
+                cand["price"], cand["area"] = sp["rate"], sp["size"]
+                cand["suite_name"] = sp["name"]
+                cand["suite_no"] = _suite_no(sp["name"])
+                store.update_record(
+                    record_id, price=f"{sp['rate']}（{sp['name']} {sp['size']} SF）",
+                    area=sp["size"],
+                    notes=f"采用套间 {sp['name']}：{sp['size']} SF × {sp['rate']} ≈ ${monthly:,.0f}/月")
+                self.emit(f"  套间 {sp['name']}：{sp['size']} SF × {sp['rate']} "
+                          f"≈ ${monthly:,.0f}/月 → 在 ${price_min}-${price_max}/月 内", "pass")
+            else:
+                pstate, pmonthly = _price_state(cand)
+                if pstate == "over":
+                    note = (f"价格超区间：{cand.get('price') or '未知'} ≈ ${pmonthly:,.0f}/月，"
+                            f"要求 ${price_min}-${price_max}/月（该房源无套间明细，按整栋算）")
+                    store.update_record(record_id, conclusion="不通过", notes=note)
+                    self.emit(f"  {note} → 淘汰该房源", "warn")
+                    continue
+                if pstate == "unknown":
+                    # 预算无法判定时不放行（否则 $/SF/YR 缺面积会算出错误月租）
+                    note = (f"价格无法判定预算：{cand.get('price') or '未抓到价格'}"
+                            f"，面积 {cand.get('area') or '未知'} SF，需人工核对是否 ≤${price_max}/月")
+                    store.update_record(record_id, conclusion="待人工", notes=note)
+                    self.emit(f"  {note} → 转人工，继续下一个", "warn")
+                    continue
 
             # 步骤1.5 办公房源预筛（SOP 补充：明显非办公房源直接不用，360 全景图优先）
             if self.stopped:
@@ -233,37 +386,41 @@ class TaskRunner:
             msg_low = r2["message"].lower()
             needs_suite = ("missing" in msg_low or "缺房间号" in r2["message"] or "n1" in msg_low)
             if r2["status"] == "fail" and needs_suite:
-                self.emit("Smarty 提示缺房间号，在 Smarty 中挖掘该楼房间号...", "warn")
-                # 房间号只从 Smarty 挖（用户要求）：官方 API（订阅后自动生效）
-                # → Smarty 官网部件（免费、不耗 API 额度）。LoopNet 不参与挖号。
-                suites = smarty.api_mine_suites(addr, max_suites=4)
-                if suites is None:
-                    self.emit("  API 未订阅房间号枚举，改用 Smarty 官网部件查询该楼合法房间号...", "warn")
-                    suites = smarty.web_mine_suites(addr, max_suites=4)
-                elif suites:
-                    self.emit(f"  Smarty API 返回 {len(suites)} 个房间号")
-                merged = list(suites or [])[:4]
-                if merged:
-                    self.emit(f"  Smarty 挖到 {len(merged)} 个房间号，逐一验证："
-                              + "、".join(s.split(" Ste ")[-1].split(",")[0] for s in merged))
+                # 优先用 LoopNet 详情页已经给出的套间号直接验证（省掉 25-40s 挖号）
+                hint = _suite_hint_addr(addr, cand.get("suite_no", ""))
+                merged: list = []
+                if hint:
+                    self.emit(f"  LoopNet 详情页已给出套间（{cand.get('suite_name')}），"
+                              f"先直接验证 {hint}", "pass")
+                    merged = [hint]
                 else:
-                    self.emit("  Smarty 未能枚举到该楼房间号 → 该地址淘汰", "warn")
-                suite_pass = None
-                for s_addr in merged:
-                    if self.stopped:
-                        break
-                    self.emit(f"  验证 {s_addr}")
-                    r2s = smarty.verify_address(s_addr, tag=f"r{record_id}")
-                    shots.append(r2s.get("screenshot", ""))
-                    if r2s["status"] == "quota":
-                        self.emit(r2s["message"], "error")
-                        self.stopped = True
-                        break
-                    if r2s["status"] == "pass":
-                        suite_pass = s_addr
-                        self.emit(f"  ✓ Suite 地址双绿通过：{s_addr}", "pass")
-                        break
-                    self.emit(f"  ✗ {r2s['message'][:60]}")
+                    self.emit("Smarty 提示缺房间号，在 Smarty 中挖掘该楼房间号...", "warn")
+                    # 房间号只从 Smarty 挖（用户要求）：官方 API（订阅后自动生效）
+                    # → Smarty 官网部件（免费、不耗 API 额度）。LoopNet 不参与挖号。
+                    suites = smarty.api_mine_suites(addr, max_suites=4)
+                    if suites is None:
+                        self.emit("  API 未订阅房间号枚举，改用 Smarty 官网部件查询该楼合法房间号...", "warn")
+                        suites = smarty.web_mine_suites(addr, max_suites=4)
+                    elif suites:
+                        self.emit(f"  Smarty API 返回 {len(suites)} 个房间号")
+                    merged = list(suites or [])[:4]
+                    if merged:
+                        self.emit(f"  Smarty 挖到 {len(merged)} 个房间号，逐一验证："
+                                  + "、".join(s.split(" Ste ")[-1].split(",")[0] for s in merged))
+                    else:
+                        self.emit("  Smarty 未能枚举到该楼房间号 → 该地址淘汰", "warn")
+                suite_pass = _verify_suites(merged, record_id, shots)
+                # 详情页给的套间没过 → 回退挖号再试（不直接淘汰）
+                if not suite_pass and hint and not self.stopped:
+                    self.emit("  该套间验证未通过，回退 Smarty 挖号再试...", "warn")
+                    suites = smarty.api_mine_suites(addr, max_suites=4)
+                    if suites is None:
+                        suites = smarty.web_mine_suites(addr, max_suites=4)
+                    extra = [s for s in (suites or []) if s != hint][:4]
+                    if extra:
+                        self.emit("  Smarty 挖到 " + "、".join(
+                            s.split(" Ste ")[-1].split(",")[0] for s in extra))
+                    suite_pass = _verify_suites(extra, record_id, shots)
                 shots = [s for s in shots if s]
                 if suite_pass:
                     addr = suite_pass
