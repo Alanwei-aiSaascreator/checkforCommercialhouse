@@ -1,0 +1,21 @@
+# 运行数据：数据库 / 截图 / Chrome 用户配置 / exports
+# 其中 data/config.json 含 Smarty、DeepSeek 密钥与代理地址，绝不能入库
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 本地日志
+*.log
+
+# 临时探针脚本
+_test_*.py
+_probe_*.py
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

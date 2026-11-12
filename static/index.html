@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>地址核查自动化</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif; background: #f3f4f6; color: #1f2937; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 20px 16px 60px; }
+
+  /* 头部 */
+  .hero { display: flex; align-items: center; gap: 14px; padding: 18px 22px; border-radius: 14px;
+          background: linear-gradient(100deg, #0e7c5a 0%, #0a5c43 70%, #084d38 100%);
+          color: #fff; box-shadow: 0 6px 18px rgba(10,92,67,.25); }
+  .hero .icon { width: 46px; height: 46px; border-radius: 12px; background: rgba(255,255,255,.16);
+                display: flex; align-items: center; justify-content: center; font-size: 26px; }
+  .hero h1 { font-size: 22px; letter-spacing: .5px; }
+  .hero p { font-size: 13px; opacity: .85; margin-top: 3px; }
+
+  /* 标签页 */
+  .tabs { display: flex; gap: 10px; margin: 18px 0; flex-wrap: wrap; }
+  .tab { border: none; cursor: pointer; padding: 10px 20px; border-radius: 10px; font-size: 14px;
+         background: #e5e7eb; color: #374151; transition: all .15s; }
+  .tab:hover { background: #d9dde3; }
+  .tab.active { background: #0b6b4f; color: #fff; font-weight: 600; }
+  .tab .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 5px; border-radius: 9px;
+                font-size: 12px; background: rgba(255,255,255,.25); }
+
+  /* 卡片 */
+  .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 22px; }
+  .page { display: none; }
+  .page.active { display: block; }
+
+  /* 表单 */
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 20px; }
+  .field label { display: block; font-size: 13px; color: #4b5563; margin-bottom: 6px; }
+  .field input, .field textarea { width: 100%; padding: 10px 12px; font-size: 14px; border: 1px solid #d1d5db;
+        border-radius: 8px; outline: none; background: #fff; }
+  .field input:focus { border-color: #0e7c5a; box-shadow: 0 0 0 3px rgba(14,124,90,.12); }
+  .btn { border: none; cursor: pointer; padding: 11px 22px; border-radius: 9px; font-size: 14px;
+         background: #0e7c5a; color: #fff; font-weight: 600; transition: background .15s; }
+  .btn:hover { background: #0b6b4f; }
+  .btn:disabled { background: #9ca3af; cursor: not-allowed; }
+  .btn.gray { background: #6b7280; } .btn.gray:hover { background: #4b5563; }
+  .btn.red { background: #b3261e; } .btn.red:hover { background: #8f1e18; }
+  .btn.sm { padding: 6px 14px; font-size: 13px; }
+  .note { margin-top: 16px; font-size: 13px; color: #6b7280; line-height: 1.7; }
+
+  /* 日志 */
+  .log { margin-top: 16px; background: #0f172a; color: #d1fae5; border-radius: 10px; padding: 14px;
+         font-family: Consolas, Menlo, monospace; font-size: 13px; height: 340px; overflow-y: auto;
+         line-height: 1.75; white-space: pre-wrap; word-break: break-all; display: none; }
+  .log .pass { color: #6ee7b7; } .log .warn { color: #fcd34d; } .log .error { color: #fca5a5; }
+  .shots { margin-top: 12px; display: none; flex-wrap: wrap; gap: 10px; }
+  .shots img { width: 180px; border-radius: 8px; border: 1px solid #e5e7eb; cursor: zoom-in; }
+
+  /* 表格 */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 9px 10px; background: #f9fafb; color: #6b7280; font-weight: 600;
+       border-bottom: 1px solid #e5e7eb; white-space: nowrap; }
+  td { padding: 9px 10px; border-bottom: 1px solid #f3f4f6; vertical-align: top; }
+  tr:hover td { background: #f9fafb; }
+  .badge-pass { color: #0b6b4f; background: #d1fae5; padding: 2px 10px; border-radius: 9px; font-size: 12px; }
+  .badge-fail { color: #b3261e; background: #fee2e2; padding: 2px 10px; border-radius: 9px; font-size: 12px; }
+  .badge-pending { color: #92400e; background: #fef3c7; padding: 2px 10px; border-radius: 9px; font-size: 12px; }
+  .steps { font-size: 12px; color: #6b7280; line-height: 1.7; }
+  .thumb { width: 74px; height: 48px; object-fit: cover; border-radius: 6px; border: 1px solid #e5e7eb;
+           margin: 2px 4px 2px 0; cursor: zoom-in; }
+  .addr { font-weight: 600; }
+  .addr a { color: #0e7c5a; text-decoration: none; }
+  .empty { text-align: center; color: #9ca3af; padding: 40px 0; font-size: 14px; }
+  .shot-missing { display: inline-block; min-width: 74px; padding: 15px 8px; margin: 2px 4px 2px 0;
+                  font-size: 12px; color: #9ca3af; text-align: center;
+                  border: 1px dashed #d1d5db; border-radius: 6px; }
+  h3.sec { font-size: 15px; margin-bottom: 12px; color: #374151; }
+
+  /* 已收录列表 */
+  .known-list { margin-top: 14px; max-height: 380px; overflow-y: auto; }
+  .known-item { padding: 8px 12px; border-bottom: 1px solid #f3f4f6; font-size: 13px; display: flex; justify-content: space-between; }
+  .known-item span.muted { color: #9ca3af; }
+
+  /* 灯箱 */
+  #lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 99;
+              align-items: center; justify-content: center; cursor: zoom-out; }
+  #lightbox img { max-width: 92vw; max-height: 92vh; border-radius: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <div class="icon">🏠</div>
+    <div>
+      <h1>地址核查自动化</h1>
+      <p>LoopNet → Smarty → 街景AI对比 → OpenCorporates · 全自动</p>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" data-page="new">新建核查任务</button>
+    <button class="tab" data-page="records">核查记录</button>
+    <button class="tab" data-page="known">收录地址表</button>
+  </div>
+
+  <!-- 新建任务 -->
+  <div class="page active" id="page-new">
+    <div class="card">
+      <div class="grid">
+        <div class="field"><label>城市（如 Los Angeles）</label>
+          <input id="city" value="Los Angeles" placeholder="Los Angeles"></div>
+        <div class="field"><label>州缩写（如 CA）</label>
+          <input id="state" value="CA" placeholder="CA" maxlength="2"></div>
+        <div class="field"><label>价格下限（$/月）</label>
+          <input id="priceMin" type="number" value="0" min="0"></div>
+        <div class="field"><label>价格上限（$/月）</label>
+          <input id="priceMax" type="number" value="2000" min="0"></div>
+        <div class="field"><label>目标通过地址数</label>
+          <input id="target" type="number" value="3" min="1"></div>
+      </div>
+      <div class="field" style="margin-top:16px">
+        <label>手动房源链接（可选，一行一个；LoopNet 反爬时直接贴详情页链接兜底）</label>
+        <textarea id="listingUrls" rows="3" placeholder="https://www.loopnet.com/Listing/..."></textarea>
+      </div>
+      <div style="margin-top:16px; display:flex; gap:10px;">
+        <button class="btn" id="startBtn">开始核查</button>
+        <button class="btn red" id="stopBtn" style="display:none">终止任务</button>
+      </div>
+      <p class="note">流程全自动执行：收录表查重 → LoopNet → Smarty 双绿 → 街景AI对比 → OpenCorporates ≤5；不确定项自动保守淘汰，无需人工介入。</p>
+      <div class="log" id="log"></div>
+      <div class="shots" id="shots"></div>
+    </div>
+  </div>
+
+  <!-- 核查记录 -->
+  <div class="page" id="page-records">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px">
+        <h3 class="sec" style="margin:0">核查记录</h3>
+        <div style="display:flex; gap:8px; flex-wrap:wrap">
+          <input id="recKeyword" placeholder="搜索地址/中介/电话/邮箱" style="padding:6px 10px;font-size:13px;border:1px solid #d1d5db;border-radius:8px;width:200px">
+          <select id="recFilter" style="padding:6px 8px;font-size:13px;border:1px solid #d1d5db;border-radius:8px">
+            <option value="通过" selected>通过（成功档案）</option>
+            <option value="">全部结论</option>
+            <option value="不通过">不通过（失败档案）</option>
+            <option value="待人工">待人工</option>
+          </select>
+          <button class="btn sm gray" id="recSearch">搜索</button>
+          <button class="btn sm gray" id="recReset">重置</button>
+          <button class="btn sm" id="addRecBtn">新增记录</button>
+          <button class="btn sm" id="exportBtn">导出Excel（通过记录）</button>
+          <button class="btn sm red" id="clearHistoryBtn">清空历史</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th>时间</th><th>地址</th><th>价格</th><th>面积(SF)</th><th>四步结果</th><th>结论</th><th>截图</th><th>操作</th></tr></thead>
+          <tbody id="recordsBody"><tr><td colspan="8" class="empty">加载中...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 记录新增/编辑弹窗 -->
+  <div id="recModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:98; align-items:center; justify-content:center">
+    <div class="card" style="width:560px; max-height:88vh; overflow-y:auto">
+      <h3 class="sec" id="recModalTitle">新增记录</h3>
+      <div class="grid">
+        <div class="field" style="grid-column:1/-1"><label>地址 *</label><input id="mAddress" placeholder="6795 E Tennessee Ave Ste 331, Denver CO 80224"></div>
+        <div class="field"><label>价格（$/月）</label><input id="mPrice"></div>
+        <div class="field"><label>面积（SF）</label><input id="mArea"></div>
+        <div class="field"><label>中介姓名</label><input id="mAgent"></div>
+        <div class="field"><label>电话</label><input id="mPhone"></div>
+        <div class="field" style="grid-column:1/-1"><label>邮箱</label><input id="mEmail"></div>
+        <div class="field" style="grid-column:1/-1"><label>网址（LoopNet 链接）</label><input id="mUrl"></div>
+        <div class="field"><label>结论</label>
+          <select id="mConclusion" style="width:100%;padding:10px 12px;font-size:14px;border:1px solid #d1d5db;border-radius:8px">
+            <option>待人工</option><option>通过</option><option>不通过</option>
+          </select></div>
+        <div class="field"><label>已复核</label>
+          <select id="mReviewed" style="width:100%;padding:10px 12px;font-size:14px;border:1px solid #d1d5db;border-radius:8px">
+            <option value="0">否</option><option value="1">是</option>
+          </select></div>
+        <div class="field" style="grid-column:1/-1"><label>备注</label><textarea id="mNotes" rows="3"></textarea></div>
+      </div>
+      <div style="margin-top:16px; display:flex; gap:10px; justify-content:flex-end">
+        <button class="btn gray" id="recCancel">取消</button>
+        <button class="btn" id="recSave">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 收录地址表 -->
+  <div class="page" id="page-known">
+    <div class="card">
+      <h3 class="sec">收录地址表（已核查通过，用于后续查重）</h3>
+      <div class="field">
+        <label>批量导入（一行一个地址）</label>
+        <textarea id="knownText" rows="4" placeholder="925 B St, Ste 201, San Diego, CA 92101"></textarea>
+      </div>
+      <div style="margin-top:10px"><button class="btn sm" id="importBtn">导入</button></div>
+      <div class="known-list" id="knownList"><div class="empty">加载中...</div></div>
+    </div>
+  </div>
+</div>
+
+<div id="lightbox"><img id="lightboxImg" alt=""></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+/* ---------- 标签页 ---------- */
+document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+  document.querySelectorAll(".page").forEach(x => x.classList.remove("active"));
+  t.classList.add("active");
+  $("#page-" + t.dataset.page).classList.add("active");
+  if (t.dataset.page === "records") loadRecords();
+  if (t.dataset.page === "known") loadKnown();
+});
+
+/* ---------- 灯箱 ---------- */
+document.addEventListener("click", e => {
+  if (e.target.id === "lightbox") { $("#lightbox").style.display = "none"; return; }
+  if (e.target.tagName === "IMG" && e.target.dataset.full) {
+    $("#lightboxImg").src = e.target.dataset.full;
+    $("#lightbox").style.display = "flex";
+  }
+});
+const shotUrl = p => "/api/screenshot?path=" + encodeURIComponent(p);
+
+/* 截图加载失败（文件缺失）→ 优雅降级为占位块，不显示破图图标 */
+document.addEventListener("error", e => {
+  const t = e.target;
+  if (t.tagName === "IMG" && (t.classList.contains("thumb") || t.closest("#shots"))) {
+    const s = document.createElement("span");
+    s.className = "shot-missing";
+    s.textContent = "截图缺失";
+    t.replaceWith(s);
+  }
+}, true);
+
+/* ---------- 新建任务 ---------- */
+let running = false, es = null;
+$("#startBtn").onclick = async () => {
+  const body = {
+    city: $("#city").value.trim(), state: $("#state").value.trim(),
+    price_min: +$("#priceMin").value || 0, price_max: +$("#priceMax").value || 2000,
+    target: +$("#target").value || 3, listing_urls: $("#listingUrls").value.trim(),
+  };
+  if (!body.city || !body.state) return alert("请填写城市和州缩写");
+  const r = await fetch("/api/tasks", {method: "POST", headers: {"Content-Type": "application/json"},
+                                       body: JSON.stringify(body)});
+  if (!r.ok) return alert((await r.json()).detail || "启动失败");
+  const {task_id} = await r.json();
+  running = true;
+  $("#startBtn").disabled = true; $("#stopBtn").style.display = "";
+  $("#log").style.display = "block"; $("#log").textContent = ""; $("#shots").style.display = "flex"; $("#shots").innerHTML = "";
+  listen(task_id);
+};
+$("#stopBtn").onclick = () => { if (es && es._taskId) fetch(`/api/tasks/${es._taskId}/stop`, {method: "POST"}); };
+
+function listen(taskId) {
+  es = new EventSource(`/api/tasks/${taskId}/events`);
+  es._taskId = taskId;
+  es.onmessage = m => {
+    const ev = JSON.parse(m.data);
+    appendLog(`[${ev.time}] ${ev.message}`, ev.level);
+  };
+  es.addEventListener("screenshot", m => {
+    const ev = JSON.parse(m.data);
+    if (ev.path) {
+      const img = new Image();
+      img.src = shotUrl(ev.path); img.dataset.full = shotUrl(ev.path);
+      $("#shots").appendChild(img);
+      appendLog(`[截图] ${ev.step} 已留档`, "info");
+    }
+  });
+  es.addEventListener("done", () => {
+    es.close(); running = false;
+    $("#startBtn").disabled = false; $("#stopBtn").style.display = "none";
+    appendLog("—— 任务结束 ——", "pass");
+  });
+  es.onerror = () => { es.close(); running = false;
+    $("#startBtn").disabled = false; $("#stopBtn").style.display = "none"; };
+}
+function appendLog(msg, level) {
+  const div = document.createElement("div");
+  if (level) div.className = level;
+  div.textContent = msg;
+  $("#log").appendChild(div);
+  $("#log").scrollTop = $("#log").scrollHeight;
+}
+
+/* ---------- 核查记录 ---------- */
+$("#exportBtn").onclick = () => { window.open("/api/export?conclusion=" + encodeURIComponent("通过"), "_blank"); };
+$("#recSearch").onclick = () => loadRecords();
+$("#recKeyword").onkeydown = e => { if (e.key === "Enter") loadRecords(); };
+$("#recFilter").onchange = () => loadRecords();
+$("#recReset").onclick = () => { $("#recKeyword").value = ""; $("#recFilter").value = ""; loadRecords(); };
+$("#clearHistoryBtn").onclick = async () => {
+  const s = await (await fetch("/api/history/stats")).json();
+  const ask = `将清空：核查记录 ${s.records} 条、失败档案 ${s.failed} 条。\n收录地址表（${s.known} 条已通过地址）会保留。\n此操作不可撤销，确认继续？`;
+  if (!confirm(ask)) return;
+  const r = await fetch("/api/history/clear", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({include_known: false})});
+  if (!r.ok) return alert((await r.json()).detail || "清空失败");
+  const d = await r.json();
+  alert(`已清空：核查记录 ${d.records} 条，失败档案 ${d.failed} 条`);
+  loadRecords();
+};
+
+async function loadRecords() {
+  const kw = $("#recKeyword").value.trim(), cf = $("#recFilter").value;
+  const qs = new URLSearchParams();
+  if (kw) qs.set("keyword", kw);
+  if (cf) qs.set("conclusion", cf);
+  const recs = await (await fetch("/api/records?" + qs.toString())).json();
+  const tb = $("#recordsBody");
+  if (!recs.length) { tb.innerHTML = `<tr><td colspan="8" class="empty">暂无记录</td></tr>`; return; }
+  tb.innerHTML = recs.map(r => {
+    const badge = r.conclusion === "通过" ? "badge-pass" : r.conclusion === "不通过" ? "badge-fail" : "badge-pending";
+    // 只展示三类：双绿验证卡 / LoopNet 房源图 / 查重截图（街景图入档但不在此展示）
+    const allShots = r.screenshots || [];
+    const low = p => String(p).toLowerCase();
+    const pick = pred => allShots.find(p => pred(low(p)));
+    const shots = [pick(p => p.includes("smarty")),                    // 双绿验证卡
+                   pick(p => p.includes("_photo")),                    // LoopNet 房源图
+                   pick(p => p.includes("opencorp"))]                  // 查重截图
+                  .filter(Boolean)
+                  .map(p => `<img class="thumb" src="${shotUrl(p)}" data-full="${shotUrl(p)}" loading="lazy">`)
+                  .join("");
+    return `<tr>
+      <td style="white-space:nowrap">${esc((r.created_at || "").replace("T", " "))}</td>
+      <td class="addr"><a href="${esc(r.listing_url)}" target="_blank" rel="noopener">${esc(r.address)}</a>
+        ${r.agent ? `<div class="steps">${esc(r.agent)}${r.phone ? " · " + esc(r.phone) : ""}${r.email ? " · " + esc(r.email) : ""}</div>` : ""}</td>
+      <td style="white-space:nowrap">${esc(r.price || "—")}</td>
+      <td style="white-space:nowrap">${esc(r.area || "—")}</td>
+      <td class="steps">${esc(r.step1 || "")}<br>${esc(r.step2 || "")}<br>${esc(r.step3 || "")}<br>${esc(r.step4 || "")}</td>
+      <td><span class="${badge}">${esc(r.conclusion)}</span>${r.reviewed ? `<div class="steps">已复核</div>` : ""}${r.notes ? `<div class="steps">${esc(r.notes)}</div>` : ""}</td>
+      <td>${shots}</td>
+      <td style="white-space:nowrap">
+        <button class="btn sm gray" onclick="openRecModal(${r.id})">编辑</button>
+        <button class="btn sm red" style="margin-top:4px" onclick="deleteRecord(${r.id}, ${JSON.stringify(r.address).replace(/"/g, "&quot;")})">删除</button>
+      </td></tr>`;
+  }).join("");
+}
+
+/* ---------- 记录增删改（弹窗） ---------- */
+let editingId = null;
+function openRecModal(id, rec) {
+  editingId = id || null;
+  $("#recModalTitle").textContent = id ? `编辑记录 #${id}` : "新增记录";
+  const r = rec || {};
+  $("#mAddress").value = r.address || "";
+  $("#mPrice").value = r.price || "";
+  $("#mArea").value = r.area || "";
+  $("#mAgent").value = r.agent || "";
+  $("#mPhone").value = r.phone || "";
+  $("#mEmail").value = r.email || "";
+  $("#mUrl").value = r.listing_url || "";
+  $("#mConclusion").value = r.conclusion || "待人工";
+  $("#mReviewed").value = r.reviewed ? "1" : "0";
+  $("#mNotes").value = r.notes || "";
+  $("#recModal").style.display = "flex";
+}
+function closeRecModal() { $("#recModal").style.display = "none"; editingId = null; }
+$("#addRecBtn").onclick = () => openRecModal(null);
+$("#recCancel").onclick = closeRecModal;
+$("#recModal").addEventListener("click", e => { if (e.target.id === "recModal") closeRecModal(); });
+
+async function loadOneRecord(id) {
+  const recs = await (await fetch("/api/records")).json();
+  return recs.find(r => r.id === id);
+}
+window.openRecModal = async id => openRecModal(id, await loadOneRecord(id));
+
+$("#recSave").onclick = async () => {
+  const addr = $("#mAddress").value.trim();
+  if (!addr) return alert("地址必填");
+  const body = {
+    address: addr, price: $("#mPrice").value.trim(), area: $("#mArea").value.trim(),
+    agent: $("#mAgent").value.trim(), phone: $("#mPhone").value.trim(),
+    email: $("#mEmail").value.trim(), listing_url: $("#mUrl").value.trim(),
+    conclusion: $("#mConclusion").value, reviewed: +$("#mReviewed").value,
+    notes: $("#mNotes").value.trim(),
+  };
+  const r = await fetch(editingId ? `/api/records/${editingId}` : "/api/records", {
+    method: editingId ? "PUT" : "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
+  });
+  if (!r.ok) return alert((await r.json()).detail || "保存失败");
+  closeRecModal(); loadRecords();
+};
+
+window.deleteRecord = async (id, addr) => {
+  if (!confirm(`确认删除该记录？\n${addr}`)) return;
+  const r = await fetch(`/api/records/${id}`, {method: "DELETE"});
+  if (!r.ok) return alert("删除失败");
+  loadRecords();
+};
+
+/* ---------- 收录地址表 ---------- */
+async function loadKnown() {
+  const items = await (await fetch("/api/known")).json();
+  $("#knownList").innerHTML = items.length
+    ? items.map(k => `<div class="known-item"><span>${esc(k.raw)}</span><span class="muted">#${k.id}</span></div>`).join("")
+    : `<div class="empty">收录表为空</div>`;
+}
+$("#importBtn").onclick = async () => {
+  const text = $("#knownText").value.trim();
+  if (!text) return;
+  const r = await fetch("/api/known", {method: "POST", headers: {"Content-Type": "application/json"},
+                                       body: JSON.stringify({text})});
+  const res = await r.json();
+  alert(res.ok ? `导入成功，新增 ${res.added} 条` : (res.detail || "导入失败"));
+  $("#knownText").value = "";
+  loadKnown();
+};
+
+</script>
+</body>
+</html>

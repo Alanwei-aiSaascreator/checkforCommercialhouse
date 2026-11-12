@@ -1,0 +1,17 @@
+# 地址核查自动化 — 依赖清单（安装到项目 venv）
+# 创建环境：
+#   C:\Python313\python.exe -m venv --system-site-packages .venv
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+fastapi>=0.110
+uvicorn>=0.29
+httpx>=0.27
+playwright>=1.40
+websockets>=12
+httptools>=0.6
+openpyxl>=3.1    # Excel 导出（SOP 输出物）
+pillow>=10.0     # 截图裁剪 + openpyxl 内嵌图片
+numpy>=1.26      # openpyxl 兼容依赖（系统旧版 numpy 会报 no attribute 'short'）
+
+# 运行前配置密钥（二选一）：
+#   环境变量 SMARTY_AUTH_ID / SMARTY_AUTH_TOKEN / DEEPSEEK_API_KEY
+#   或 data/config.json: {"smarty_auth_id":"...","smarty_auth_token":"...","deepseek_api_key":"..."}
