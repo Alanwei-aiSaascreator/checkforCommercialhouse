@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS records (
     notes TEXT DEFAULT '',
     reviewed INTEGER DEFAULT 0,
     area TEXT DEFAULT '',
-    email TEXT DEFAULT ''
+    email TEXT DEFAULT '',
+    source TEXT DEFAULT ''       -- 步骤1 数据源：loopnet / crexi（两条线各自独立，互不替代）
 );
 CREATE TABLE IF NOT EXISTS known_addresses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +61,12 @@ CREATE TABLE IF NOT EXISTS searched_pages (
     page INTEGER NOT NULL,
     visited_at TEXT NOT NULL,
     PRIMARY KEY (search_key, page)
+);
+CREATE TABLE IF NOT EXISTS mined_suites (
+    address_norm TEXT PRIMARY KEY,   -- 楼栋级归一化地址
+    suites TEXT NOT NULL,            -- JSON 数组：挖到的房号级完整地址
+    note TEXT DEFAULT '',
+    created_at TEXT NOT NULL
 );
 """
 
@@ -140,11 +147,19 @@ def _con() -> sqlite3.Connection:
     return con
 
 
+def _migrate(con: sqlite3.Connection) -> None:
+    """轻量迁移：只加列，不动既有数据（线上 app.db 已存在，不能靠建表语句）。"""
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(records)")}
+    if "source" not in cols:
+        con.execute("ALTER TABLE records ADD COLUMN source TEXT DEFAULT ''")
+
+
 def init_db() -> None:
     with _lock:
         con = _con()
         try:
             con.executescript(_SCHEMA)
+            _migrate(con)
             con.commit()
         finally:
             con.close()
@@ -157,15 +172,15 @@ def insert_record(d: dict) -> int:
         try:
             cur = con.execute(
                 """INSERT INTO records (created_at, address, address_norm, price, agent,
-                     phone, email, listing_url, step1, screenshots, area)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                     phone, email, listing_url, step1, screenshots, area, source)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     datetime.now().isoformat(timespec="seconds"),
                     addr, normalize(addr),
                     d.get("price", ""), d.get("agent", ""), d.get("phone", ""),
                     d.get("email", ""), d.get("listing_url", ""),
                     d.get("step1", ""), json.dumps(d.get("screenshots") or [], ensure_ascii=False),
-                    d.get("area", ""),
+                    d.get("area", ""), d.get("source", ""),
                 ),
             )
             con.commit()
@@ -207,13 +222,18 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return d
 
 
-def list_records(conclusion: str = "", keyword: str = "") -> list[dict]:
-    """核查记录列表（倒序）。conclusion 精确过滤；keyword 模糊匹配地址/中介/电话/邮箱/网址。"""
+def list_records(conclusion: str = "", keyword: str = "",
+                 source: str = "") -> list[dict]:
+    """核查记录列表（倒序）。conclusion 精确过滤；keyword 模糊匹配地址/中介/电话/邮箱/网址；
+    source 按步骤1 数据源过滤（loopnet / crexi，两条线分开查看）。"""
     sql, args = "SELECT * FROM records", []
     conds = []
     if conclusion:
         conds.append("conclusion=?")
         args.append(conclusion)
+    if source:
+        conds.append("source=?")
+        args.append(source.strip().lower())
     if keyword:
         like = f"%{keyword}%"
         conds.append("(address LIKE ? OR agent LIKE ? OR phone LIKE ? OR email LIKE ?"
@@ -251,8 +271,12 @@ def delete_record(record_id: int) -> bool:
 
 # ---------- 已检查页记忆（同一搜索条件不重复翻同一页） ----------
 
-def page_key(city: str, state: str, price_min: int, price_max: int) -> str:
-    return f"{str(city).strip().lower()}|{str(state).strip().lower()}|{int(price_min)}-{int(price_max)}"
+def page_key(city: str, state: str, price_min: int, price_max: int,
+             source: str = "loopnet") -> str:
+    """翻页记忆按「数据源」隔离：LoopNet 与 Crexi 的总页数/页码互不相干。"""
+    src = str(source or "loopnet").strip().lower()
+    return (f"{src}|{str(city).strip().lower()}|{str(state).strip().lower()}"
+            f"|{int(price_min)}-{int(price_max)}")
 
 
 def page_seen_set(key: str) -> set:
@@ -415,6 +439,38 @@ def smarty_cache_put(address_norm: str, status: str, standard: str = "") -> None
                 "INSERT OR REPLACE INTO smarty_cache (address_norm, status, standard, checked_at)"
                 " VALUES (?,?,?,?)",
                 (address_norm, status, standard, datetime.now().isoformat(timespec="seconds")))
+            con.commit()
+        finally:
+            con.close()
+
+
+def mined_get(address: str):
+    """取该楼栋已挖到的房号（跨任务缓存，避免反复消耗免费通道的调用次数）。
+    返回 (suites列表, note) 或 None。"""
+    con = _con()
+    try:
+        row = con.execute("SELECT suites, note FROM mined_suites WHERE address_norm=?",
+                          (normalize(address),)).fetchone()
+        if not row:
+            return None
+        try:
+            suites = json.loads(row["suites"])
+        except Exception:
+            suites = []
+        return list(suites or []), (row["note"] or "")
+    finally:
+        con.close()
+
+
+def mined_put(address: str, suites: list, note: str = "") -> None:
+    with _lock:
+        con = _con()
+        try:
+            con.execute(
+                "INSERT OR REPLACE INTO mined_suites (address_norm, suites, note, created_at)"
+                " VALUES (?,?,?,?)",
+                (normalize(address), json.dumps(suites, ensure_ascii=False), note,
+                 datetime.now().isoformat(timespec="seconds")))
             con.commit()
         finally:
             con.close()

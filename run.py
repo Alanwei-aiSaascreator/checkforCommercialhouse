@@ -52,8 +52,9 @@ _CONCLUSIONS = ("通过", "不通过", "待人工")
 
 
 @app.get("/api/records")
-def api_records(conclusion: str = "", keyword: str = ""):
-    return store.list_records(conclusion=conclusion.strip(), keyword=keyword.strip())
+def api_records(conclusion: str = "", keyword: str = "", source: str = ""):
+    return store.list_records(conclusion=conclusion.strip(), keyword=keyword.strip(),
+                              source=source.strip().lower())
 
 
 @app.post("/api/records")
@@ -176,6 +177,9 @@ def api_known_import(body: dict):
 
 @app.post("/api/tasks")
 def api_task_start(body: dict):
+    source = (body.get("source") or "loopnet").strip().lower()
+    if source not in ("loopnet", "crexi"):
+        raise HTTPException(400, "source 只能是 loopnet 或 crexi")
     params = {
         "city": (body.get("city") or "").strip(),
         "state": (body.get("state") or "").strip().upper(),
@@ -183,6 +187,7 @@ def api_task_start(body: dict):
         "price_max": body.get("price_max") or 2000,
         "target": body.get("target") or 3,
         "listing_urls": body.get("listing_urls") or "",
+        "source": source,
     }
     if not params["city"] or not params["state"]:
         raise HTTPException(400, "城市和州缩写必填")
@@ -242,14 +247,33 @@ def api_screenshot(path: str):
 # ---------- Excel 导出（SOP 输出物） ----------
 
 @app.get("/api/export")
-def api_export(conclusion: str = "通过", sheet: str = ""):
-    """导出核查结果 Excel（12 列 + 内嵌 smarty/街景/查重截图）。
-    sheet 可选：自定义 Sheet 名（如 "加洲 2000一个月"），默认 "核查通过记录"。"""
-    recs = [r for r in store.list_records() if r.get("conclusion") == conclusion]
-    if not recs:
-        raise HTTPException(404, f"没有结论为「{conclusion}」的核查记录")
-    recs.reverse()  # list_records 为倒序，导出按时间正序
-    path = excel_export.export_records(recs, sheet_name=sheet or f"核查{conclusion}记录")
+def api_export(conclusion: str = "通过", sheet: str = "", source: str = "", ids: str = ""):
+    """导出核查结果 Excel（12 列 + 数据源列 + 内嵌 smarty/街景/查重截图）。
+
+    ids 可选：指定要导出的记录 id（逗号分隔，如 "178,180"）——此时忽略 conclusion
+    与 source，按给定顺序导出（记录页「导出」按钮/勾选批量导出走这条）；
+    sheet 可选：自定义 Sheet 名（如 "加洲 2000一个月"）；
+    source 可选：只导出某条线（loopnet / crexi）。
+    """
+    picked = []
+    for x in (ids or "").replace(" ", "").split(","):
+        if x.isdigit():
+            picked.append(int(x))
+    if picked:
+        by_id = {r["id"]: r for r in store.list_records()}
+        recs = [by_id[i] for i in picked if i in by_id]
+        if not recs:
+            raise HTTPException(404, "所选记录不存在（可能已被删除）")
+        default_sheet = "核查记录" if len(recs) > 1 else "核查记录1条"
+    else:
+        src = source.strip().lower()
+        recs = [r for r in store.list_records(source=src) if r.get("conclusion") == conclusion]
+        if not recs:
+            who = {"crexi": "（Crexi 线）", "loopnet": "（LoopNet 线）"}.get(src, "")
+            raise HTTPException(404, f"没有结论为「{conclusion}」的核查记录{who}")
+        recs.reverse()  # list_records 为倒序，导出按时间正序
+        default_sheet = f"核查{conclusion}记录"
+    path = excel_export.export_records(recs, sheet_name=sheet or default_sheet)
     return FileResponse(path, filename=Path(path).name,
                         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 

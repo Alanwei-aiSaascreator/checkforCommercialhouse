@@ -19,6 +19,10 @@ PROXY_URL = os.environ.get("PROXY_URL", "")
 SMARTY_AUTH_ID = os.environ.get("SMARTY_AUTH_ID", "")
 SMARTY_AUTH_TOKEN = os.environ.get("SMARTY_AUTH_TOKEN", "")
 SMARTY_DAILY_LIMIT = int(os.environ.get("SMARTY_DAILY_LIMIT", "1000000"))
+# 挖房间号的免费通道：smarty.com 官网演示页自己用的公开 demo key（走站点额度，不耗我们账号）。
+# 置 SMARTY_DEMO_MINE=0 可关闭；该 key 随时可能被官方收紧，届时会退化为"挖不到房号"。
+SMARTY_DEMO_KEY = os.environ.get("SMARTY_DEMO_KEY", "21102174564513388")
+SMARTY_DEMO_MINE = os.environ.get("SMARTY_DEMO_MINE", "1") not in ("0", "false", "False")
 
 # DeepSeek 视觉模型（OpenAI 兼容接口）
 # 注意：实测 deepseek-v4-pro 不支持图像（返回 [Unsupported Image]），

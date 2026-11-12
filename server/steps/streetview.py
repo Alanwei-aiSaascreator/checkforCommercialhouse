@@ -13,8 +13,17 @@ def _strip_unit(address: str) -> str:
     return re.sub(r"\b(suite|ste|room|rm|unit|#)\s*\w+", " ", address, flags=re.I).strip(" ,")
 
 
+def _is_loopnet(url: str) -> bool:
+    return "loopnet.com" in (url or "").lower()
+
+
+def _listing_origin(url: str) -> str:
+    m = re.match(r"^(https?://[^/]+)", url or "", re.I)
+    return (m.group(1) + "/") if m else "https://www.loopnet.com/"
+
+
 def _grab_listing_photos(listing_url: str, tag: str, limit: int = 3) -> list[str]:
-    """从 LoopNet 详情页抓外观照片（下载原图，非截图）。
+    """从房源详情页抓外观照片（下载原图，非截图）。支持 LoopNet / Crexi。
 
     主路径：用浏览器上下文的 request API 下载原图字节——与页面共享 Cookie、
     自动带 UA，可显式补 Referer，且不受页面 CORS 限制（之前浏览器内 fetch
@@ -24,6 +33,13 @@ def _grab_listing_photos(listing_url: str, tag: str, limit: int = 3) -> list[str
     """
     if not listing_url:
         return []
+    loopnet = _is_loopnet(listing_url)
+    # 图片筛选：LoopNet 只认 CDN 路径 /i1//i2//i3/；其他站（Crexi）按「大图 + 排除图标」筛
+    if loopnet:
+        pick_js = ("(s.includes('loopnet.com') && (s.includes('/i2/') || s.includes('/i3/')"
+                   " || s.includes('/i1/')))")
+    else:
+        pick_js = (r"(!/logo|icon|sprite|avatar|placeholder|favicon/i.test(s) && s.startsWith('http'))")
     paths: list[str] = []
     page = new_page()
     try:
@@ -32,18 +48,17 @@ def _grab_listing_photos(listing_url: str, tag: str, limit: int = 3) -> list[str
         page.mouse.wheel(0, 1200)
         page.wait_for_timeout(2500)
         srcs = page.evaluate(
-            """() => {
+            f"""() => {{
                 const urls = [];
                 const og = document.querySelector("meta[property='og:image']");
                 if (og && og.content) urls.push(og.content);
-                for (const img of document.querySelectorAll('img')) {
+                for (const img of document.querySelectorAll('img')) {{
                     const s = img.currentSrc || img.src || '';
-                    if (s.includes('loopnet.com') && (s.includes('/i2/') || s.includes('/i3/') || s.includes('/i1/'))
-                        && img.naturalWidth > 400) urls.push(s);
+                    if ({pick_js} && img.naturalWidth > 400) urls.push(s);
                     if (urls.length >= 12) break;
-                }
+                }}
                 return [...new Set(urls)];
-            }"""
+            }}"""
         )
         # 360 全景 / 虚拟看房图优先下载
         prio = [s for s in (srcs or [])
@@ -54,7 +69,7 @@ def _grab_listing_photos(listing_url: str, tag: str, limit: int = 3) -> list[str
                 break
             try:
                 resp = page.context.request.get(
-                    src, headers={"Referer": "https://www.loopnet.com/"}, timeout=20000)
+                    src, headers={"Referer": _listing_origin(listing_url)}, timeout=20000)
                 if resp.status != 200:
                     continue
                 body = resp.body()
@@ -79,11 +94,15 @@ def _grab_listing_photos(listing_url: str, tag: str, limit: int = 3) -> list[str
             page.wait_for_timeout(2500)
             imgs = page.locator(
                 "img[src*='loopnet.com'][src*='/i2/'], img[src*='loopnet.com'][src*='/i1/']"
+                if loopnet else "img[src^='http']"
             )
-            n = min(imgs.count(), limit + 2)
+            n = min(imgs.count(), limit + 6)
             for i in range(n):
                 try:
                     img = imgs.nth(i)
+                    box = img.bounding_box()
+                    if not box or box["width"] < 300:
+                        continue
                     if not img.is_visible():
                         img.scroll_into_view_if_needed()
                         page.wait_for_timeout(800)

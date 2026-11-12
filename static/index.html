@@ -35,9 +35,9 @@
   /* 表单 */
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 20px; }
   .field label { display: block; font-size: 13px; color: #4b5563; margin-bottom: 6px; }
-  .field input, .field textarea { width: 100%; padding: 10px 12px; font-size: 14px; border: 1px solid #d1d5db;
-        border-radius: 8px; outline: none; background: #fff; }
-  .field input:focus { border-color: #0e7c5a; box-shadow: 0 0 0 3px rgba(14,124,90,.12); }
+  .field input, .field textarea, .field select { width: 100%; padding: 10px 12px; font-size: 14px;
+       border: 1px solid #d1d5db; border-radius: 8px; outline: none; background: #fff; }
+  .field input:focus, .field select:focus { border-color: #0e7c5a; box-shadow: 0 0 0 3px rgba(14,124,90,.12); }
   .btn { border: none; cursor: pointer; padding: 11px 22px; border-radius: 9px; font-size: 14px;
          background: #0e7c5a; color: #fff; font-weight: 600; transition: background .15s; }
   .btn:hover { background: #0b6b4f; }
@@ -64,6 +64,10 @@
   .badge-pass { color: #0b6b4f; background: #d1fae5; padding: 2px 10px; border-radius: 9px; font-size: 12px; }
   .badge-fail { color: #b3261e; background: #fee2e2; padding: 2px 10px; border-radius: 9px; font-size: 12px; }
   .badge-pending { color: #92400e; background: #fef3c7; padding: 2px 10px; border-radius: 9px; font-size: 12px; }
+  /* 数据源小标签：LoopNet / Crexi 两条线一眼分开 */
+  .src { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 9px;
+         font-size: 11px; background: #e5e7eb; color: #374151; vertical-align: middle; }
+  .src.crexi { background: #dbeafe; color: #1e40af; }
   .steps { font-size: 12px; color: #6b7280; line-height: 1.7; }
   .thumb { width: 74px; height: 48px; object-fit: cover; border-radius: 6px; border: 1px solid #e5e7eb;
            margin: 2px 4px 2px 0; cursor: zoom-in; }
@@ -92,7 +96,7 @@
     <div class="icon">🏠</div>
     <div>
       <h1>地址核查自动化</h1>
-      <p>LoopNet → Smarty → 街景AI对比 → OpenCorporates · 全自动</p>
+      <p>步骤一数据源可选（LoopNet / Crexi） → Smarty → 街景AI对比 → OpenCorporates · 全自动</p>
     </div>
   </div>
 
@@ -116,16 +120,25 @@
           <input id="priceMax" type="number" value="2000" min="0"></div>
         <div class="field"><label>目标通过地址数</label>
           <input id="target" type="number" value="3" min="1"></div>
+        <div class="field" style="grid-column:1/-1"><label>步骤1 数据源</label>
+          <select id="source">
+            <option value="loopnet" selected>LoopNet（loopnet.com）</option>
+            <option value="crexi">Crexi（crexi.com）</option>
+          </select>
+          <div style="font-size:12px;color:#9ca3af;margin-top:6px">
+            两者筛选口径与结果字段完全一致（城市/州 + 月租区间）；选哪个就只用哪个，不做双源并行。
+          </div></div>
       </div>
       <div class="field" style="margin-top:16px">
-        <label>手动房源链接（可选，一行一个；LoopNet 反爬时直接贴详情页链接兜底）</label>
-        <textarea id="listingUrls" rows="3" placeholder="https://www.loopnet.com/Listing/..."></textarea>
+        <label>手动房源链接（可选，一行一个；LoopNet / Crexi 详情页链接均可，反爬时兜底）</label>
+        <textarea id="listingUrls" rows="3" placeholder="https://www.loopnet.com/Listing/... 或 https://www.crexi.com/lease/properties/..."></textarea>
       </div>
       <div style="margin-top:16px; display:flex; gap:10px;">
         <button class="btn" id="startBtn">开始核查</button>
         <button class="btn red" id="stopBtn" style="display:none">终止任务</button>
       </div>
-      <p class="note">流程全自动执行：收录表查重 → LoopNet → Smarty 双绿 → 街景AI对比 → OpenCorporates ≤5；不确定项自动保守淘汰，无需人工介入。</p>
+      <p class="note">流程全自动执行：收录表查重 → 步骤1（LoopNet 或 Crexi）→ Smarty 双绿 → 街景AI对比 → OpenCorporates ≤5；不确定项自动保守淘汰，无需人工介入。<br>
+        Crexi 未登录时详情页电话/邮箱被打码，这两项会留空（价格/面积/套间/经纪公司照常抓取），需要联系方式时用 LoopNet 跑或人工补。</p>
       <div class="log" id="log"></div>
       <div class="shots" id="shots"></div>
     </div>
@@ -144,17 +157,23 @@
             <option value="不通过">不通过（失败档案）</option>
             <option value="待人工">待人工</option>
           </select>
+          <select id="recSource" style="padding:6px 8px;font-size:13px;border:1px solid #d1d5db;border-radius:8px">
+            <option value="">全部数据源</option>
+            <option value="loopnet">LoopNet</option>
+            <option value="crexi">Crexi</option>
+          </select>
           <button class="btn sm gray" id="recSearch">搜索</button>
           <button class="btn sm gray" id="recReset">重置</button>
           <button class="btn sm" id="addRecBtn">新增记录</button>
+          <button class="btn sm" id="exportPickedBtn">导出选中</button>
           <button class="btn sm" id="exportBtn">导出Excel（通过记录）</button>
           <button class="btn sm red" id="clearHistoryBtn">清空历史</button>
         </div>
       </div>
       <div style="overflow-x:auto">
         <table>
-          <thead><tr><th>时间</th><th>地址</th><th>电话</th><th>价格</th><th>面积(SF)</th><th>四步结果</th><th>结论</th><th>截图</th><th>操作</th></tr></thead>
-          <tbody id="recordsBody"><tr><td colspan="9" class="empty">加载中...</td></tr></tbody>
+          <thead><tr><th style="width:30px"><input type="checkbox" id="recPickAll" title="全选当前列表"></th><th>时间</th><th>地址</th><th>电话</th><th>价格</th><th>面积(SF)</th><th>四步结果</th><th>结论</th><th>截图</th><th>操作</th></tr></thead>
+          <tbody id="recordsBody"><tr><td colspan="10" class="empty">加载中...</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -171,7 +190,7 @@
         <div class="field"><label>中介姓名</label><input id="mAgent"></div>
         <div class="field"><label>电话</label><input id="mPhone"></div>
         <div class="field" style="grid-column:1/-1"><label>邮箱</label><input id="mEmail"></div>
-        <div class="field" style="grid-column:1/-1"><label>网址（LoopNet 链接）</label><input id="mUrl"></div>
+        <div class="field" style="grid-column:1/-1"><label>网址（房源链接 LoopNet / Crexi）</label><input id="mUrl"></div>
         <div class="field"><label>结论</label>
           <select id="mConclusion" style="width:100%;padding:10px 12px;font-size:14px;border:1px solid #d1d5db;border-radius:8px">
             <option>待人工</option><option>通过</option><option>不通过</option>
@@ -228,6 +247,9 @@ document.addEventListener("click", e => {
   }
 });
 const shotUrl = p => "/api/screenshot?path=" + encodeURIComponent(p);
+/* 数据源标签：LoopNet / Crexi 两条线互不替代，列表里直接标出来 */
+const srcChip = s => s === "crexi" ? '<span class="src crexi">Crexi</span>'
+                   : s === "loopnet" ? '<span class="src">LoopNet</span>' : "";
 
 /* 截图加载失败（文件缺失）→ 优雅降级为占位块，不显示破图图标 */
 document.addEventListener("error", e => {
@@ -247,12 +269,13 @@ $("#startBtn").onclick = async () => {
     city: $("#city").value.trim(), state: $("#state").value.trim(),
     price_min: +$("#priceMin").value || 0, price_max: +$("#priceMax").value || 2000,
     target: +$("#target").value || 3, listing_urls: $("#listingUrls").value.trim(),
+    source: $("#source").value,
   };
   if (!body.city || !body.state) return alert("请填写城市和州缩写");
-  // LoopNet 只支持城市级搜索：填州名/地区名（如 ALASKA）会直接 404
+  // 房源站只支持城市级搜索：填州名/地区名（如 ALASKA）会直接 404
   const US_STATES = "ALABAMA ALASKA ARIZONA ARKANSAS CALIFORNIA COLORADO CONNECTICUT DELAWARE FLORIDA GEORGIA HAWAII IDAHO ILLINOIS INDIANA IOWA KANSAS KENTUCKY LOUISIANA MAINE MARYLAND MASSACHUSETTS MICHIGAN MINNESOTA MISSISSIPPI MISSOURI MONTANA NEBRASKA NEVADA NEWHAMPSHIRE NEWJERSEY NEWMEXICO NEWYORK NORTHCAROLINA NORTHDAKOTA OHIO OKLAHOMA OREGON PENNSYLVANIA RHODEISLAND SOUTHCAROLINA SOUTHDAKOTA TENNESSEE TEXAS UTAH VERMONT VIRGINIA WASHINGTON WESTVIRGINIA WISCONSIN WYOMING".split(" ");
   if (US_STATES.includes(body.city.toUpperCase().replace(/[\s_-]/g, ""))) {
-    return alert(`「${body.city}」是州名，LoopNet 只支持城市级搜索。\n请填具体城市（如 Anchorage），州缩写填 ${body.state}。`);
+    return alert(`「${body.city}」是州名，房源站只支持城市级搜索。\n请填具体城市（如 Anchorage），州缩写填 ${body.state}。`);
   }
   const r = await fetch("/api/tasks", {method: "POST", headers: {"Content-Type": "application/json"},
                                        body: JSON.stringify(body)});
@@ -298,11 +321,31 @@ function appendLog(msg, level) {
 }
 
 /* ---------- 核查记录 ---------- */
-$("#exportBtn").onclick = () => { window.open("/api/export?conclusion=" + encodeURIComponent("通过"), "_blank"); };
+$("#exportBtn").onclick = () => {
+  // 导出跟随当前数据源筛选：选了 Crexi 就只导 Crexi 那条线的通过记录
+  const src = $("#recSource").value;
+  window.open("/api/export?conclusion=" + encodeURIComponent("通过")
+              + (src ? "&source=" + encodeURIComponent(src) : ""), "_blank");
+};
+/* 单条导出：只把这一条记录导成 Excel */
+function exportOne(id) { window.open("/api/export?ids=" + id, "_blank"); }
+/* 勾选批量导出：按勾选顺序导出 */
+$("#exportPickedBtn").onclick = () => {
+  const ids = [...document.querySelectorAll(".recPick:checked")].map(c => c.value);
+  if (!ids.length) return alert("先在列表左侧勾选要导出的记录（可多选）");
+  window.open("/api/export?ids=" + ids.join(","), "_blank");
+};
+$("#recPickAll").onchange = e => {
+  document.querySelectorAll(".recPick").forEach(c => c.checked = e.target.checked);
+};
 $("#recSearch").onclick = () => loadRecords();
 $("#recKeyword").onkeydown = e => { if (e.key === "Enter") loadRecords(); };
 $("#recFilter").onchange = () => loadRecords();
-$("#recReset").onclick = () => { $("#recKeyword").value = ""; $("#recFilter").value = ""; loadRecords(); };
+$("#recSource").onchange = () => loadRecords();
+$("#recReset").onclick = () => {
+  $("#recKeyword").value = ""; $("#recFilter").value = ""; $("#recSource").value = "";
+  loadRecords();
+};
 $("#clearHistoryBtn").onclick = async () => {
   const s = await (await fetch("/api/history/stats")).json();
   const ask = `将清空：核查记录 ${s.records} 条、失败档案 ${s.failed} 条。\n收录地址表（${s.known} 条已通过地址）会保留。\n此操作不可撤销，确认继续？`;
@@ -317,12 +360,14 @@ $("#clearHistoryBtn").onclick = async () => {
 
 async function loadRecords() {
   const kw = $("#recKeyword").value.trim(), cf = $("#recFilter").value;
+  const src = $("#recSource").value;
   const qs = new URLSearchParams();
   if (kw) qs.set("keyword", kw);
   if (cf) qs.set("conclusion", cf);
+  if (src) qs.set("source", src);
   const recs = await (await fetch("/api/records?" + qs.toString())).json();
   const tb = $("#recordsBody");
-  if (!recs.length) { tb.innerHTML = `<tr><td colspan="9" class="empty">暂无记录</td></tr>`; return; }
+  if (!recs.length) { tb.innerHTML = `<tr><td colspan="10" class="empty">暂无记录</td></tr>`; return; }
   tb.innerHTML = recs.map(r => {
     const badge = r.conclusion === "通过" ? "badge-pass" : r.conclusion === "不通过" ? "badge-fail" : "badge-pending";
     // 只展示三类：双绿验证卡 / LoopNet 房源图 / 查重截图（街景图入档但不在此展示）
@@ -336,8 +381,9 @@ async function loadRecords() {
                   .map(p => `<img class="thumb" src="${shotUrl(p)}" data-full="${shotUrl(p)}" loading="lazy">`)
                   .join("");
     return `<tr>
+      <td><input type="checkbox" class="recPick" value="${r.id}"></td>
       <td style="white-space:nowrap">${esc((r.created_at || "").replace("T", " "))}</td>
-      <td class="addr"><a href="${esc(r.listing_url)}" target="_blank" rel="noopener">${esc(r.address)}</a>
+      <td class="addr"><a href="${esc(r.listing_url)}" target="_blank" rel="noopener">${esc(r.address)}</a>${srcChip(r.source)}
         ${r.agent ? `<div class="steps">${esc(r.agent)}${r.email ? " · " + esc(r.email) : ""}</div>` : ""}</td>
       <td style="white-space:nowrap">${esc(r.phone || "—")}</td>
       <td style="white-space:nowrap">${esc(r.price || "—")}</td>
@@ -346,10 +392,12 @@ async function loadRecords() {
       <td><span class="${badge}">${esc(r.conclusion)}</span>${r.reviewed ? `<div class="steps">已复核</div>` : ""}${r.notes ? `<div class="steps">${esc(r.notes)}</div>` : ""}</td>
       <td>${shots}</td>
       <td style="white-space:nowrap">
-        <button class="btn sm gray" onclick="openRecModal(${r.id})">编辑</button>
+        <button class="btn sm gray" onclick="exportOne(${r.id})">导出</button>
+        <button class="btn sm gray" style="margin-top:4px" onclick="openRecModal(${r.id})">编辑</button>
         <button class="btn sm red" style="margin-top:4px" onclick="deleteRecord(${r.id}, ${JSON.stringify(r.address).replace(/"/g, "&quot;")})">删除</button>
       </td></tr>`;
   }).join("");
+  $("#recPickAll").checked = false;   // 重新渲染后清掉全选态
 }
 
 /* ---------- 记录增删改（弹窗） ---------- */

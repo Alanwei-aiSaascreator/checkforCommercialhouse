@@ -6,6 +6,7 @@ OpenAI 兼容 chat 接口，多图输入，要求返回 JSON：
 import base64
 import json
 import re
+import time
 from pathlib import Path
 
 import httpx
@@ -13,8 +14,8 @@ import httpx
 from . import config
 
 _PROMPT = """你是商业地产核查专家。前面几张图是【同一地址】的 Google 街景（多个不同朝向视角，
-可能有树木遮挡、只拍到局部墙面、或拍摄年代不同），之后几张是 LoopNet 房源详情页的建筑照片。
-请判断街景中是否出现 LoopNet 照片里的同一栋建筑。
+可能有树木遮挡、只拍到局部墙面、或拍摄年代不同），之后几张是房源详情页（LoopNet/Crexi）的建筑照片。
+请判断街景中是否出现房源照片里的同一栋建筑。
 
 严格按以下步骤执行：
 
@@ -103,6 +104,24 @@ def check_office_photos(image_paths: list) -> dict:
     return result
 
 
+def _post_chat(payload: dict, headers: dict, proxies):
+    """POST chat/completions。429（每分钟请求数/token 限额）按 Retry-After 退避重试，
+    最多 3 次——不加这个，限流会被上层当成"AI 判定失败"，好地址被误淘汰。"""
+    for attempt in range(3):
+        with httpx.Client(timeout=150, proxy=proxies) as client:
+            r = client.post(f"{config.DEEPSEEK_BASE_URL}/chat/completions",
+                            json=payload, headers=headers)
+        if r.status_code == 429 and attempt < 2:
+            try:
+                wait = float(r.headers.get("Retry-After") or 0)
+            except Exception:
+                wait = 0
+            time.sleep(min(max(wait, 3.0 * (attempt + 1)), 20.0))
+            continue
+        r.raise_for_status()
+        return r.json()
+
+
 def _chat_content(content: list, max_tokens: int) -> str:
     """调 chat/completions 返回 content 文本。deepseek-flash 的 reasoning token
     会占用 max_tokens，不足时 content 为空（此前 1500 偶发不够）——空回复自动加倍重试一次。"""
@@ -116,11 +135,8 @@ def _chat_content(content: list, max_tokens: int) -> str:
             "temperature": 0.1,
             "max_tokens": mt,
         }
-        with httpx.Client(timeout=150, proxy=proxies) as client:
-            r = client.post(f"{config.DEEPSEEK_BASE_URL}/chat/completions",
-                            json=payload, headers=headers)
-            r.raise_for_status()
-            text = r.json()["choices"][0]["message"].get("content") or ""
+        data = _post_chat(payload, headers, proxies)
+        text = data["choices"][0]["message"].get("content") or ""
         if text.strip():
             return text
     return text

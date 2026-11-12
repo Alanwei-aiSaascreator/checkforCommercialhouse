@@ -16,10 +16,10 @@ from openpyxl.utils import get_column_letter
 from . import config
 
 COLUMNS = ["编码", "序号", "地址", "价格", "面积", "中介姓名", "电话",
-           "网址", "smarty截图", "街景截图", "查重截图", "邮箱"]
+           "网址", "smarty截图", "街景截图", "查重截图", "邮箱", "数据源"]
 
 # 列宽（字符数；截图列略宽以容纳缩略图）
-_WIDTHS = [8, 6, 42, 10, 9, 16, 15, 40, 16, 16, 16, 26]
+_WIDTHS = [8, 6, 42, 10, 9, 16, 15, 40, 16, 16, 16, 26, 12]
 _IMG_W = 150  # 内嵌图显示宽度（像素）
 _ROW_H = 100  # 截图行高（像素换算 pt：px * 0.75）
 
@@ -37,6 +37,12 @@ def _price_display(price: str, area: str) -> str:
     if monthly is None:
         return price or ""
     return f"${monthly:,.0f}/月"
+
+
+def _source_display(source: str) -> str:
+    """数据源列：LoopNet / Crexi（历史记录没有 source 字段则留空）。"""
+    s = (source or "").strip().lower()
+    return "Crexi" if s == "crexi" else ("LoopNet" if s == "loopnet" else "")
 
 
 def _classify_shots(screenshots: list) -> tuple:
@@ -107,6 +113,7 @@ def export_records(records: list, sheet_name: str = "核查通过记录",
             r.get("listing_url", ""),
             "", "", "",              # 三个截图列由内嵌图片填充
             r.get("email", ""),
+            _source_display(r.get("source", "")),
         ]
         for c, v in enumerate(values, 1):
             cell = ws.cell(row=row, column=c, value=v)

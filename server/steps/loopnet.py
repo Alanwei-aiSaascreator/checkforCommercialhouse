@@ -247,7 +247,8 @@ def _detail_candidate(page, url: str, city: str = "", state: str = "") -> dict:
     }
 
 
-_BLOCK_KEYWORDS = ("are you a robot", "access denied", "unusual traffic", "captcha")
+_BLOCK_KEYWORDS = ("are you a robot", "access denied", "unusual traffic", "captcha",
+                   "too many requests")
 # 页码越界时 LoopNet 的 404 文案
 _NOT_FOUND_KEYWORDS = ("we can't find what you're looking for", "might have been moved",
                        "page not found")
@@ -326,10 +327,13 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
             body = page.evaluate("() => document.body.innerText").lower()
             blocked = any(k in body for k in _BLOCK_KEYWORDS)
         if blocked:
+            ip = browser.exit_ip()
             return {"status": "fail",
-                    "message": "LoopNet 拦截（Access Denied/反爬）：请开启系统代理并选美国节点"
-                               "（SOP：Clash Verge → 系统代理 → 凤凰城）后重试；"
-                               "或在界面粘房源链接走手动兜底",
+                    "message": "LoopNet 拦截（Access Denied/Akamai，属出口 IP 被拉黑，与本机代码无关）"
+                               + (f"：当前出口 IP {ip}" if ip else "")
+                               + "。请换一个 LoopNet 能通过的美国节点（SOP：Clash Verge → 系统代理；"
+                                 "机房/云 IP 段常被整段封，优先住宅 IP 节点），换完直接重跑；"
+                                 "也可在界面粘房源详情页链接走手动兜底",
                     "candidates": [], "screenshot": search_shot or "", "total_pages": 0}
         # 第 1 页 404 先重试一次：Akamai 抖一下也会返回 404，
         # 只有连试两次都 404 才能判定"这个搜索地区不存在"

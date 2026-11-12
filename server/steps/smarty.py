@@ -9,6 +9,7 @@
 import html
 import re
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -27,17 +28,24 @@ def _smarty_query(address: str) -> dict:
         "auth-id": config.SMARTY_AUTH_ID,
         "auth-token": config.SMARTY_AUTH_TOKEN,
     }
-    if config.PROXY_URL:
-        proxies = config.PROXY_URL
-    else:
-        proxies = None
-    with httpx.Client(timeout=25, proxy=proxies) as client:
-        r = client.get(
-            "https://us-street.api.smartystreets.com/street-address",
-            params=params,
-        )
+    proxies = config.PROXY_URL or None
+    # 429（频率限制）：按 Retry-After 退避重试，最多 3 次；仍失败抛给上层按"限流"处理
+    for attempt in range(3):
+        with httpx.Client(timeout=25, proxy=proxies) as client:
+            r = client.get(
+                "https://us-street.api.smartystreets.com/street-address",
+                params=params,
+            )
+        if r.status_code == 429 and attempt < 2:
+            try:
+                wait = float(r.headers.get("Retry-After") or 0)
+            except Exception:
+                wait = 0
+            time.sleep(min(max(wait, 2.0 * (attempt + 1)), 15.0))
+            continue
         r.raise_for_status()
         data = r.json()
+        break
     return (data or [{}])[0]
 
 
@@ -246,10 +254,34 @@ def verify_address(address: str, tag: str = "smarty") -> dict:
             "screenshot": shot, "standard_address": ""}
 
 
-# ---------- 大楼房间号挖掘（Smarty 优先，官网部件兜底） ----------
+# ---------- 大楼房间号挖掘（真正订阅优先，官网免费通道兜底） ----------
+#
+# 现状（2026-11 实测，别改回老写法）：
+#   * 官方 US Autocomplete API 能给出房号建议 → api_mine_suites；未订阅时返回 402；
+#   * 官网旧「single-address」部件早已改版成纯输入框，下拉选项消失，
+#     老的"等下拉弹 Ste 选项"方案 100% 超时（这是通过率骤降、每个地址白等 30-40s 的根因）；
+#   * smarty.com 演示页自身用一把公开 demo key 调 us-street.api.smarty.com，
+#     该接口返回 DPV 匹配码：Y=房号真实存在 / S=街址有效但房号未被 USPS 确认 / D=缺房号。
+#
+# 新方案：楼层锚点猜 + DPV 判定（Ste 100/200/300… 逐层探，命中 Y 即收工）
+#   - **默认用自有 auth-id/auth-token 后台直查**（稳定、无公共 key 限流、可长期跑）
+#   - 自有密钥不可用（未配置/401/402 额度用完）时才退回官网 demo key 兜底
+#   - demo key 是 smarty.com 演示页的公共凭证，全世界共用额度，连打十几次必 429，
+#     所以只有兜底时才用，且限速 1.1s/次
+#   - 两条通道都不可用 → 上层转"待人工"，不把地址判死（下次重跑还能挖）
 
-_AUTOCOMPLETE_URL = "https://us-autocomplete.api.smartystreets.com/suggest"
-_SMARTY_WIDGET_URL = "https://www.smartystreets.com/products/single-address"
+# 新版接口（旧的 us-autocomplete.api.smartystreets.com/suggest 已退役，别再指回去）
+_AUTOCOMPLETE_URL = "https://us-autocomplete.api.smarty.com/v2/lookup"
+_DEMO_STREET_API = "https://us-street.api.smarty.com/street-address"
+_DEMO_HEADERS = {"Referer": "https://www.smarty.com/", "Origin": "https://www.smarty.com"}
+# 楼层锚点：写字楼套间多是 100/200/300（三位数楼层号），末尾几个是甲级/单元式备用模式
+_MINE_ANCHORS = (100, 200, 300, 400, 500, 600, 700, 800, 900,
+                 101, 102, 103, 110, 1, 2, 10, 20)
+_MINE_MAX_CALLS = 16
+_DEMO_MIN_GAP = 1.1          # demo key 的最小间隔（共享额度，别打太猛）
+_OWN_MIN_GAP = 0.15          # 自有密钥：套餐一般 10 req/s，0.15s 间隔安全
+_probe_lock = threading.Lock()
+_probe_last = {"own": 0.0, "demo": 0.0}
 
 
 def _auth_params() -> dict:
@@ -277,13 +309,17 @@ def api_mine_suites(address: str, max_suites: int = 6):
         entries = []
         for s in r.json().get("suggestions", []):
             line = s.get("street_line", "")
-            m = re.search(r"\b(?:Ste|Suite|#)\s*#?\s*([A-Za-z0-9-]+)\b", line, re.I)
+            # v2 把房号单独放 secondary 字段；老版是拼在 street_line 里
+            sec = (s.get("secondary") or "").strip()
+            m = re.search(r"\b(?:Ste|Suite|#)\s*#?\s*([A-Za-z0-9-]+)\b",
+                          sec or line, re.I)
             if m:
                 city = s.get("city", "")
                 state = s.get("state_abbreviation") or s.get("state", "")
                 zc = s.get("zipcode", "")
                 tail = f", {city}, {state} {zc}".strip(", ")
-                entries.append(f"{street} {m.group(1).upper()}{(' ' + tail) if rest == '' else rest}")
+                entries.append(f"{street} Ste {m.group(1).upper()}"
+                               f"{(' ' + tail) if rest == '' else rest}")
         # 去重保序
         seen, out = set(), []
         for e in entries:
@@ -298,76 +334,156 @@ def api_mine_suites(address: str, max_suites: int = 6):
 _web_mine_last_error = ""  # 调试用：最近一次官网挖号失败原因
 
 
-def _web_mine_worker(address: str, max_suites: int) -> list:
-    """（内部）在独立线程中运行的官网挖号实现：独立临时 Chrome，英文环境。"""
-    global _web_mine_last_error
-    street, rest = _split_street_rest(address)
-    import tempfile
-    from playwright.sync_api import sync_playwright
+def _own_key_ready() -> bool:
+    return bool(getattr(config, "SMARTY_AUTH_ID", "") and getattr(config, "SMARTY_AUTH_TOKEN", ""))
 
-    tmp = tempfile.mkdtemp(prefix="smarty_mine_")
-    try:
-        with sync_playwright() as pw:
-            ctx = pw.chromium.launch_persistent_context(
-                tmp, headless=False,
-                args=["--disable-blink-features=AutomationControlled", "--lang=en-US"],
-                proxy={"server": config.PROXY_URL} if config.PROXY_URL else None,
-                viewport={"width": 1440, "height": 900})
-            page = ctx.new_page()
+
+def _probe_params(street: str, demo: bool) -> dict:
+    if demo:
+        return {"key": config.SMARTY_DEMO_KEY, "match": "enhanced",
+                "candidates": 1, "street": street}
+    return {"auth-id": config.SMARTY_AUTH_ID, "auth-token": config.SMARTY_AUTH_TOKEN,
+            "candidates": 1, "street": street}
+
+
+def _probe_client(demo: bool) -> httpx.Client:
+    # 自有密钥（secret key）不能带 Referer，否则 Smarty 按浏览器请求拒绝 → 401
+    headers = dict(_DEMO_HEADERS) if demo else {}
+    return httpx.Client(timeout=15, proxy=config.PROXY_URL or None, headers=headers)
+
+
+def _probe_dpv(client: httpx.Client, street: str, demo: bool) -> tuple:
+    """探一次 DPV 匹配码，返回 (dpv, err)。
+
+    dpv 非空 = 拿到结论（Y=房号真实存在 / S / D / N）；
+    err = rate(429) / auth(401) / quota(402) / net，供上层决定要不要换通道。
+    """
+    mode = "demo" if demo else "own"
+    gap = _DEMO_MIN_GAP if demo else _OWN_MIN_GAP
+    for attempt in range(2):
+        with _probe_lock:
+            wait = gap - (time.time() - _probe_last[mode])
+            if wait > 0:
+                time.sleep(wait)
+            _probe_last[mode] = time.time()
+        try:
+            r = client.get(_DEMO_STREET_API, params=_probe_params(street, demo))
+        except Exception:
+            return "", "net"
+        if r.status_code == 200:
             try:
-                page.goto(_SMARTY_WIDGET_URL, timeout=45000, wait_until="domcontentloaded")
-                page.wait_for_timeout(5000)
-                box = page.locator("#us-street-address-entry").first
-                box.scroll_into_view_if_needed(timeout=15000)
-                box.click(timeout=5000)
-                box.type(" ".join(address.replace(",", " ").split()), delay=50)
-                # 显式等待下拉选项出现（异步加载，固定等待会竞态）
-                page.wait_for_selector("li[id^='us-street-address-entry-option']",
-                                       timeout=12000)
-                page.wait_for_timeout(1500)
-                ste_opt = page.locator("li[id^='us-street-address-entry-option']").filter(
-                    has_text=re.compile(r"Ste|Suite", re.I))
-                if not ste_opt.count():
-                    _web_mine_last_error = "下拉无 Ste 折叠项（该楼可能无房间号）"
-                    return []
-                ste_opt.first.click()
-                page.wait_for_timeout(4500)
-                texts = page.evaluate(
-                    """() => [...document.querySelectorAll(
-                            "li[id^='us-street-address-entry-option'], [role=option]")]
-                         .map(e => e.innerText.trim()).filter(Boolean)""")
-                seen, suites = set(), []
-                for t in texts:
-                    m = re.search(r"\bSte\s*#?\s*([A-Za-z0-9-]+)\b", t, re.I)
-                    if m and m.group(1).upper() not in seen:
-                        seen.add(m.group(1).upper())
-                        suites.append(m.group(1).upper())
-                if not suites:
-                    _web_mine_last_error = "点击后未解析到房间号"
-                return [f"{street} Ste {s}{rest}" for s in suites[:max_suites]]
-            finally:
-                ctx.close()
-    except Exception as e:
-        _web_mine_last_error = f"{type(e).__name__}: {e}"
-        return []
+                arr = r.json()
+            except Exception:
+                return "", "net"
+            if not arr:
+                return "N", ""
+            return str(arr[0].get("analysis", {}).get("dpv_match_code") or ""), ""
+        if r.status_code == 429:
+            if attempt == 0:
+                time.sleep(6 if demo else 3)
+                continue
+            return "", "rate"
+        if r.status_code == 402:
+            return "", "quota"
+        if r.status_code in (401, 403):
+            return "", "auth"
+        return "", f"http{r.status_code}"
+    return "", "rate"
+
+
+def channel_down(note: str) -> bool:
+    """挖号通道故障（限流/鉴权/额度）≠ 这个地址没有房号：
+    上层据此转"待人工"，不写失败档案（下次重跑还能挖）。"""
+    return any(k in (note or "") for k in ("通道不可用", "限流"))
+
+
+def _down_text(err: str, calls: int) -> str:
+    if err == "rate":
+        return f"挖号通道被限流（429），已试 {calls} 个锚点"
+    if err == "quota":
+        return f"挖号通道不可用（402/账号额度用完），已试 {calls} 个锚点"
+    if err == "auth":
+        return f"挖号通道不可用（401/密钥无效），已试 {calls} 个锚点"
+    return f"挖号通道不可用（{err}），已试 {calls} 个锚点"
 
 
 def web_mine_suites(address: str, max_suites: int = 6, timeout: int = 90) -> list:
-    """在 Smarty 官网免费验证部件里挖房间号（用户指定方案：Smarty 里挖、Smarty 里验）。
+    """挖房间号：楼层锚点猜 + DPV 判定，**默认自有密钥后台直查**，demo key 仅兜底。
 
-    必须在【独立线程】中执行：Playwright 同步 API 不允许同一线程内同时存在
-    两个实例——流水线线程已占用一个（服务常驻浏览器），直接调用会立即失败
-    （表现为秒回空结果、退化为 LoopNet 兜底）。独立线程 + 独立临时 Chrome
-    解决该问题，也不影响服务浏览器。
+    思路：写字楼套间基本都是三位楼层号（Ste 100/200/300…），拿锚点逐层试，
+    返回 DPV=Y 的真房号即收工（管线只要一个可用房号就能继续验证）。
+    实测 343 E Main St(Stockton) → Ste 100 为 Y；195 S Beverly Dr → Ste 400 为 Y；
+    11751 Mississippi Ave → Ste 100 为 Y。自有密钥下通常 1-2 次即命中。
 
-    网页部件走 smarty.com 站点自身额度，不消耗 API 免费额度。
-    返回房间号级完整地址列表，失败返回 []。"""
-    result = {"suites": []}
+    timeout 形参保留兼容旧调用（HTTP 路径远快于该上限）。失败/无命中返回 []，
+    具体原因写进 _web_mine_last_error，供日志展示（不再静默超时）。
+    """
+    global _web_mine_last_error
+    _web_mine_last_error = ""
+    # 跨任务缓存：同一栋楼挖过就不再探测
+    cached = store.mined_get(address)
+    if cached is not None:
+        suites, note = cached
+        _web_mine_last_error = note or ""
+        if suites:
+            _web_mine_last_error = ""
+        return suites[:max_suites]
 
-    def _run():
-        result["suites"] = _web_mine_worker(address, max_suites)
+    modes = []
+    if _own_key_ready():
+        modes.append(False)              # 自有密钥（默认）
+    if getattr(config, "SMARTY_DEMO_MINE", True) and getattr(config, "SMARTY_DEMO_KEY", ""):
+        modes.append(True)               # 官网 demo key（兜底）
+    if not modes:
+        _web_mine_last_error = "挖号通道已关闭（未配置 Smarty 密钥且 SMARTY_DEMO_MINE=0）"
+        return []
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    return result["suites"]
+    street, rest = _split_street_rest(address)
+    out: list = []
+    calls = 0
+    err = ""
+    try:
+        for demo in modes:
+            client = _probe_client(demo)
+            try:
+                for n in _MINE_ANCHORS:
+                    if calls >= _MINE_MAX_CALLS or len(out) >= max_suites:
+                        break
+                    candidate = f"{street} Ste {n}{rest}"
+                    calls += 1
+                    dpv, err = _probe_dpv(client, candidate, demo)
+                    if dpv == "Y":
+                        out.append(candidate)
+                    elif dpv:
+                        time.sleep(0.12)
+                    else:
+                        break            # 本通道故障：别继续打了
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            if out or err not in ("auth", "quota"):
+                break                    # 有结果，或不是密钥问题 → 不用换通道
+            if demo:
+                break
+            # 自有密钥 401/402 → 换 demo key 重来一遍
+            calls = 0
+            err = ""
+    except Exception as e:
+        _web_mine_last_error = f"{type(e).__name__}: {e}"
+        return out[:max_suites]
+
+    if out:
+        _web_mine_last_error = ""
+    elif err:
+        _web_mine_last_error = _down_text(err, calls)
+    else:
+        _web_mine_last_error = (f"探测 {calls} 个楼层锚点均非 DPV=Y"
+                                "（该楼 USPS 侧没有房号记录，或房号不是三位楼层号）")
+    # 落缓存：命中的结果长期复用；"确认没有房号"也缓存（通道故障不缓存，下次还能重试）
+    if out:
+        store.mined_put(address, out, "")
+    elif not channel_down(_web_mine_last_error) and "已关闭" not in _web_mine_last_error:
+        store.mined_put(address, [], _web_mine_last_error)
+    return out[:max_suites]

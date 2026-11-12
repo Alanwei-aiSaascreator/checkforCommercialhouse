@@ -7,7 +7,33 @@ import traceback
 from datetime import datetime
 
 from . import config, deepseek_client, store
-from .steps import loopnet, smarty, streetview, opencorporates
+from .steps import crexi, loopnet, smarty, streetview, opencorporates
+
+
+def _manual_candidates(urls: list, source: str = "loopnet") -> dict:
+    """手动链接：只解析与当前步骤1 数据源同站的链接。
+
+    两条线互不替代——选了 Crexi 就只认 crexi.com 的链接，贴了 LoopNet 链接
+    不会"顺手帮你跑"，而是明确报错并忽略，避免把两个数据源的数据混进同一次任务。
+    """
+    is_crexi = (source or "loopnet").strip().lower() == "crexi"
+    mod, expect, label = ((crexi, "crexi.com", "Crexi") if is_crexi
+                          else (loopnet, "loopnet.com", "LoopNet"))
+    ok = [u for u in urls if expect in (u or "").lower()]
+    skipped = [u for u in urls if u not in ok]
+    if not ok:
+        return {"status": "fail", "candidates": [], "screenshot": "",
+                "message": f"当前步骤1 数据源是 {label}，但手动链接里没有 {expect} 的链接；"
+                           f"两条线不互相替代，请改贴 {label} 详情页链接，"
+                           f"或把数据源切换为另一家后重跑"}
+    r = mod.candidates_from_urls(ok)
+    msg = r.get("message") or ""
+    if skipped:
+        msg += f"（已忽略 {len(skipped)} 条非 {label} 链接）"
+    return {"status": "pass" if r.get("candidates") else "warn",
+            "message": msg or "手动链接未解析出候选",
+            "candidates": r.get("candidates") or [],
+            "screenshot": r.get("screenshot") or ""}
 
 
 class TaskRunner:
@@ -48,8 +74,13 @@ class TaskRunner:
         city, state = p["city"], p["state"]
         price_min, price_max = int(p.get("price_min") or 0), int(p.get("price_max") or 2000)
         target = int(p.get("target") or 3)
+        # 步骤1 数据源：LoopNet（默认）/ Crexi，两者同构（同样的筛选口径与候选结构）
+        source = (p.get("source") or "loopnet").strip().lower()
+        feed = crexi if source == "crexi" else loopnet
+        src_label = "Crexi" if source == "crexi" else "LoopNet"
         known_count = store.count_known()
-        self.emit(f"开始核查：{city}, {state}，价格 ${price_min}-${price_max}/月，目标 {target} 个地址；收录表共 {known_count} 条")
+        self.emit(f"开始核查：{city}, {state}，价格 ${price_min}-${price_max}/月，目标 {target} 个地址；"
+                  f"步骤1 数据源：{src_label}；收录表共 {known_count} 条")
 
         manual_urls = [u for u in (p.get("listing_urls") or "").replace("\r", "").split("\n") if u.strip()]
         approved = 0
@@ -63,8 +94,8 @@ class TaskRunner:
             - 跨任务记住查过的页，下次从没查过的页里随机排在前面
             - 一直跑到「达到目标通过数」或「所有页都跑完」为止
             """
-            per_page = 40                                 # LoopNet 每页 40 条，整页取满
-            skey = store.page_key(city, state, price_min, price_max)
+            per_page = 60 if source == "crexi" else 40     # Crexi 每页 60 条 / LoopNet 40 条
+            skey = store.page_key(city, state, price_min, price_max, source=source)
             seen_pages = store.page_seen_set(skey)        # 历史任务翻过的页（跨任务记忆）
             used: set = set()
             visits = 0
@@ -82,7 +113,7 @@ class TaskRunner:
                                      if p not in used and p not in seen_pages]
                         if not remaining:
                             if reset_done:
-                                self.emit(f"LoopNet 共 {total_pages} 页已全部遍历，"
+                                self.emit(f"{src_label} 共 {total_pages} 页已全部遍历，"
                                           f"未再产出全新候选", "warn")
                                 return
                             # 所有页都检查过：清空翻页记忆，再随机重跑一轮（只重置一次）
@@ -95,7 +126,7 @@ class TaskRunner:
                             continue
                         plan = remaining
                         random.shuffle(plan)
-                        self.emit(f"步骤1：LoopNet 全部 {total_pages} 页按随机顺序遍历"
+                        self.emit(f"步骤1：{src_label} 全部 {total_pages} 页按随机顺序遍历"
                                   f"（本轮 {len(plan)} 页，已跳过检查过的 {len(seen_pages)} 页）："
                                   + "、".join(f"第{p}页" for p in plan))
                 produced = 0
@@ -106,18 +137,18 @@ class TaskRunner:
                         continue
                     used.add(page_no)
                     visits += 1
-                    self.emit(f"步骤1：LoopNet 采集候选（第 {page_no}/{total_pages or '?'} 页，"
+                    self.emit(f"步骤1：{src_label} 采集候选（第 {page_no}/{total_pages or '?'} 页，"
                               f"已访问 {visits} 页）...")
-                    r1 = loopnet.search_candidates(city, state, price_min, price_max,
-                                                   limit=per_page, tag=f"task{self.task_id}",
-                                                   page=page_no)
+                    r1 = feed.search_candidates(city, state, price_min, price_max,
+                                                limit=per_page, tag=f"task{self.task_id}",
+                                                page=page_no)
                     self.emit(f"步骤1结果（第{page_no}页）：{r1['message']}",
                               "pass" if r1["status"] == "pass" else "warn")
                     if visits == 1 and r1["screenshot"]:
                         self.events.put({"__screenshot__": {"step": "step1", "path": r1["screenshot"]}})
                     # 反爬拦截：后面的页同样过不去，继续抽只是空转
                     if r1["status"] == "fail" and "拦截" in r1["message"]:
-                        self.emit("LoopNet 被反爬拦截，停止自动搜索", "error")
+                        self.emit(f"{src_label} 被反爬拦截，停止自动搜索", "error")
                         return
                     # 第 1 页就 404 = 搜索地区本身无效（如把州名当城市填），
                     # 再抽 20 页只是重复 404，直接终止并给出可操作提示
@@ -137,7 +168,7 @@ class TaskRunner:
                     seen_pages.add(page_no)
                     if not total_pages and r1.get("total_pages"):
                         total_pages = int(r1["total_pages"])
-                        self.emit(f"  LoopNet 该搜索条件下共 {total_pages} 页（约 40 条/页）")
+                        self.emit(f"  {src_label} 该搜索条件下共 {total_pages} 页（约 {per_page} 条/页）")
                     fresh, skip_known, skip_failed = [], 0, 0
                     for c in r1["candidates"]:
                         if store.normalize(c["address"]) in seen_addrs:
@@ -219,7 +250,7 @@ class TaskRunner:
 
         if manual_urls:
             self.emit(f"检测到 {len(manual_urls)} 条手动房源链接，跳过自动搜索（反爬兜底模式）...")
-            r1 = loopnet.candidates_from_urls(manual_urls)
+            r1 = _manual_candidates(manual_urls, source)
             self.emit(f"步骤1结果：{r1['message']}", "pass" if r1["status"] == "pass" else "warn")
             if r1["screenshot"]:
                 self.events.put({"__screenshot__": {"step": "step1", "path": r1["screenshot"]}})
@@ -263,8 +294,9 @@ class TaskRunner:
                 "agent": cand.get("agent", ""), "phone": cand.get("phone", ""),
                 "email": cand.get("email", ""), "area": cand.get("area", ""),
                 "listing_url": cand.get("listing_url", ""),
-                "step1": f"pass：LoopNet 采集（价格 {cand.get('price', '未知')}）",
-                "screenshots": [],  # SOP：LoopNet 搜索页截图不入档
+                "step1": f"pass：{src_label} 采集（价格 {cand.get('price', '未知')}）",
+                "source": source,   # 记录归属哪条线（LoopNet / Crexi），两条线分开查看/导出
+                "screenshots": [],  # SOP：搜索页截图不入档
             })
             shots = []
             spaces: list = []
@@ -272,7 +304,7 @@ class TaskRunner:
             # SOP：价格/中介姓名/联系方式/面积都是硬性字段——搜索卡片缺哪个就去详情页补抓
             if cand.get("listing_url") and need_detail:
                 self.emit("补抓详情页（价格/经纪人/面积/套间表）...")
-                info = loopnet.fetch_broker_info(cand.get("listing_url", ""))
+                info = feed.fetch_broker_info(cand.get("listing_url", ""))
                 spaces = info.get("spaces") or []
                 for k in ("agent", "phone", "email", "price", "area"):
                     if info.get(k) and not cand.get(k):
@@ -348,7 +380,7 @@ class TaskRunner:
                 photos = streetview.grab_listing_photos(cand["listing_url"], tag=f"r{record_id}")
                 if photos:
                     self.emit(f"  已下载 {len(photos)} 张房源照片（360/全景图优先）")
-                    shots.extend(photos[:3])  # LoopNet 房源图入档（记录页展示用）
+                    shots.extend(photos[:3])  # 房源图入档（记录页展示用）
                     try:
                         office = deepseek_client.check_office_photos(photos)
                         oc = office.get("conclusion", "uncertain")
@@ -382,33 +414,34 @@ class TaskRunner:
                 self.stopped = True
                 break
 
-            # SOP 常见问题：缺房间号 → 四级挖号（Smarty API→Smarty官网部件→LoopNet线索→常见编号）
+            # SOP 常见问题：缺房间号 → 挖号（房源页线索 → Smarty API → Smarty 官网部件）
             msg_low = r2["message"].lower()
             needs_suite = ("missing" in msg_low or "缺房间号" in r2["message"] or "n1" in msg_low)
             if r2["status"] == "fail" and needs_suite:
-                # 优先用 LoopNet 详情页已经给出的套间号直接验证（省掉 25-40s 挖号）
+                # 优先用详情页已经给出的套间号直接验证（省掉 25-40s 挖号）
                 hint = _suite_hint_addr(addr, cand.get("suite_no", ""))
                 merged: list = []
                 if hint:
-                    self.emit(f"  LoopNet 详情页已给出套间（{cand.get('suite_name')}），"
+                    self.emit(f"  {src_label} 详情页已给出套间（{cand.get('suite_name')}），"
                               f"先直接验证 {hint}", "pass")
                     merged = [hint]
                 else:
                     self.emit("Smarty 提示缺房间号，在 Smarty 中挖掘该楼房间号...", "warn")
                     # 房间号只从 Smarty 挖（用户要求）：官方 API（订阅后自动生效）
-                    # → Smarty 官网部件（免费、不耗 API 额度）。LoopNet 不参与挖号。
+                    # → 官网免费通道（楼层锚点猜 + DPV 判定，不耗我们账号的 lookups）
                     suites = smarty.api_mine_suites(addr, max_suites=4)
                     if suites is None:
-                        self.emit("  API 未订阅房间号枚举，改用 Smarty 官网部件查询该楼合法房间号...", "warn")
+                        self.emit("  API 未订阅房间号枚举，改用官网免费通道探测楼层房号...", "warn")
                         suites = smarty.web_mine_suites(addr, max_suites=4)
                     elif suites:
                         self.emit(f"  Smarty API 返回 {len(suites)} 个房间号")
                     merged = list(suites or [])[:4]
                     if merged:
-                        self.emit(f"  Smarty 挖到 {len(merged)} 个房间号，逐一验证："
+                        self.emit(f"  Smarty 挖到 {len(merged)} 个真实房号（DPV=Y），逐一验证："
                                   + "、".join(s.split(" Ste ")[-1].split(",")[0] for s in merged))
                     else:
-                        self.emit("  Smarty 未能枚举到该楼房间号 → 该地址淘汰", "warn")
+                        reason = getattr(smarty, "_web_mine_last_error", "") or "无可用通道"
+                        self.emit(f"  Smarty 未能挖到房号（{reason}）→ 该地址淘汰", "warn")
                 suite_pass = _verify_suites(merged, record_id, shots)
                 # 详情页给的套间没过 → 回退挖号再试（不直接淘汰）
                 if not suite_pass and hint and not self.stopped:
@@ -420,6 +453,9 @@ class TaskRunner:
                     if extra:
                         self.emit("  Smarty 挖到 " + "、".join(
                             s.split(" Ste ")[-1].split(",")[0] for s in extra))
+                    else:
+                        self.emit(f"  回退挖号也未命中（{getattr(smarty, '_web_mine_last_error', '') or '无可用通道'}）",
+                                  "warn")
                     suite_pass = _verify_suites(extra, record_id, shots)
                 shots = [s for s in shots if s]
                 if suite_pass:
@@ -435,6 +471,15 @@ class TaskRunner:
                     if self.stopped:
                         store.update_record(record_id, conclusion="不通过", notes="Smarty 额度耗尽，未完成验证")
                         break
+                    # 挖号通道被限流（429/401）时不能算"这地址不合格"——它只是没查到，
+                    # 转待人工而不登记失败档案，避免把好地址误杀（下次重跑还能挖）
+                    mine_reason = getattr(smarty, "_web_mine_last_error", "") or ""
+                    if smarty.channel_down(mine_reason):
+                        note = f"缺房间号且挖号通道限流（{mine_reason[:60]}），未验证完，建议稍后重跑"
+                        store.update_record(record_id, conclusion="待人工", notes=note,
+                                            screenshots=shots)
+                        self.emit(f"  {note} → 转待人工，继续下一个", "warn")
+                        continue
                     note = f"Smarty 未通过（含 Suite 尝试）：{r2['message'][:80]}"
                     store.update_record(record_id, conclusion="不通过",
                                         notes=note, screenshots=shots)
@@ -449,6 +494,15 @@ class TaskRunner:
                 self.emit("该地址淘汰，处理下一个候选", "warn")
                 continue
             if r2["status"] == "suspect":
+                # 限流/网络类失败是"这次没查到"，不是"这地址不合格"：
+                # 转待人工、不写失败档案（否则好地址被拉黑，重跑也救不回来）
+                _transient = ("429", "限流", "请求失败", "请求异常", "timeout", "超时")
+                if any(k in r2["message"] for k in _transient):
+                    note = f"Smarty 限流/网络未验证完（{r2['message'][:60]}），建议稍后重跑"
+                    store.update_record(record_id, conclusion="待人工", notes=note,
+                                        screenshots=shots)
+                    self.emit(f"  {note} → 转待人工，继续下一个", "warn")
+                    continue
                 note = f"Smarty 结果不明确，全自动模式保守淘汰：{r2['message'][:80]}"
                 store.update_record(record_id, conclusion="不通过", notes=note)
                 store.add_failed_address(addr, "Smarty", note, building=True)

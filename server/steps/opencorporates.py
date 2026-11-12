@@ -130,6 +130,10 @@ def _read_count(page, timeout_ms: int = 45000):
         m = re.search(r"([\d,]+)\s+compan", text.lower())
         if m:
             return int(m.group(1).replace(",", "")), text
+        # 0 结果时页面不一定带数字（英文 "No companies found" / 被翻译成中文
+        # 「未找到任何公司」），直接判定 0 家，别退化成"无法解析"
+        if re.search(r"\bno\s+companies?\b|未找到任何公司|没有找到|未找到", text, re.I):
+            return 0, text
         # 兜底：结果页没出汇总句时数结果条目
         try:
             n = page.locator("li.result, ul.results li, div.search-result").count()

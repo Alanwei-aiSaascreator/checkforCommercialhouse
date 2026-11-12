@@ -68,9 +68,13 @@ def _ensure_context():
         _reset()
         _pw = sync_playwright().start()
         # 有头模式：LoopNet / 谷歌地图 / OpenCorporates 页面肉眼可见，方便人工盯流程
-        launch_kw = dict(headless=False, viewport=VIEWPORT,
+        # Translate* 必须关掉：Crexi 等站点会被 Chrome 自动翻译成中文，
+        # 页面文案变成「每平方英尺/月 x 美元」，所有英文标签/价格正则都会失效。
+        launch_kw = dict(headless=False, viewport=VIEWPORT, locale="en-US",
                          args=["--disable-blink-features=AutomationControlled",
-                               "--lang=en-US"])
+                               "--lang=en-US",
+                               "--disable-features=Translate,TranslateUI",
+                               "--disable-translate"])
         proxy = {"server": config.PROXY_URL} if config.PROXY_URL else None
         if proxy:
             launch_kw["proxy"] = proxy
@@ -90,13 +94,69 @@ def _ensure_context():
         return _context
 
 
+_TRANSLATE_HOSTS = ("translate.goog", "translate-pa.googleapis")
+
+
+def block_translate(page) -> None:
+    """拦截 Google 翻译请求，保证页面保持英文原文。
+
+    为什么必须全局做：Crexi / OpenCorporates 都会按浏览器语言自动把页面翻成中文，
+    翻完文案变成「每平方英尺每月 4 美元」「未找到任何公司」，
+    所有英文正则（价格、Found N companies）全部失效（实测：查重步骤因此误判）。
+    """
+    def _handler(route):
+        low = route.request.url.lower()
+        if any(h in low for h in _TRANSLATE_HOSTS):
+            return route.abort()
+        return route.continue_()
+
+    try:
+        page.route("**/*", _handler)
+    except Exception:
+        pass
+
+
+_exit_ip_cache = {"t": 0.0, "v": ""}
+
+
+def exit_ip() -> str:
+    """当前代理出口 IP（10 分钟缓存）。
+
+    反爬排查用：LoopNet 的 Akamai 认的是出口 IP，机房/脏 IP 会整段被封，
+    把 IP+运营商打进日志，用户才知道该换哪个节点（而不是反复重试同一节点）。
+    """
+    now = time.time()
+    if _exit_ip_cache["v"] and now - _exit_ip_cache["t"] < 600:
+        return _exit_ip_cache["v"]
+    info = ""
+    try:
+        resp = _ensure_context().request.get("https://ipinfo.io/json", timeout=15000)
+        if resp.status == 200:
+            d = resp.json()
+            seg = [str(d.get("ip") or "?")]
+            org = d.get("org") or d.get("isp") or ""
+            city = d.get("city") or ""
+            if org:
+                seg.append(org)
+            if city:
+                seg.append(city)
+            info = " · ".join(seg)
+    except Exception:
+        info = ""
+    if info:
+        _exit_ip_cache.update(t=now, v=info)
+    return info
+
+
 def new_page():
     """新开一个标签页（调用方负责 close）。连接在检查后瞬断时重建并重试一次。"""
     try:
-        return _ensure_context().new_page()
+        page = _ensure_context().new_page()
     except Exception:
         _reset()
-        return _ensure_context().new_page()
+        page = _ensure_context().new_page()
+    block_translate(page)
+    return page
 
 
 def safe_close(page) -> None:
