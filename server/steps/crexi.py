@@ -248,8 +248,13 @@ def _detail_candidate(page, url: str) -> dict:
     elif not agent:
         agent = brokerage
     building = re.sub(r"[^\d]", "", str(info.get("building") or ""))
+    addr = _clean_h1(info.get("h1", ""))
+    # 页面没渲染出来时 h1 会是站点名（实测拿到 "www.crexi.com"），
+    # 真地址一定含门牌号——不含数字就判为解析失败，宁可空也不要脏地址进库
+    if not re.search(r"\d", addr):
+        addr = ""
     return {
-        "address": _clean_h1(info.get("h1", "")),
+        "address": addr,
         "price": (info.get("price") or "").strip(),
         "agent": agent,
         "phone": "",            # 未登录打码，不伪造

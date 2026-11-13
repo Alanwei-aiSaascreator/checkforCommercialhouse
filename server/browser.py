@@ -3,6 +3,7 @@
 使用系统 Chrome（channel="chrome"）+ data/chrome_profile 持久化配置，
 保留登录态/ Cookie，降低 LoopNet、OpenCorporates 的反爬拦截概率。
 """
+import queue
 import threading
 import time
 
@@ -10,37 +11,60 @@ from playwright.sync_api import sync_playwright
 
 from . import config
 
-_pw = None
-_context = None
+# 每个线程各自持有 Playwright 驱动与 context：
+#   Playwright Sync API 的对象绑定创建它的线程，跨线程用会直接报错；
+#   而 Chrome 同一个 user-data-dir 不能同时被两个实例打开（实测报
+#   "Opening in existing browser session"）。所以：
+#   - 首个建上下文的线程用主配置目录（保留 LoopNet/Crexi 登录态）；
+#   - 其余线程（如并行的街景）用独立的 _aux 目录。
+_tls = threading.local()
 _lock = threading.Lock()
+_aux = {"thread": None, "queue": None}
 
 VIEWPORT = {"width": 1440, "height": 900}
 
 
+def _state():
+    if not hasattr(_tls, "pw"):
+        _tls.pw = None
+        _tls.context = None
+    return _tls
+
+
+def _profile_dir():
+    """任务线程用主配置（保留 LoopNet/Crexi 登录态），辅助线程用 _aux。
+
+    同一个 user-data-dir 不允许两个 Chrome 实例同时打开
+    （实测报 "Opening in existing browser session"），所以必须分开目录。
+    """
+    if getattr(_tls, "role", "main") == "aux":
+        return config.CHROME_PROFILE_DIR.parent / (config.CHROME_PROFILE_DIR.name + "_aux")
+    return config.CHROME_PROFILE_DIR
+
+
 def _stop_pw():
-    """停掉 Playwright 驱动（node 子进程），失败也不抛。"""
-    global _pw
-    if _pw is None:
+    """停掉本线程的 Playwright 驱动（node 子进程），失败也不抛。"""
+    st = _state()
+    if st.pw is None:
         return
     try:
-        _pw.stop()
+        st.pw.stop()
     except Exception:
         pass
-    _pw = None
+    st.pw = None
 
 
-def _launch(**extra):
-    return _pw.chromium.launch_persistent_context(
-        str(config.CHROME_PROFILE_DIR), **extra)
+def _launch(profile_dir, **extra):
+    return _state().pw.chromium.launch_persistent_context(str(profile_dir), **extra)
 
 
 def _alive() -> bool:
-    """探测连接是否存活。优先用 Playwright 内部的判死条件（_sync 同款）：
-    事件循环已关闭或 dispatcher fiber 已死 → 连接必断。"""
-    if _context is None:
+    """探测本线程连接是否存活：事件循环已关闭或 dispatcher fiber 已死 → 必断。"""
+    ctx = _state().context
+    if ctx is None:
         return False
     try:
-        if _context._loop.is_closed() or _context._dispatcher_fiber.dead:
+        if ctx._loop.is_closed() or ctx._dispatcher_fiber.dead:
             return False
         return True
     except Exception:
@@ -48,50 +72,115 @@ def _alive() -> bool:
 
 
 def _reset():
-    """丢弃失效的 context 与驱动，回到干净状态。"""
-    global _context
-    if _context is not None:
+    """丢弃本线程失效的 context 与驱动，回到干净状态。"""
+    st = _state()
+    if st.context is not None:
         try:
-            _context.close()
+            st.context.close()
         except Exception:
             pass
-        _context = None
+        st.context = None
     _stop_pw()
 
 
 def _ensure_context():
-    global _pw, _context
-    with _lock:
-        if _context is not None and _alive():
-            return _context
-        # 连接失效或首次使用：清理残留（驱动/浏览器可能已死），重建
-        _reset()
-        _pw = sync_playwright().start()
-        # 有头模式：LoopNet / 谷歌地图 / OpenCorporates 页面肉眼可见，方便人工盯流程
-        # Translate* 必须关掉：Crexi 等站点会被 Chrome 自动翻译成中文，
-        # 页面文案变成「每平方英尺/月 x 美元」，所有英文标签/价格正则都会失效。
-        launch_kw = dict(headless=False, viewport=VIEWPORT, locale="en-US",
-                         args=["--disable-blink-features=AutomationControlled",
-                               "--lang=en-US",
-                               "--disable-features=Translate,TranslateUI",
-                               "--disable-translate"])
-        proxy = {"server": config.PROXY_URL} if config.PROXY_URL else None
-        if proxy:
-            launch_kw["proxy"] = proxy
+    """本线程独享 st（threading.local），所以这里不加锁——
+    启动 Chrome 要数秒，持锁会与 _profile_dir 互相等待（曾因此死锁卡死任务）。"""
+    st = _state()
+    if st.context is not None and _alive():
+        return st.context
+    # 连接失效或首次使用：清理残留（驱动/浏览器可能已死），重建
+    _reset()
+    profile_dir = _profile_dir()
+    st.pw = sync_playwright().start()
+    # 有头模式：LoopNet / 谷歌地图 / OpenCorporates 页面肉眼可见，方便人工盯流程
+    # Translate* 必须关掉：Crexi 等站点会被 Chrome 自动翻译成中文，
+    # 页面文案变成「每平方英尺/月 x 美元」，所有英文标签/价格正则都会失效。
+    launch_kw = dict(headless=False, viewport=VIEWPORT, locale="en-US",
+                     args=["--disable-blink-features=AutomationControlled",
+                           "--lang=en-US",
+                           "--disable-features=Translate,TranslateUI",
+                           "--disable-translate"])
+    proxy = {"server": config.PROXY_URL} if config.PROXY_URL else None
+    if proxy:
+        launch_kw["proxy"] = proxy
+    try:
         try:
-            try:
-                # 优先系统 Chrome（保留真实指纹特征）
-                _context = _launch(channel="chrome", **launch_kw)
-            except Exception:
-                # 未装 Chrome 时退回 Playwright 自带 Chromium
-                _stop_pw()
-                _pw = sync_playwright().start()
-                _context = _launch(**launch_kw)
+            # 优先系统 Chrome（保留真实指纹特征）
+            st.context = _launch(profile_dir, channel="chrome", **launch_kw)
         except Exception:
-            # 彻底失败：清理驱动，下次任务从干净状态重试
+            # 未装 Chrome 时退回 Playwright 自带 Chromium
             _stop_pw()
-            raise
-        return _context
+            st.pw = sync_playwright().start()
+            st.context = _launch(profile_dir, **launch_kw)
+    except Exception:
+        # 彻底失败：清理驱动，下次任务从干净状态重试
+        _stop_pw()
+        raise
+    return st.context
+
+
+def close_current():
+    """关闭当前线程的 context 与驱动（任务结束时调用，避免残留 Chrome 占住配置目录）。"""
+    _reset()
+
+
+def _aux_loop(q):
+    """常驻辅助线程：独占一个 Chrome（_aux 配置目录），专供并行步骤使用。"""
+    _tls.role = "aux"
+    while True:
+        job = q.get()
+        if job is None:
+            break
+        fn, box, ev = job
+        try:
+            box["ok"] = fn()
+        except Exception as e:
+            box["err"] = e
+        finally:
+            ev.set()
+
+
+def _aux_queue():
+    with _lock:
+        t = _aux["thread"]
+        if t is None or not t.is_alive():
+            q = queue.Queue()
+            t = threading.Thread(target=_aux_loop, args=(q,), daemon=True,
+                                 name="browser-aux")
+            t.start()
+            _aux["thread"], _aux["queue"] = t, q
+        return _aux["queue"]
+
+
+class _Job:
+    def __init__(self, box, ev):
+        self._box, self._ev = box, ev
+
+    def result(self, timeout=None):
+        if not self._ev.wait(timeout):
+            raise TimeoutError("辅助浏览器线程执行超时")
+        if "err" in self._box:
+            raise self._box["err"]
+        return self._box.get("ok")
+
+
+def submit(fn) -> _Job:
+    """把 fn 丢给常驻辅助线程执行（独立 Chrome/配置目录），立即返回 Job。
+
+    为什么不用普通 Thread：Playwright Sync API 的对象绑定创建它的线程，
+    每开一个新线程就要重启一次 Chrome（数秒），且并发时配置目录容易冲突；
+    常驻线程只启动一次，后续复用。
+    """
+    q = _aux_queue()
+    box, ev = {}, threading.Event()
+    q.put((fn, box, ev))
+    return _Job(box, ev)
+
+
+def run_async(fn, timeout=None):
+    """同步版：在辅助线程执行并直接返回结果。"""
+    return submit(fn).result(timeout)
 
 
 _TRANSLATE_HOSTS = ("translate.goog", "translate-pa.googleapis")

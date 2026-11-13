@@ -236,6 +236,9 @@ def _detail_candidate(page, url: str, city: str = "", state: str = "") -> dict:
         pass
     addr = _parse_address(text, city, state) or title or og
     addr = re.sub(r"\s+", " ", addr).strip(" |")
+    # 同理：真地址一定含门牌号，标题/og 兜底常拿到站点名，不含数字就不采用
+    if not re.search(r"\d", addr):
+        addr = ""
     price = _parse_price(text)
     return {
         "address": addr,

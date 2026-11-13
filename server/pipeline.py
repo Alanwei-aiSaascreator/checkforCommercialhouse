@@ -6,7 +6,8 @@ import threading
 import traceback
 from datetime import datetime
 
-from . import config, deepseek_client, store
+from . import browser, config, deepseek_client, store
+from .addrutil import clean_address
 from .steps import crexi, loopnet, smarty, streetview, opencorporates
 
 
@@ -264,8 +265,15 @@ class TaskRunner:
         for cand in candidate_stream:
             if self.stopped:
                 break
-            addr = cand["address"]
-            self.emit(f"—— 候选地址：{addr}")
+            # 清洗重复片段（"537 Long Point Road Road" / "413 & 415 415 E Remington st"）：
+            # 脏地址会把 Google 地理编码带偏到别的城市（实测被编到洛杉矶）
+            raw_addr = cand["address"]
+            addr = clean_address(raw_addr)
+            if addr != raw_addr:
+                self.emit(f"—— 候选地址：{addr}（原文 {raw_addr}，已去重复）")
+                cand["address"] = addr
+            else:
+                self.emit(f"—— 候选地址：{addr}")
 
             # 查重前置：与收录表比对
             if store.is_known_address(addr):
@@ -551,11 +559,30 @@ class TaskRunner:
                 self.emit(f"采用 Smarty 标准化地址：{check_addr}")
 
             # 步骤3 街景 + AI 对比（复用预筛阶段已下载的房源照片）
+            # 与步骤4 查重并行：两者都用浏览器，但浏览器层已按线程隔离
+            # （各自一个 Chrome 实例 + 独立配置目录），互不阻塞。
+            # 实测单条：街景 ~26s、查重 ~18s，串行 45s → 并行 ~27s。
             if self.stopped:
                 break
-            self.emit("步骤3：Google Maps 街景 + DeepSeek 视觉对比...")
-            r3 = streetview.check_street_view(check_addr, cand.get("listing_url", ""),
-                                              tag=f"r{record_id}", photos=photos)
+            self.emit("步骤3/4 并行：Google Maps 街景+AI 与 OpenCorporates 查重同时进行...")
+            # 街景丢给常驻辅助线程（独立 Chrome/配置目录），本线程同时跑查重
+            job = browser.submit(lambda: streetview.check_street_view(
+                check_addr, cand.get("listing_url", ""),
+                tag=f"r{record_id}", photos=photos))
+            try:
+                r4 = opencorporates.check_duplicates(check_addr, tag=f"r{record_id}")
+            except Exception as e:
+                r4 = {"status": "suspect", "screenshot": "",
+                      "message": f"查重步骤异常: {type(e).__name__}: {e}"}
+            try:
+                r3 = job.result(timeout=420)
+            except Exception as e:
+                r3 = {"status": "suspect", "screenshot": "", "extra_shots": [],
+                      "message": f"街景步骤异常: {type(e).__name__}: {e}"}
+            if not isinstance(r3, dict) or "status" not in r3:
+                r3 = {"status": "suspect", "screenshot": "", "extra_shots": [],
+                      "message": "街景步骤无有效返回"}
+
             shots.append(r3.get("screenshot", ""))
             shots.extend(r3.get("extra_shots") or [])
             self.emit(f"步骤3结果：{r3['message']}", "pass" if r3["status"] == "pass" else ("error" if r3["status"] == "fail" else "warn"))
@@ -568,11 +595,8 @@ class TaskRunner:
                 self.emit("该地址淘汰，处理下一个候选", "warn")
                 continue
 
-            # 步骤4 OpenCorporates
-            if self.stopped:
-                break
-            self.emit("步骤4：OpenCorporates 查重...")
-            r4 = opencorporates.check_duplicates(check_addr, tag=f"r{record_id}")
+            # 步骤4 OpenCorporates（结果已在上面与步骤3 并行取得，这里只报状态）
+            self.emit("步骤4：OpenCorporates 查重完成（与步骤3 并行）")
             shots.append(r4.get("screenshot", ""))
             self.emit(f"步骤4结果：{r4['message']}", "pass" if r4["status"] == "pass" else ("error" if r4["status"] == "fail" else "warn"))
             store.update_record(record_id, step4=f"{r4['status']}：{r4['message']}", screenshots=[s for s in shots if s])
@@ -612,8 +636,17 @@ RUNNERS: dict[str, TaskRunner] = {}
 def start_task(task_id: str, params: dict) -> TaskRunner:
     runner = TaskRunner(task_id, params)
     RUNNERS[task_id] = runner
+
+    def _run_and_cleanup():
+        try:
+            runner.run()
+        finally:
+            # 任务结束必须关掉本线程的 Chrome，否则进程残留会占住配置目录，
+            # 下一个任务启动时报 "Opening in existing browser session"
+            browser.close_current()
+
     # 用独立线程跑流水线（而非事件循环的 executor）：executor 线程池被 uvicorn
     # 复用后可能带事件循环上下文，Playwright Sync API 会报
     # "using Sync API inside the asyncio loop"。全新线程则干净无环。
-    threading.Thread(target=runner.run, daemon=True, name=f"task-{task_id}").start()
+    threading.Thread(target=_run_and_cleanup, daemon=True, name=f"task-{task_id}").start()
     return runner
