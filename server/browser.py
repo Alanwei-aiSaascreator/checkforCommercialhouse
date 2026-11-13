@@ -83,6 +83,56 @@ def _reset():
     _stop_pw()
 
 
+def _launch_kw(**extra):
+    """统一的启动参数（有头 + 关自动翻译 + 关自动化标记）。
+
+    Translate* 必须关掉：Crexi / CityFeet 等站会被 Chrome 自动翻译成中文，
+    页面文案变成「每平方英尺/月 x 美元」，所有英文标签/价格正则都会失效。
+    """
+    kw = dict(headless=False, viewport=VIEWPORT, locale="en-US",
+              args=["--disable-blink-features=AutomationControlled",
+                    "--lang=en-US",
+                    "--disable-features=Translate,TranslateUI",
+                    "--disable-translate"])
+    if config.PROXY_URL:
+        kw["proxy"] = {"server": config.PROXY_URL}
+    kw.update(extra)
+    return kw
+
+
+def new_page_in(profile_name: str):
+    """在**指定配置目录**里开一个标签页（同线程可并存多个 Chrome 进程）。
+
+    为什么需要：主配置 data/chrome_profile 带着 Crexi 登录态，但也因此被
+    Akamai 记住（实测 CityFeet 对主配置直接返回 Access Denied，而全新配置
+    正常 200）。所以免登录的数据源用独立配置（chrome_profile_feeds）。
+    同一 user-data-dir 不能被两个 Chrome 打开，因此每个配置目录单独一套。
+    """
+    st = _state()
+    if st.pw is None:
+        st.pw = sync_playwright().start()
+    extra = getattr(st, "extra", None)
+    if extra is None:
+        extra = st.extra = {}
+    ctx = extra.get(profile_name)
+    if ctx is not None:
+        try:
+            ctx.pages          # 连接已断会抛
+        except Exception:
+            ctx = None
+    if ctx is None:
+        d = config.CHROME_PROFILE_DIR.parent / profile_name
+        try:
+            ctx = st.pw.chromium.launch_persistent_context(
+                str(d), channel="chrome", **_launch_kw())
+        except Exception:
+            ctx = st.pw.chromium.launch_persistent_context(str(d), **_launch_kw())
+        extra[profile_name] = ctx
+    page = ctx.new_page()
+    block_translate(page)
+    return page
+
+
 def _ensure_context():
     """本线程独享 st（threading.local），所以这里不加锁——
     启动 Chrome 要数秒，持锁会与 _profile_dir 互相等待（曾因此死锁卡死任务）。"""
@@ -93,17 +143,7 @@ def _ensure_context():
     _reset()
     profile_dir = _profile_dir()
     st.pw = sync_playwright().start()
-    # 有头模式：LoopNet / 谷歌地图 / OpenCorporates 页面肉眼可见，方便人工盯流程
-    # Translate* 必须关掉：Crexi 等站点会被 Chrome 自动翻译成中文，
-    # 页面文案变成「每平方英尺/月 x 美元」，所有英文标签/价格正则都会失效。
-    launch_kw = dict(headless=False, viewport=VIEWPORT, locale="en-US",
-                     args=["--disable-blink-features=AutomationControlled",
-                           "--lang=en-US",
-                           "--disable-features=Translate,TranslateUI",
-                           "--disable-translate"])
-    proxy = {"server": config.PROXY_URL} if config.PROXY_URL else None
-    if proxy:
-        launch_kw["proxy"] = proxy
+    launch_kw = _launch_kw()
     try:
         try:
             # 优先系统 Chrome（保留真实指纹特征）
@@ -122,6 +162,14 @@ def _ensure_context():
 
 def close_current():
     """关闭当前线程的 context 与驱动（任务结束时调用，避免残留 Chrome 占住配置目录）。"""
+    st = _state()
+    for ctx in list((getattr(st, "extra", {}) or {}).values()):
+        try:
+            ctx.close()
+        except Exception:
+            pass
+    if getattr(st, "extra", None):
+        st.extra = {}
     _reset()
 
 

@@ -8,18 +8,34 @@ from datetime import datetime
 
 from . import browser, config, deepseek_client, store
 from .addrutil import clean_address
-from .steps import crexi, loopnet, smarty, streetview, opencorporates
+from .steps import (cbre, commercialcafe, commercialsearch, crexi, cityfeet, loopnet,
+                    officespace, smarty, streetview, opencorporates)
+
+# 步骤1 数据源注册表：source key → (模块, 展示名, 详情页域名)
+# 新数据源只要实现 search_candidates / fetch_broker_info（+ candidates_from_urls）
+# 就能挂进来，pipeline 其余部分与数据源无关。
+FEEDS = {
+    "loopnet": (loopnet, "LoopNet", "loopnet.com"),
+    "crexi": (crexi, "Crexi", "crexi.com"),
+    "cityfeet": (cityfeet, "CityFeet", "cityfeet.com"),
+    "commercialcafe": (commercialcafe, "CommercialCafe", "commercialcafe.com"),
+    "commercialsearch": (commercialsearch, "CommercialSearch", "commercialsearch.com"),
+    "officespace": (officespace, "OfficeSpace", "officespace.com"),
+    "cbre": (cbre, "CBRE", "cbre.com"),
+}
+
+
+def feed_of(source: str):
+    return FEEDS.get((source or "loopnet").strip().lower()) or FEEDS["loopnet"]
 
 
 def _manual_candidates(urls: list, source: str = "loopnet") -> dict:
     """手动链接：只解析与当前步骤1 数据源同站的链接。
 
-    两条线互不替代——选了 Crexi 就只认 crexi.com 的链接，贴了 LoopNet 链接
-    不会"顺手帮你跑"，而是明确报错并忽略，避免把两个数据源的数据混进同一次任务。
+    各数据源互不替代——选了 Crexi 就只认 crexi.com 的链接，贴了别家链接
+    不会"顺手帮你跑"，而是明确报错并忽略，避免把多个数据源的数据混进同一次任务。
     """
-    is_crexi = (source or "loopnet").strip().lower() == "crexi"
-    mod, expect, label = ((crexi, "crexi.com", "Crexi") if is_crexi
-                          else (loopnet, "loopnet.com", "LoopNet"))
+    mod, label, expect = feed_of(source)
     ok = [u for u in urls if expect in (u or "").lower()]
     skipped = [u for u in urls if u not in ok]
     if not ok:
@@ -75,10 +91,9 @@ class TaskRunner:
         city, state = p["city"], p["state"]
         price_min, price_max = int(p.get("price_min") or 0), int(p.get("price_max") or 2000)
         target = int(p.get("target") or 3)
-        # 步骤1 数据源：LoopNet（默认）/ Crexi，两者同构（同样的筛选口径与候选结构）
+        # 步骤1 数据源：LoopNet（默认）/ Crexi / CityFeet …（见 FEEDS 注册表）
         source = (p.get("source") or "loopnet").strip().lower()
-        feed = crexi if source == "crexi" else loopnet
-        src_label = "Crexi" if source == "crexi" else "LoopNet"
+        feed, src_label, _domain = feed_of(source)
         known_count = store.count_known()
         self.emit(f"开始核查：{city}, {state}，价格 ${price_min}-${price_max}/月，目标 {target} 个地址；"
                   f"步骤1 数据源：{src_label}；收录表共 {known_count} 条")
@@ -95,7 +110,9 @@ class TaskRunner:
             - 跨任务记住查过的页，下次从没查过的页里随机排在前面
             - 一直跑到「达到目标通过数」或「所有页都跑完」为止
             """
-            per_page = 60 if source == "crexi" else 40     # Crexi 每页 60 条 / LoopNet 40 条
+            # 各源每页条数不同：Crexi 60 / CityFeet 30 / Commercial* 30 / LoopNet 40
+            per_page = {"crexi": 60, "cityfeet": 30, "commercialcafe": 30,
+                        "commercialsearch": 30}.get(source, 40)
             skey = store.page_key(city, state, price_min, price_max, source=source)
             seen_pages = store.page_seen_set(skey)        # 历史任务翻过的页（跨任务记忆）
             used: set = set()
@@ -560,8 +577,8 @@ class TaskRunner:
                     # 地址本身有效、只是缺房间号且挖不到 → 不能判死：
                     # 房源和价格都是真实的（实测 10524 Watterson Trail 790 SF $1,200/月
                     # 就在预算内），只是 Smarty 要求 secondary。转待人工，不写失败档案。
-                    note = (f"地址有效但缺房间号（{r2['message'][:60]}），"
-                            f"Smarty 未挖到可验证的套间号，需人工确认具体套间")
+                    note = (f"缺房间号且 Smarty 未挖到可验证套间"
+                            f"（{r2['message'][:70]}），需人工确认具体套间")
                     store.update_record(record_id, conclusion="待人工",
                                         notes=note, screenshots=shots)
                     self.emit(f"  {note} → 转待人工，继续下一个", "warn")

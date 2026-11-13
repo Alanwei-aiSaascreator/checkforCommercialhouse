@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from server import store
 from server import excel_export
 from server.steps import smarty
-from server.pipeline import RUNNERS, start_task
+from server.pipeline import FEEDS, RUNNERS, start_task
 
 BASE = Path(__file__).resolve().parent
 SHOTS = Path(store.config.SHOTS_DIR).resolve()
@@ -178,8 +178,8 @@ def api_known_import(body: dict):
 @app.post("/api/tasks")
 def api_task_start(body: dict):
     source = (body.get("source") or "loopnet").strip().lower()
-    if source not in ("loopnet", "crexi"):
-        raise HTTPException(400, "source 只能是 loopnet 或 crexi")
+    if source not in FEEDS:
+        raise HTTPException(400, "source 只能是 " + " / ".join(FEEDS.keys()))
     params = {
         "city": (body.get("city") or "").strip(),
         "state": (body.get("state") or "").strip().upper(),
