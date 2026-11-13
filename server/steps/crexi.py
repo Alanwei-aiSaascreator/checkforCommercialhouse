@@ -547,6 +547,9 @@ def _candidate_from_item(item: dict) -> dict:
     spaces = _item_spaces(item)
     rng = item.get("leaseRateRange") or {}
     total_monthly = (rng.get("totalMonthly") or "").strip()
+    # "0" / "$0" 是接口的占位值，不是真的免租 → 当无价处理
+    if re.fullmatch(r"\$?\s*0(?:\.0+)?", total_monthly.replace(",", "")):
+        total_monthly = ""
     per_sf = (rng.get("perSqftAnnual") or "").strip()
 
     # 面积：优先最小的可租套间（整栋面积会把预算内小套间算死）
