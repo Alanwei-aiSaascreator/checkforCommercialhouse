@@ -123,9 +123,16 @@ class TaskRunner:
             while not self.stopped and approved < target:
                 if not plan:
                     if not total_pages:
-                        # 用第 1 页探总页数（只为读分页条，不代表优先查第 1 页）
-                        plan = [1]
-                        self.emit("步骤1：先用第 1 页探测该搜索条件共有多少页...")
+                        # 总页数未知（数据源没暴露分页条）：必须逐页往下探，
+                        # 否则会永远只跑第 1 页——实测 CityFeet 卡在首页反复抓同一批，
+                        # 已收录的全跳过、页面一直停在同一个列表页
+                        nxt = (max(used) + 1) if used else 1
+                        plan = [nxt]
+                        if nxt == 1:
+                            self.emit("步骤1：先用第 1 页探测该搜索条件共有多少页...")
+                        else:
+                            self.emit(f"步骤1：总页数未知，顺序探测第 {nxt} 页"
+                                      f"（遇到空页即认定到末页）...")
                     else:
                         remaining = [p for p in range(1, total_pages + 1)
                                      if p not in used and p not in seen_pages]

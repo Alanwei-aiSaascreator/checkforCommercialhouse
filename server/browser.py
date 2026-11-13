@@ -72,8 +72,19 @@ def _alive() -> bool:
 
 
 def _reset():
-    """丢弃本线程失效的 context 与驱动，回到干净状态。"""
+    """丢弃本线程失效的 context 与驱动，回到干净状态。
+
+    必须连 st.extra（其它配置目录的 Chrome）一起清掉：pw.stop() 会连带杀掉
+    这些浏览器，Python 侧的 ctx 对象就变成僵尸——再用它 new_page() 会抛
+    "Event loop is closed! Is Playwright already stopped?"（实测任务中途崩过）。
+    """
     st = _state()
+    for ctx in list((getattr(st, "extra", {}) or {}).values()):
+        try:
+            ctx.close()
+        except Exception:
+            pass
+    st.extra = {}
     if st.context is not None:
         try:
             st.context.close()
@@ -114,23 +125,39 @@ def new_page_in(profile_name: str):
     extra = getattr(st, "extra", None)
     if extra is None:
         extra = st.extra = {}
-    ctx = extra.get(profile_name)
+    ctx = extra.pop(profile_name, None)
     if ctx is not None:
         try:
-            ctx.pages          # 连接已断会抛
+            ctx.pages                  # 连接已断会抛
+            page = ctx.new_page()      # 驱动被 stop 会抛 Event loop is closed
+            block_translate(page)
+            extra[profile_name] = ctx
+            return page
         except Exception:
-            ctx = None
-    if ctx is None:
-        d = config.CHROME_PROFILE_DIR.parent / profile_name
+            try:
+                ctx.close()
+            except Exception:
+                pass
+    # 走到这里：没有缓存 / 缓存已死 → 重建（驱动也可能已被 _reset 停掉）
+    d = config.CHROME_PROFILE_DIR.parent / profile_name
+    last = None
+    for attempt in range(2):
+        if st.pw is None:
+            st.pw = sync_playwright().start()
         try:
-            ctx = st.pw.chromium.launch_persistent_context(
-                str(d), channel="chrome", **_launch_kw())
-        except Exception:
-            ctx = st.pw.chromium.launch_persistent_context(str(d), **_launch_kw())
-        extra[profile_name] = ctx
-    page = ctx.new_page()
-    block_translate(page)
-    return page
+            try:
+                ctx = st.pw.chromium.launch_persistent_context(
+                    str(d), channel="chrome", **_launch_kw())
+            except Exception:
+                ctx = st.pw.chromium.launch_persistent_context(str(d), **_launch_kw())
+            page = ctx.new_page()
+            extra[profile_name] = ctx
+            block_translate(page)
+            return page
+        except Exception as e:
+            last = e
+            _stop_pw()                 # 驱动大概率已死，重启后再试一次
+    raise last
 
 
 def _ensure_context():
@@ -139,10 +166,14 @@ def _ensure_context():
     st = _state()
     if st.context is not None and _alive():
         return st.context
-    # 连接失效或首次使用：清理残留（驱动/浏览器可能已死），重建
-    _reset()
+    # 只有「旧连接确实失效」才整体重置。首次创建主 context 时不能调 _reset()：
+    # 那时 pw 往往已被 new_page_in() 启动（feeds 的 Chrome 正跑着），
+    # pw.stop() 会把它一起杀掉，后续再开页就抛 "Event loop is closed"（实测任务中途崩）
+    if st.context is not None:
+        _reset()
     profile_dir = _profile_dir()
-    st.pw = sync_playwright().start()
+    if st.pw is None:
+        st.pw = sync_playwright().start()
     launch_kw = _launch_kw()
     try:
         try:

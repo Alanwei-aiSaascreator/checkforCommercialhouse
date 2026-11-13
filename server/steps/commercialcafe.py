@@ -64,9 +64,34 @@ def _city_path(city: str, state: str, base: str = "") -> str:
 
 
 def _list_url(city: str, state: str, page: int, base: str = "") -> str:
+    """分页参数是 **Page（大写 P）**：?listingType=lease&Page=2。
+    小写 page 无效，会永远返回第 1 页（实测翻页后内容完全一样）。"""
     url = _city_path(city, state, base)
-    q = "?listingType=lease" + (f"&page={page}" if page > 1 else "")
+    q = "?listingType=lease" + (f"&Page={page}" if page > 1 else "")
     return url + q
+
+
+_PAGES_JS = r"""
+() => {
+    const nums = [...document.querySelectorAll("a[href]")]
+        .map(a => a.getAttribute("href") || "")
+        .map(h => { const m = /[?&]page=(\d+)/i.exec(h); return m ? +m[1] : 0; })
+        .filter(n => n > 0);
+    const body = document.body.innerText || "";
+    let total = 0;
+    // "1-30 of 459" 形式最准
+    const rng = /([\d,]+)\s*[-–]\s*([\d,]+)\s*of\s*([\d,]+)/i.exec(body);
+    if (rng) total = +rng[3].replace(/,/g, "");
+    if (!total) {
+        // "365 listings" / "459 Properties" / "128 results"：
+        // 页面上可能同时有「30 results（本页条数）」和「459 listings（总数）」→ 取最大
+        const all = [...body.matchAll(/([\d,]+)\s*(?:listings?|properties|results)\b/gi)]
+            .map(m => +m[1].replace(/,/g, "")).filter(n => n > 0);
+        if (all.length) total = Math.max(...all);
+    }
+    return {maxPage: nums.length ? Math.max(...nums) : 0, totalListings: total};
+}
+"""
 
 
 _ADDR_RE = re.compile(r"(.+?),\s*([A-Za-z .]+),\s*([A-Z]{2})\s*$")
@@ -170,6 +195,7 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
     page_no = max(int(page or 1), 1)
     url = _list_url(city, state, page_no, base)
     shot = ""
+    pages = 0
     cards: list = []
     pg = browser.new_page_in(_PROFILE)
     try:
@@ -193,6 +219,13 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
             low = (pg.evaluate("() => document.body.innerText") or "").lower()
         except Exception:
             low = ""
+        # 总页数：优先用「365 listings / 每页 30」算，退回分页条最大页码
+        try:
+            pgn = pg.evaluate(_PAGES_JS) or {}
+        except Exception:
+            pgn = {}
+        _total_listings = int(pgn.get("totalListings") or 0)
+        pages = ((_total_listings + 29) // 30) if _total_listings else int(pgn.get("maxPage") or 0)
         if not cards and any(k in low for k in _BLOCK_KEYWORDS):
             return {"status": "fail",
                     "message": "CommercialCafe 被 Cloudflare 拦截：稍后重试（挑战页需等 10~15s）",
@@ -200,7 +233,7 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
         if not cards:
             return {"status": "warn",
                     "message": f"CommercialCafe 第 {page_no} 页无候选（{city}, {state}）",
-                    "candidates": [], "screenshot": shot, "total_pages": 0,
+                    "candidates": [], "screenshot": shot, "total_pages": pages,
                     "not_found": page_no > 1}
     except Exception as e:
         return {"status": "fail", "message": f"CommercialCafe 访问失败: {str(e)[:80]}",
@@ -226,10 +259,10 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
         if len(candidates) >= limit:
             break
 
-    msg = (f"CommercialCafe 第 {page_no} 页采集到 {len(candidates)} 个候选"
+    msg = (f"CommercialCafe 第 {page_no}/{pages or '?'} 页采集到 {len(candidates)} 个候选"
            if candidates else f"CommercialCafe 第 {page_no} 页未解析到候选")
     return {"status": "pass" if candidates else "warn", "message": msg,
-            "candidates": candidates, "screenshot": shot, "total_pages": 0}
+            "candidates": candidates, "screenshot": shot, "total_pages": pages}
 
 
 def fetch_broker_info(listing_url: str) -> dict:

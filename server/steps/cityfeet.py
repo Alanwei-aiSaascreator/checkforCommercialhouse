@@ -39,6 +39,15 @@ _CARDS_JS = r"""
 }).filter(c => c.text)
 """
 
+_PAGES_JS = r"""
+() => {
+    const nums = [...document.querySelectorAll("a[href*='pgnum']")]
+        .map(a => parseInt((/pgnum=(\d+)/.exec(a.getAttribute("href") || "") || [])[1] || 0))
+        .filter(n => n > 0);
+    return nums.length ? Math.max(...nums) : 0;
+}
+"""
+
 _DETAIL_JS = r"""
 () => {
     const body = document.body.innerText || "";
@@ -166,6 +175,11 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
             low = (pg.evaluate("() => document.body.innerText") or "").lower()
         except Exception:
             low = ""
+        # 分页条最大页码（?pgnum=N）。读不到会返回 0 → pipeline 会退化为逐页探测
+        try:
+            total = int(pg.evaluate(_PAGES_JS) or 0)
+        except Exception:
+            total = 0
         if any(k in low for k in _BLOCK_KEYWORDS):
             return {"status": "fail",
                     "message": "CityFeet 拦截（验证码/限流）：请稍后重试或换节点",
@@ -207,11 +221,11 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
         if len(candidates) >= limit:
             break
 
-    msg = (f"CityFeet 第 {page_no} 页采集到 {len(candidates)} 个候选"
+    msg = (f"CityFeet 第 {page_no}/{total or '?'} 页采集到 {len(candidates)} 个候选"
            f"（{city} {_PTYPE} 出租；价格以详情页为准）"
            if candidates else f"CityFeet 第 {page_no} 页未解析到候选")
     return {"status": "pass" if candidates else "warn", "message": msg,
-            "candidates": candidates, "screenshot": shot, "total_pages": 0}
+            "candidates": candidates, "screenshot": shot, "total_pages": total}
 
 
 def fetch_broker_info(listing_url: str) -> dict:

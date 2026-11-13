@@ -41,6 +41,18 @@ _CARDS_JS = r"""
 }
 """
 
+_PAGES_JS = r"""
+() => {
+    const nums = [...document.querySelectorAll("a[href*='page=']")]
+        .map(a => { const m = /page=(\d+)/.exec(a.getAttribute("href") || ""); return m ? +m[1] : 0; })
+        .filter(n => n > 0);
+    const body = document.body.innerText || "";
+    const m = /([\d,]+)\s*results?/i.exec(body);
+    return {maxPage: nums.length ? Math.max(...nums) : 0,
+            total: m ? +m[1].replace(/,/g, "") : 0};
+}
+"""
+
 _PRICE_RE = re.compile(r"\$\s*[\d,]+(?:\.\d+)?\s*(?:-\s*\$?\s*[\d,]+(?:\.\d+)?\s*)?"
                        r"(?:/\s*(?:SF\s*/?\s*)?(?:MO|YR|MONTH|YEAR))?", re.I)
 _SIZE_RE = re.compile(r"([\d,]+)\s*(?:-\s*([\d,]+))?\s*(?:sq\.?\s*ft|SF)", re.I)
@@ -55,14 +67,37 @@ def _list_url(city: str, state: str, page: int) -> str:
     return f"{url}?page={page}" if page > 1 else url
 
 
-def _parse_card(text: str) -> dict:
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+_ADDR_RE = re.compile(
+    r"(\d{2,6}\s+[A-Za-z0-9 .'\-]{2,40}?\s(?:St|Street|Ave|Avenue|Dr|Drive|Rd|Road|Blvd|"
+    r"Boulevard|Pkwy|Parkway|Way|Ln|Lane|Hwy|Highway|Pl|Place|Ct|Court|Cir|Circle|Pike|"
+    r"Trail|Trl)\b)", re.I)
+
+_STREET_RX = re.compile(r"(st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|pkwy|way|"
+                        r"ln|lane|hwy|highway|pl|place|ct|court|cir|circle)", re.I)
+
+
+def _addr_from_url(url: str) -> str:
+    """卡片文案常被楼名/价格挤成一团，URL slug 反而是最干净的地址来源：
+    /ky/louisville/2339802-10200-linn-station-road-2nd-floor → 10200 Linn Station Road 2nd Floor"""
+    m = re.search(r"/[a-z]{2}/[a-z0-9\-]+/\d+-([^/?#]+)", url or "")
+    if not m:
+        return ""
+    words = m.group(1).replace("-", " ").split()
+    return " ".join(w if w.isdigit() else w.capitalize() for w in words).strip()
+
+
+def _parse_card(text: str, url: str = "") -> dict:
+    text = text or ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     addr = price = area = ""
+    m_addr = _ADDR_RE.search(text)
+    if m_addr:
+        addr = re.sub(r"\s+", " ", m_addr.group(1)).strip()
+    if not addr:
+        addr = _addr_from_url(url)
     for ln in lines:
         # 地址行：有数字 + 街名后缀，且不能是「1,146 Sq. Ft. 1st floor - $1,300/month」这类
-        if (not addr and re.search(r"\d", ln)
-                and re.search(r"(st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|pkwy|way|"
-                              r"ln|lane|hwy|highway|pl|place|ct|court|cir|circle)\b", ln, re.I)
+        if (not addr and re.search(r"\d", ln) and _STREET_RX.search(ln)
                 and not re.search(r"sq\.?\s*ft|\$|/month|/mo\b", ln, re.I)
                 and len(ln) < 80):
             addr = re.sub(r"\s+", " ", ln).strip(" |,")
@@ -91,6 +126,7 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
     page_no = max(int(page or 1), 1)
     url = _list_url(city, state, page_no)
     shot = ""
+    pages = 0
     cards: list = []
     pg = browser.new_page_in(_PROFILE)
     try:
@@ -108,6 +144,12 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
             low = (pg.evaluate("() => document.body.innerText") or "").lower()
         except Exception:
             low = ""
+        try:
+            pgn = pg.evaluate(_PAGES_JS) or {}
+        except Exception:
+            pgn = {}
+        _total = int(pgn.get("total") or 0)
+        pages = ((_total + 29) // 30) if _total else int(pgn.get("maxPage") or 0)
         if not cards and any(k in low for k in _BLOCK_KEYWORDS):
             return {"status": "fail", "message": "OfficeSpace 被拦截（验证码/限流）",
                     "candidates": [], "screenshot": shot, "total_pages": 0}
@@ -115,7 +157,7 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
             nf = "page not found" in low or "404" in low
             return {"status": "warn",
                     "message": f"OfficeSpace 第 {page_no} 页无候选（{city}, {state}）",
-                    "candidates": [], "screenshot": shot, "total_pages": 0,
+                    "candidates": [], "screenshot": shot, "total_pages": pages,
                     "not_found": nf or page_no > 1}
     except Exception as e:
         return {"status": "fail", "message": f"OfficeSpace 访问失败: {str(e)[:80]}",
@@ -125,7 +167,7 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
 
     candidates, seen = [], set()
     for c in cards:
-        p = _parse_card(c.get("text", ""))
+        p = _parse_card(c.get("text", ""), c.get("url", ""))
         addr = p["address"]
         if not addr or not re.search(r"\d", addr):
             continue
@@ -141,10 +183,10 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
         if len(candidates) >= limit:
             break
 
-    msg = (f"OfficeSpace 第 {page_no} 页采集到 {len(candidates)} 个候选"
+    msg = (f"OfficeSpace 第 {page_no}/{pages or '?'} 页采集到 {len(candidates)} 个候选"
            if candidates else f"OfficeSpace 第 {page_no} 页未解析到候选")
     return {"status": "pass" if candidates else "warn", "message": msg,
-            "candidates": candidates, "screenshot": shot, "total_pages": 0}
+            "candidates": candidates, "screenshot": shot, "total_pages": pages}
 
 
 def fetch_broker_info(listing_url: str) -> dict:
