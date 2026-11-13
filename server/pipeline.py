@@ -292,9 +292,14 @@ class TaskRunner:
             #   * 联系方式/面积缺失仍要开页：SOP 要求中介+电话是硬字段，
             #     而且 email 从未在卡片上出现过，不能拿它当开页理由
             undisclosed = bool(cand.get("undisclosed"))
+            # 该数据源以详情页为唯一价格口径（Crexi）：卡片价不参与淘汰，
+            # 除"价格未披露"外一律进详情页看套间表（实测 63% 的淘汰必须看套间表）
+            detail_prices = bool(getattr(feed, "DETAIL_IS_PRICE_SOURCE", False))
             if undisclosed:
                 # 价格未披露：详情页也是同一句话，开了也拿不到数字 → 直接转人工
                 need_detail = False
+            elif detail_prices:
+                need_detail = True
             else:
                 need_detail = (not cand.get("price") or not cand.get("area")
                                or pstate != "pass"
@@ -311,6 +316,7 @@ class TaskRunner:
             })
             shots = []
             spaces: list = []
+            info: dict = {}
 
             # SOP：价格/中介姓名/联系方式/面积都是硬性字段——搜索卡片缺哪个就去详情页补抓
             if cand.get("listing_url") and need_detail:
@@ -320,6 +326,12 @@ class TaskRunner:
                 for k in ("agent", "phone", "email", "price", "area"):
                     if info.get(k) and not cand.get(k):
                         cand[k] = info[k]
+                if detail_prices and info.get("price"):
+                    # 该数据源以详情页价格为准：卡片价直接换成详情页价，
+                    # 避免同一房源出现"卡片说超预算、套间表说在预算内"两套数字
+                    cand["price"] = info["price"]
+                    if info.get("area"):
+                        cand["area"] = info["area"]
                 if any(info.get(k) for k in ("agent", "phone", "email", "price", "area")):
                     store.update_record(record_id, agent=cand.get("agent", ""),
                                         phone=cand.get("phone", ""),
@@ -393,8 +405,15 @@ class TaskRunner:
                 break
             photos = []
             if cand.get("listing_url"):
-                self.emit("下载房源照片并做办公适用性 AI 预筛...")
-                photos = streetview.grab_listing_photos(cand["listing_url"], tag=f"r{record_id}")
+                # 详情页已经拿到图片 URL → 直接下，不再开一次同样的详情页（省 ~10s/条）
+                photo_urls = info.get("photo_urls") or []
+                if photo_urls:
+                    self.emit(f"下载房源照片（复用详情页图片 {len(photo_urls)} 张，免二次开页）...")
+                    photos = streetview.download_photo_urls(
+                        photo_urls, tag=f"r{record_id}", referer=cand["listing_url"])
+                if not photos:
+                    self.emit("下载房源照片并做办公适用性 AI 预筛...")
+                    photos = streetview.grab_listing_photos(cand["listing_url"], tag=f"r{record_id}")
                 if photos:
                     self.emit(f"  已下载 {len(photos)} 张房源照片（360/全景图优先）")
                     shots.extend(photos[:3])  # 房源图入档（记录页展示用）

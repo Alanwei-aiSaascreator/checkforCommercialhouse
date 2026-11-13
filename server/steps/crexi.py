@@ -21,8 +21,16 @@ from .loopnet import _parse_area, _parse_price, monthly_price
 _BASE = "https://www.crexi.com"
 _SEARCH = _BASE + "/search/properties-for-lease/"
 
+# 价格只认详情页（套间表）：搜索卡片上的 "$X/SF/MO" 常是整层口径，
+# 按它粗判会误杀小套间。pipeline 读到本标记后，卡片阶段不再做价格淘汰，
+# 除"价格未披露"外一律进详情页取价（详见 pipeline need_detail）。
+DETAIL_IS_PRICE_SOURCE = True
+
 _BLOCK_KEYWORDS = ("access denied", "are you a robot", "unusual traffic", "captcha",
-                   "verify you are human", "too many requests")
+                   "verify you are human", "too many requests",
+                   # Cloudflare 挑战页（实测出现过：截图为 "Performing security verification"）
+                   "security verification", "verifying you are not a bot",
+                   "just a moment", "checking your browser")
 _NOT_FOUND_KEYWORDS = ("error 404", "page not found")
 
 # 翻译拦截已统一到 browser.new_page()（所有步骤共用），这里只做别名方便阅读
@@ -266,7 +274,15 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
     shot_path = ""
     pg = browser.new_page()
     try:
-        browser.goto_retry(pg, url, timeout=60000, wait=7000)
+        # 卡片渲染时间波动大（实测 5~10s，固定 7s 空等会拿到空页误判"无候选"）：
+        # 先短等，再轮询等卡片真的出现（最多 24s），出现即走 —— 比固定空等更稳也更快
+        browser.goto_retry(pg, url, timeout=60000, wait=2000)
+        cards: list = []
+        for _ in range(12):
+            cards = pg.evaluate(_CARDS_JS) or []
+            if cards:
+                break
+            pg.wait_for_timeout(2000)
         shot_path = browser.shot(pg, f"{tag}_crexi")
         body = pg.evaluate("() => document.body.innerText")
         low = (body or "").lower()
@@ -353,21 +369,69 @@ def candidates_from_urls(urls: list) -> dict:
             "candidates": candidates, "screenshot": shot_path or ""}
 
 
+_PHOTOS_JS = r"""
+(limit) => {
+    const urls = [];
+    const og = document.querySelector("meta[property='og:image']");
+    if (og && og.content) urls.push(og.content);
+    for (const img of document.querySelectorAll('img')) {
+        const s = img.currentSrc || img.src || '';
+        if (!s.startsWith('http')) continue;
+        if (/logo|icon|sprite|avatar|placeholder|favicon/i.test(s)) continue;
+        if (img.naturalWidth && img.naturalWidth < 500) continue;
+        urls.push(s);
+        if (urls.length >= limit) break;
+    }
+    return [...new Set(urls)];
+}
+"""
+
+
+def _photo_urls(pg, limit: int = 8) -> list:
+    """在当前详情页取房源大图 URL（不下载，只记 URL，价格过关后再下）。"""
+    try:
+        urls = pg.evaluate(_PHOTOS_JS, limit) or []
+    except Exception:
+        return []
+    return [u for u in urls if isinstance(u, str) and u.startswith("http")]
+
+
 def fetch_broker_info(listing_url: str) -> dict:
-    """详情页补抓 价格/经纪人/面积 + 各套间面积与单价（spaces）。
-    电话/邮箱未登录打码 → 返回空串（不猜、不伪造）。"""
-    info = {"price": "", "agent": "", "phone": "", "email": "", "area": "", "spaces": []}
+    """详情页补抓 价格/经纪人/面积 + 各套间面积与单价（spaces）+ 房源图 URL。
+    电话/邮箱未登录打码 → 返回空串（不猜、不伪造）。
+
+    顺带取图：价格过关后直接下这些 URL，省掉再开一次同一张详情页（约 10s/条）。
+    """
+    info = {"price": "", "agent": "", "phone": "", "email": "", "area": "",
+            "spaces": [], "photo_urls": []}
     if not listing_url:
         return info
     pg = browser.new_page()
     try:
-        # 固定空等 6s 太贵：DOMContentLoaded 后 4s 足够渲染价格/套间表
-        # （提速只压"无意义空等"，不提高请求频率，反爬策略不变）
-        browser.goto_retry(pg, listing_url, timeout=60000, wait=4000)
+        # 不再固定空等：实测价格/套间表约 2.4s 就绪，改为"等元素出现即走"
+        # （最多再等 8s；拦截页会一直等不到，仍走原有失败路径）
+        browser.goto_retry(pg, listing_url, timeout=60000, wait=800)
+        # 只等「套间表」元素：价格元素先出现时套间/经纪人还没渲染完（实测会解析出空中介、
+        # 价格里混进 "| 507 days on market"），所以以 space 为准，等到就走（最多约 6.4s）
+        for _ in range(8):
+            try:
+                ready = pg.evaluate("() => document.querySelectorAll('[data-cy=space]').length")
+            except Exception:
+                ready = 0
+            if ready:
+                break
+            pg.wait_for_timeout(800)
         cand = _detail_candidate(pg, listing_url)
         for k in ("price", "agent", "area"):
             info[k] = cand.get(k, "")
         info["spaces"] = cand.get("spaces") or []
+        # 图片多为懒加载：轻滚一屏再取 URL（实测 800ms 大图基本齐）
+        try:
+            pg.mouse.wheel(0, 900)
+            pg.wait_for_timeout(800)
+        except Exception:
+            pass
+        info["photo_urls"] = _photo_urls(pg)
     except Exception:
         pass
     finally:

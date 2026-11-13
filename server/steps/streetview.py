@@ -121,6 +121,40 @@ def _grab_listing_photos(listing_url: str, tag: str, limit: int = 3) -> list[str
     return paths
 
 
+def download_photo_urls(urls: list, tag: str, referer: str = "", limit: int = 3) -> list[str]:
+    """下载已知图片 URL（详情页已解析出来），不再导航整页。
+
+    用浏览器上下文的 request API：共享 Cookie/UA、可补 Referer，
+    与 _grab_listing_photos 同一套下载方式，只是省掉第二次打开详情页。
+    360 全景/虚拟看房图优先（与 _grab_listing_photos 一致）。"""
+    if not urls:
+        return []
+    prio = [u for u in urls if any(k in u.lower() for k in ("360", "tour", "panorama", "virtual"))]
+    ordered = prio + [u for u in urls if u not in prio]
+    paths: list[str] = []
+    page = new_page()
+    try:
+        for src in ordered:
+            if len(paths) >= limit:
+                break
+            try:
+                resp = page.context.request.get(
+                    src, headers={"Referer": referer or _listing_origin(src)}, timeout=20000)
+                if resp.status != 200:
+                    continue
+                body = resp.body()
+                if len(body) < 8000:      # 太小的是占位图
+                    continue
+                p = Path(config.SHOTS_DIR) / f"{tag}_photo{len(paths)}.jpg"
+                p.write_bytes(body)
+                paths.append(str(p))
+            except Exception:
+                continue
+    finally:
+        safe_close(page)
+    return paths
+
+
 def _geocode(address: str):
     """普查局免费地理编码，返回 (lat, lon) 或 None。"""
     try:
