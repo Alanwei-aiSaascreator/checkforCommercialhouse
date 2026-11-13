@@ -55,6 +55,9 @@ _PAGES_JS = r"""
 
 _PRICE_RE = re.compile(r"\$\s*[\d,]+(?:\.\d+)?\s*(?:-\s*\$?\s*[\d,]+(?:\.\d+)?\s*)?"
                        r"(?:/\s*(?:SF\s*/?\s*)?(?:MO|YR|MONTH|YEAR))?", re.I)
+# 必须带周期的报价：$1,000/MO / From $1,294/MO / $18.50/SF/YR
+_PRICE_MO_RE = re.compile(r"(?:from\s*)?\$\s*[\d,]+(?:\.\d+)?\s*(?:-\s*\$?\s*[\d,]+(?:\.\d+)?\s*)?"
+                          r"/\s*(?:SF\s*/\s*)?(?:MO|YR|MONTH|YEAR)\b", re.I)
 _SIZE_RE = re.compile(r"([\d,]+)\s*(?:-\s*([\d,]+))?\s*(?:sq\.?\s*ft|SF)", re.I)
 
 
@@ -68,8 +71,8 @@ def _list_url(city: str, state: str, page: int) -> str:
 
 
 _ADDR_RE = re.compile(
-    r"(\d{2,6}\s+[A-Za-z0-9 .'\-]{2,40}?\s(?:St|Street|Ave|Avenue|Dr|Drive|Rd|Road|Blvd|"
-    r"Boulevard|Pkwy|Parkway|Way|Ln|Lane|Hwy|Highway|Pl|Place|Ct|Court|Cir|Circle|Pike|"
+    r"(\d{2,6},?\s+[A-Za-z][A-Za-z0-9 .,'\-]{1,40}?\s(?:St|Street|Ave|Avenue|Dr|Drive|Rd|Road|"
+    r"Blvd|Boulevard|Pkwy|Parkway|Way|Ln|Lane|Hwy|Highway|Pl|Place|Ct|Court|Cir|Circle|Pike|"
     r"Trail|Trl)\b)", re.I)
 
 _STREET_RX = re.compile(r"(st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|pkwy|way|"
@@ -93,8 +96,11 @@ def _parse_card(text: str, url: str = "") -> dict:
     m_addr = _ADDR_RE.search(text)
     if m_addr:
         addr = re.sub(r"\s+", " ", m_addr.group(1)).strip()
-    if not addr:
-        addr = _addr_from_url(url)
+    if not addr or re.fullmatch(r"[\d,]+", addr.strip()):
+        # URL slug 只给出门牌号（/tn/nashville/2387843-501 → "501"）时算无效地址
+        slug_addr = _addr_from_url(url)
+        if slug_addr and not re.fullmatch(r"[\d,]+", slug_addr.strip()):
+            addr = slug_addr
     for ln in lines:
         # 地址行：有数字 + 街名后缀，且不能是「1,146 Sq. Ft. 1st floor - $1,300/month」这类
         if (not addr and re.search(r"\d", ln) and _STREET_RX.search(ln)
@@ -103,8 +109,12 @@ def _parse_card(text: str, url: str = "") -> dict:
             addr = re.sub(r"\s+", " ", ln).strip(" |,")
             continue
         if not price:
-            m = _PRICE_RE.search(ln)
-            if m and "$" in ln:
+            # 只认「$1,000/MO」这种带周期的报价。页面顶部的价格筛选器
+            # （"$129 | $180 | $400 | ..."）会被误当成房源价格，必须先排除
+            if ln.count("$") > 1 or ln.count("|") > 1:
+                continue
+            m = _PRICE_MO_RE.search(ln)
+            if m:
                 price = m.group(0).strip()
                 continue
         if not area:

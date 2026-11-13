@@ -435,16 +435,28 @@ _api_pg = {"pg": None}
 
 
 def _api_page():
-    """复用同一个 tab 发接口请求（每次新建要多等一次首页渲染，约 8s）。"""
+    """复用同一个 tab 发接口请求（每次新建要多等一次首页渲染，约 8s）。
+
+    必须停在 crexi.com 域名下且过了 Cloudflare 挑战：否则页内 fetch 是跨域/被拦，
+    报 "TypeError: Failed to fetch"（实测杀过 Chrome 进程后必现）。
+    """
     pg = _api_pg.get("pg")
     if pg is not None:
         try:
-            if not pg.is_closed():
-                return pg
+            if not pg.is_closed() and "crexi.com" in (pg.url or ""):
+                if "just a moment" not in (pg.title() or "").lower():
+                    return pg
         except Exception:
             pass
     pg = browser.new_page()
     browser.goto_retry(pg, _BASE, timeout=60000, wait=2500)
+    for _ in range(8):
+        try:
+            if "just a moment" not in (pg.title() or "").lower():
+                break
+        except Exception:
+            pass
+        pg.wait_for_timeout(1500)
     _api_pg["pg"] = pg
     return pg
 
@@ -492,6 +504,8 @@ def _item_spaces(item: dict) -> list:
             annual = _num(lr.get("totalAnnual"))
             if annual:
                 monthly = round(annual / 12, 2)
+        if monthly is not None and monthly <= 0:
+            monthly = None        # 接口偶尔给 0（占位）→ 当无价，别当"$0/月"算合规
         suspected = None
         if monthly is None:
             if per_mo is not None and per_mo <= _RATE_MAX_MO:
@@ -583,7 +597,21 @@ def _api_search(pg, city: str, state: str, page_no: int, size: int) -> dict:
         "sorting": {"searchAttributes.crexiSearchRank": "Descending",
                     "listingAttributes.dateActivated": "Descending"},
     }
-    return pg.evaluate(_API_FETCH_JS, [_SEARCH_API, payload]) or {}
+    last: dict = {}
+    for attempt in range(2):
+        try:
+            last = pg.evaluate(_API_FETCH_JS, [_SEARCH_API, payload]) or {}
+        except Exception as e:
+            last = {"status": 0, "text": str(e)[:120]}
+        if last.get("status") == 200 and last.get("text"):
+            return last
+        # 页内 fetch 失败多半是页面被挑战页顶掉/跨域 → 重建一次页面上下文再试
+        try:
+            browser.goto_retry(pg, _BASE, timeout=60000, wait=3000)
+            pg.wait_for_timeout(2000)
+        except Exception:
+            pass
+    return last
 
 
 def search_candidates(city: str, state: str, price_min: int, price_max: int,
