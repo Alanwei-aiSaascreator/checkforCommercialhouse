@@ -285,9 +285,20 @@ class TaskRunner:
             # 但 Ste 302A 336 SF × $28 ≈ $784 完全在预算内）。
             # 因此只要粗判不通过，就必须进详情页看「套间表」再定。
             pstate, pmonthly = _price_state(cand)
-            need_detail = (not cand.get("agent") or not cand.get("phone")
-                           or not cand.get("email") or not cand.get("price")
-                           or not cand.get("area") or pstate != "pass")
+            # 是否值得开详情页（每条 3-8s，是前半程最大耗时）：
+            #   * 卡片自己写 Undisclosed/价格面议 → 详情页只有同一句话，
+            #     拿不到数字，开了纯浪费（实测 44 条全是这种情况）
+            #   * 卡片完全没显示价格 → 仍开页（有一部分能在详情页补到真实价格）
+            #   * 联系方式/面积缺失仍要开页：SOP 要求中介+电话是硬字段，
+            #     而且 email 从未在卡片上出现过，不能拿它当开页理由
+            undisclosed = bool(cand.get("undisclosed"))
+            if undisclosed:
+                # 价格未披露：详情页也是同一句话，开了也拿不到数字 → 直接转人工
+                need_detail = False
+            else:
+                need_detail = (not cand.get("price") or not cand.get("area")
+                               or pstate != "pass"
+                               or not cand.get("agent") or not cand.get("phone"))
 
             record_id = store.insert_record({
                 "address": addr, "price": cand.get("price", ""),
@@ -365,8 +376,14 @@ class TaskRunner:
                     continue
                 if pstate == "unknown":
                     # 预算无法判定时不放行（否则 $/SF/YR 缺面积会算出错误月租）
-                    note = (f"价格无法判定预算：{cand.get('price') or '未抓到价格'}"
-                            f"，面积 {cand.get('area') or '未知'} SF，需人工核对是否 ≤${price_max}/月")
+                    if undisclosed:
+                        note = (f"价格未披露（Undisclosed/面议），面积 "
+                                f"{cand.get('area') or '未知'} SF，"
+                                f"未开详情页，需人工核对是否 ≤${price_max}/月")
+                    else:
+                        note = (f"价格无法判定预算：{cand.get('price') or '未抓到价格'}"
+                                f"，面积 {cand.get('area') or '未知'} SF，"
+                                f"需人工核对是否 ≤${price_max}/月")
                     store.update_record(record_id, conclusion="待人工", notes=note)
                     self.emit(f"  {note} → 转人工，继续下一个", "warn")
                     continue

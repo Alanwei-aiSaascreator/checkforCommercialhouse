@@ -236,13 +236,17 @@ def _detail_candidate(page, url: str, city: str = "", state: str = "") -> dict:
         pass
     addr = _parse_address(text, city, state) or title or og
     addr = re.sub(r"\s+", " ", addr).strip(" |")
+    price = _parse_price(text)
     return {
         "address": addr,
-        "price": _parse_price(text),
+        "price": price,
         "agent": _parse_broker(text),
         "phone": _parse_phone(text),
         "email": "",
         "area": _parse_area(text),
+        # 页面明确写 "Undisclosed"/"Contact for pricing" → 没有数字价格可抓
+        "undisclosed": (not price) and ("undisclosed" in (text or "").lower()
+                                        or "contact for pricing" in (text or "").lower()),
         "listing_url": url,
     }
 
@@ -375,13 +379,19 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
         if key in seen:
             continue
         seen.add(key)
+        card_text = c.get("text", "") or ""
+        card_price = _parse_price(card_text)
         candidates.append({
             "address": addr,
-            "price": _parse_price(c.get("text", "")),
-            "agent": _parse_broker(c.get("text", "")),
-            "phone": _parse_phone(c.get("text", "")),
+            "price": card_price,
+            "agent": _parse_broker(card_text),
+            "phone": _parse_phone(card_text),
             "email": "",
-            "area": _parse_area(c.get("text", "")),
+            "area": _parse_area(card_text),
+            # 卡片自己就写"价格面议"→ 详情页也没有数字，不必再开页（每条省 8s）
+            "undisclosed": (not card_price) and (
+                "undisclosed" in card_text.lower()
+                or "contact for pricing" in card_text.lower()),
             "listing_url": c["url"],
         })
         if len(candidates) >= limit:
@@ -466,7 +476,9 @@ def fetch_broker_info(listing_url: str) -> dict:
         return info
     page = browser.new_page()
     try:
-        browser.goto_retry(page, listing_url, timeout=45000, wait=5000)
+        # 固定空等 5s 太贵：DOMContentLoaded 后 3s 足够渲染价格/套间表
+        # （提速只压"无意义空等"，不提高请求频率，反爬策略不变）
+        browser.goto_retry(page, listing_url, timeout=45000, wait=3000)
         text = page.evaluate("() => document.body.innerText.slice(0, 8000)")
         info["price"] = _parse_price(text)
         info["agent"] = _parse_broker(text)

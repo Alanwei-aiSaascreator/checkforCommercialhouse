@@ -162,9 +162,13 @@ def _parse_card_text(text: str) -> dict:
         m = _CITY_LINE_RE.match(line)
         if m and i > 0:
             addr = _addr_from_line(line, lines[i - 1])
+    # 卡片自己写着 "Undisclosed Rate" → 详情页同样只会写这句话，开页纯属浪费 8 秒。
+    # 必须与"卡片上压根没显示价格"区分开：后者进详情页有机会补到真实价格。
+    undisclosed = "undisclosed" in (text or "").lower()
     return {"address": re.sub(r"\s+", " ", addr).strip(" |,"),
             "price": price,
-            "area": _parse_area("\n".join(lines))}
+            "area": _parse_area("\n".join(lines)),
+            "undisclosed": undisclosed and not price}
 
 
 def _parse_total_pages(page) -> int:
@@ -243,6 +247,7 @@ def _detail_candidate(page, url: str) -> dict:
         "phone": "",            # 未登录打码，不伪造
         "email": "",
         "area": building,
+        "undisclosed": "undisclosed" in str(info.get("price") or "").lower(),
         "listing_url": url,
         "spaces": _spaces_from_rows(info.get("spaces") or []),
     }
@@ -308,6 +313,7 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
             "phone": "",
             "email": "",
             "area": parsed["area"],
+            "undisclosed": parsed.get("undisclosed", False),
             "listing_url": c["url"],
         })
         if len(candidates) >= limit:
@@ -355,7 +361,9 @@ def fetch_broker_info(listing_url: str) -> dict:
         return info
     pg = browser.new_page()
     try:
-        browser.goto_retry(pg, listing_url, timeout=60000, wait=6000)
+        # 固定空等 6s 太贵：DOMContentLoaded 后 4s 足够渲染价格/套间表
+        # （提速只压"无意义空等"，不提高请求频率，反爬策略不变）
+        browser.goto_retry(pg, listing_url, timeout=60000, wait=4000)
         cand = _detail_candidate(pg, listing_url)
         for k in ("price", "agent", "area"):
             info[k] = cand.get(k, "")
