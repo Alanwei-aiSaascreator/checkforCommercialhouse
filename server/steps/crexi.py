@@ -23,7 +23,7 @@ _SEARCH = _BASE + "/search/properties-for-lease/"
 
 # 价格只认详情页（套间表）：搜索卡片上的 "$X/SF/MO" 常是整层口径，
 # 按它粗判会误杀小套间。pipeline 读到本标记后，卡片阶段不再做价格淘汰，
-# 除"价格未披露"外一律进详情页取价（详见 pipeline need_detail）。
+# 一律进详情页取价（含卡片写 Undisclosed 的；详见 pipeline need_detail）。
 DETAIL_IS_PRICE_SOURCE = True
 
 _BLOCK_KEYWORDS = ("access denied", "are you a robot", "unusual traffic", "captcha",
@@ -104,9 +104,10 @@ _DETAIL_JS = r"""
         .map(txt).filter(Boolean);
     const m = (document.body.innerText || "").match(/Listed by\s*([^\n]+)/);
     out.brokerage = m ? m[1].trim() : "";
-    // 套间：每块的头部三行 = 套间名 / 单价 / 面积
+    // 套间：取整块文案（前 3 行 = 套间名/单价/面积，块内后面还有
+    // Rentable SqFt、Total Monthly Rent —— 单价写 "Undisclosed" 时唯一能拿到月租的地方）
     out.spaces = [...document.querySelectorAll("[data-cy=space]")].map(e =>
-        (e.innerText || "").split("\n").map(s => s.trim()).filter(Boolean).slice(0, 3));
+        (e.innerText || "").slice(0, 900));
     return out;
 }
 """
@@ -170,8 +171,9 @@ def _parse_card_text(text: str) -> dict:
         m = _CITY_LINE_RE.match(line)
         if m and i > 0:
             addr = _addr_from_line(line, lines[i - 1])
-    # 卡片自己写着 "Undisclosed Rate" → 详情页同样只会写这句话，开页纯属浪费 8 秒。
-    # 必须与"卡片上压根没显示价格"区分开：后者进详情页有机会补到真实价格。
+    # 卡片写 "Undisclosed Rate" 只代表「卡片没价格」，不代表详情页没有：
+    # 实测 6210 Charlotte Pike 详情页头部同样是 Undisclosed，但套间块里有
+    # "Total Monthly Rent $2,500" —— 所以这个标记只用于日志提示，不再阻止开页。
     undisclosed = "undisclosed" in (text or "").lower()
     return {"address": re.sub(r"\s+", " ", addr).strip(" |,"),
             "price": price,
@@ -213,24 +215,81 @@ def _plausible_rate(rate: str) -> bool:
     return True
 
 
+def _labeled_value(lines: list, label: str) -> str:
+    """套间块里取「标签 → 下一行值」（实测：Rentable SqFt\\n2,000）。"""
+    for i, ln in enumerate(lines):
+        if label in (ln or "").lower():
+            for nxt in lines[i + 1:i + 3]:
+                v = re.sub(r"[^\d,]", "", nxt or "")
+                if v:
+                    return v.replace(",", "")
+    return ""
+
+
+def _total_monthly(lines: list) -> float | None:
+    """套间块里的「Total Monthly Rent」总月租（单价写 Undisclosed 时唯一的价格来源）。"""
+    for i, ln in enumerate(lines):
+        if re.search(r"total\s+monthly\s+rent", ln or "", re.I):
+            for nxt in lines[i + 1:i + 3]:
+                m = re.search(r"\$\s*([\d,]+(?:\.\d+)?)", nxt or "")
+                if m:
+                    try:
+                        return float(m.group(1).replace(",", ""))
+                    except ValueError:
+                        return None
+    return None
+
+
 def _spaces_from_rows(rows: list) -> list:
-    """套间行 → [{name, size, rate, monthly}]；缺面积或缺单价的跳过（与 LoopNet 一致）。"""
+    """套间块 → [{name, size, rate, monthly}]。
+
+    块结构（实测 Crexi 6210 Charlotte Pike）：
+        Space 6210            ← 套间名
+        Undisclosed           ← 单价（可以未披露）
+        2,000 SqFt            ← 面积
+        ...
+        Total Monthly Rent
+        $2,500                ← 单价未披露时，这里仍有真实月租，必须用上
+
+    只要拿到面积就保留该套间（单价缺失时 monthly=None，交给 pipeline 转人工），
+    不再因为「缺单价」整条丢弃——丢弃会让月租为 $2,500 的房源被当成"无套间"。
+    """
     spaces = []
-    for lines in rows or []:
+    for raw in rows or []:
+        if not raw:
+            continue
+        lines = (raw if isinstance(raw, list) else
+                 [ln.strip() for ln in str(raw).splitlines() if ln.strip()])
         if not lines:
             continue
         name = lines[0]
         rate = size = ""
         for ln in lines[1:]:
             low = ln.lower()
-            if not rate and ("$" in ln or "undisclosed" in low):
+            if not rate and not size and ("$" in ln or "undisclosed" in low):
                 rate = "" if "undisclosed" in low else _parse_price(ln)
             elif not size and re.search(r"sq\.?\s*ft|sqft|\bsf\b", ln, re.I):
                 size = _parse_area(ln)
-        if not (size and rate):
+        size = size or _labeled_value(lines, "rentable sqft") or _labeled_value(lines, "usable sqft")
+        if not size:
             continue
-        spaces.append({"name": name, "size": size, "rate": rate,
-                       "monthly": monthly_price(rate, size) if _plausible_rate(rate) else None})
+        monthly = _total_monthly(lines)
+        # 单价栏被误填成「每月总价」的房源（实测 76 Spring St：$5,200/SF/MO × 1,171 SF
+        # 会算出 600 万/月）→ monthly 留 None（不当单价用），另记一个疑似总价，
+        # 交给 pipeline：疑似总价都超预算时即可判死，落在预算内仍转人工复核
+        suspected = None
+        if monthly is None and rate:
+            if _plausible_rate(rate):
+                monthly = monthly_price(rate, size)
+            else:
+                m = re.search(r"\$\s*([\d,]+(?:\.\d+)?)", rate)
+                if m:
+                    try:
+                        suspected = float(m.group(1).replace(",", ""))
+                    except ValueError:
+                        suspected = None
+        spaces.append({"name": name, "size": size, "rate": rate, "monthly": monthly,
+                       "suspected_total": suspected})
     return spaces
 
 
@@ -266,9 +325,9 @@ def _detail_candidate(page, url: str) -> dict:
     }
 
 
-def search_candidates(city: str, state: str, price_min: int, price_max: int,
-                      limit: int = 60, tag: str = "search", page: int = 1) -> dict:
-    """按城市/州搜索 Crexi 出租房源（page 为结果页页码）。
+def _search_candidates_html(city: str, state: str, price_min: int, price_max: int,
+                            limit: int = 60, tag: str = "search", page: int = 1) -> dict:
+    """（旧实现，仅作接口失效时的兜底）按城市/州搜索 Crexi 出租房源。
 
     价格区间不交给 Crexi 的筛选项：它的 rate 过滤是「每平方英尺」口径，
     和 SOP 的「每月总租金」不是一回事。这里保持与 LoopNet 相同的做法——
@@ -346,6 +405,246 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
     return {"status": "pass" if candidates else "warn", "message": msg,
             "candidates": candidates, "screenshot": shot_path or "",
             "total_pages": total_pages}
+
+
+# ---------------------------------------------------------------------------
+# 搜索页改走 Crexi 自己的 JSON 接口（api.crexi.com/universal-search/v2/search）
+#
+# 为什么必须换（实测 Louisville, KY）：
+#   * 搜索页是「地图 + 列表」布局，DOM 里只渲染首屏 8 张卡片，滚动 window /
+#     mouse.wheel 都不会加载更多 → 400 条房源我们只看到 8 条，而且总页数
+#     也只能从懒渲染的分页条里读到 2 页，最后误报"共 2 页已全部遍历"
+#   * 卡片文案只有 $/SF 单价，没有月租
+#   * 接口一次给 60 条，每条自带 leaseRateRange.totalMonthly（"$1,200.14"）
+#     与 leaseDetails[].leaseRate.totalMonthly（$1,995.00 这种），
+#     月租直接可读 —— 判价根本不用开详情页
+# ---------------------------------------------------------------------------
+_SEARCH_API = "https://api.crexi.com/universal-search/v2/search"
+_API_PAGE_SIZE = 60
+
+_API_FETCH_JS = r"""
+async ([url, payload]) => {
+    const r = await fetch(url, {method: "POST",
+        headers: {"content-type": "application/json", "accept": "application/json"},
+        body: JSON.stringify(payload)});
+    return {status: r.status, text: await r.text()};
+}
+"""
+
+_api_pg = {"pg": None}
+
+
+def _api_page():
+    """复用同一个 tab 发接口请求（每次新建要多等一次首页渲染，约 8s）。"""
+    pg = _api_pg.get("pg")
+    if pg is not None:
+        try:
+            if not pg.is_closed():
+                return pg
+        except Exception:
+            pass
+    pg = browser.new_page()
+    browser.goto_retry(pg, _BASE, timeout=60000, wait=2500)
+    _api_pg["pg"] = pg
+    return pg
+
+
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _money(txt) -> str:
+    """统一成带 $ 的文案（接口有的字段自带 $，直接拼会出现 "$$1,200"）。"""
+    t = str(txt or "").strip()
+    if not t:
+        return ""
+    return t if t.startswith("$") else f"${t}"
+
+
+# 单价合理性上限：$/SF/YR > 200 或 $/SF/MO > 20 都说明「每月总价」被填进了单价栏
+_RATE_MAX_YR = 200.0
+_RATE_MAX_MO = 20.0
+
+
+def _item_spaces(item: dict) -> list:
+    """接口的 leaseDetails[] → pipeline 的套间结构 [{name,size,rate,monthly}]。
+
+    月租优先级：totalMonthly → totalAnnual/12 → 单价×面积（带合理性阈值）。
+    单价离谱（如 $54,000/SF/YR）时不换算，记 suspected_total 交 pipeline 处理，
+    宁可转人工也不算出个天文数字去误杀。
+    """
+    out = []
+    for i, d in enumerate(item.get("leaseDetails") or [], 1):
+        if not isinstance(d, dict):
+            continue
+        size = d.get("rentableSqft") or d.get("rentableSqftMin") or d.get("rentableSqftMax")
+        if not size:
+            continue
+        size = int(float(size))
+        lr = d.get("leaseRate") or {}
+        per_yr = _num(lr.get("perSqftAnnualMin"))
+        per_mo = _num(lr.get("perSqftMonthlyMin"))
+        monthly = _num(lr.get("totalMonthly"))
+        if monthly is None:
+            annual = _num(lr.get("totalAnnual"))
+            if annual:
+                monthly = round(annual / 12, 2)
+        suspected = None
+        if monthly is None:
+            if per_mo is not None and per_mo <= _RATE_MAX_MO:
+                monthly = round(per_mo * size, 2)
+            elif per_yr is not None and per_yr <= _RATE_MAX_YR:
+                monthly = round(per_yr * size / 12, 2)
+            elif per_mo is not None:
+                suspected = per_mo
+            elif per_yr is not None:
+                suspected = per_yr
+        rate = ""
+        if per_yr is not None:
+            rate = f"${per_yr:g}/SF/YR"
+        elif per_mo is not None:
+            rate = f"${per_mo:g}/SF/MO"
+        out.append({
+            "name": d.get("spaceName") or d.get("name") or f"套间 {i}",
+            "size": str(size),
+            "rate": rate,
+            "monthly": monthly,
+            "suspected_total": suspected,
+        })
+    return out
+
+
+def _candidate_from_item(item: dict) -> dict:
+    """接口 item → pipeline 候选结构（地址/月租/面积/经纪人/套间表/详情页链接）。"""
+    addrs = item.get("address") or []
+    addr = (addrs[0].get("fullAddress") if addrs and isinstance(addrs[0], dict) else "") or ""
+    brokers = item.get("brokers") or []
+    b = brokers[0] if brokers and isinstance(brokers[0], dict) else {}
+    agent = (b.get("name") or "").strip()
+    agency = (b.get("brokerage") or "").strip()
+    if agent and agency:
+        agent = f"{agent}（{agency}）"
+    elif not agent:
+        agent = agency
+
+    spaces = _item_spaces(item)
+    rng = item.get("leaseRateRange") or {}
+    total_monthly = (rng.get("totalMonthly") or "").strip()
+    per_sf = (rng.get("perSqftAnnual") or "").strip()
+
+    # 面积：优先最小的可租套间（整栋面积会把预算内小套间算死）
+    sizes = [int(s["size"]) for s in spaces if str(s.get("size", "")).isdigit()]
+    area = str(min(sizes)) if sizes else ""
+
+    # 价格文案优先用「套间级月租」（可靠）：range.totalMonthly 有脏数据
+    # —— 实测 4016 Bishop Ln 的 range 写 $27,405,000/月，而同一条的套间月租是 $4,500
+    ms = sorted({s["monthly"] for s in spaces if s.get("monthly")})
+    price = ""
+    if ms:
+        price = (f"${ms[0]:,.0f}–${ms[-1]:,.0f}/月" if len(ms) > 1
+                 else f"${ms[0]:,.0f}/月")
+    elif per_sf:
+        price = f"{_money(per_sf)}/SF/YR"
+    elif total_monthly:
+        price = total_monthly if "/" in total_monthly else f"{_money(total_monthly)}/月"
+
+    # 接口的 id 带类型前缀（"lease-1257003"），详情页路由只认纯数字：
+    # 直接用会拼成 /lease/properties/lease-1257003/... → Crexi 把它当搜索词，
+    # 跳到一个 0 结果的搜索页（实测绘图上就是 "Lease 1257003 0 Properties"）
+    pid, slug = str(item.get("id") or ""), item.get("urlSlug") or ""
+    m = re.search(r"(\d+)\s*$", pid)
+    pid = m.group(1) if m else pid
+    url = f"{_BASE}/lease/properties/{pid}/{slug}" if pid.isdigit() and slug else ""
+
+    return {
+        "address": addr,
+        "price": price,
+        "agent": agent,
+        "phone": "",
+        "email": "",
+        "area": area,
+        "undisclosed": not bool(spaces and any(s.get("monthly") for s in spaces)
+                                or total_monthly),
+        "listing_url": url,
+        "spaces": spaces,          # 接口已带套间级月租 → 无需开详情页
+    }
+
+
+def _api_search(pg, city: str, state: str, page_no: int, size: int) -> dict:
+    payload = {
+        "excludeFilters": [], "excludeSort": [], "ids": [], "boundingBox": None,
+        "filters": {"address": {"mode": "Include",
+                                "structuredValues": [f"{city}, {state}"],
+                                "type": "Plain", "values": []}},
+        "from": (page_no - 1) * size, "searchTypes": ["Lease"], "size": size,
+        "sorting": {"searchAttributes.crexiSearchRank": "Descending",
+                    "listingAttributes.dateActivated": "Descending"},
+    }
+    return pg.evaluate(_API_FETCH_JS, [_SEARCH_API, payload]) or {}
+
+
+def search_candidates(city: str, state: str, price_min: int, price_max: int,
+                      limit: int = 60, tag: str = "search", page: int = 1) -> dict:
+    """按城市/州采集 Crexi 出租房源（走官方 JSON 接口，一页 60 条）。
+
+    接口失效（非 200 / 解析失败）时自动回退到旧搜索页解析，保证不断流。
+    """
+    import json as _json
+    import math
+
+    page_no = max(int(page or 1), 1)
+    size = _API_PAGE_SIZE
+    try:
+        pg = _api_page()
+        res = _api_search(pg, city, state, page_no, size)
+        if res.get("status") != 200:
+            raise RuntimeError(f"接口返回 {res.get('status')}")
+        data = _json.loads(res.get("text") or "{}")
+    except Exception as e:
+        fb = _search_candidates_html(city, state, price_min, price_max,
+                                     limit=limit, tag=tag, page=page_no)
+        fb["message"] = f"（接口不可用：{e}，已回退搜索页解析）" + fb.get("message", "")
+        return fb
+
+    items = data.get("items") or []
+    total = int(data.get("totalCount") or 0)
+    total_pages = max(math.ceil(total / size), 1) if total else 0
+    candidates, seen = [], set()
+    for it in items:
+        # Crexi 接口会混入外州的推荐/赞助房源（实测搜 Louisville 出现 Newark, NJ）→
+        # 按州过滤，避免跨州房源混进任务
+        addrs = it.get("address") or []
+        st = (addrs[0].get("stateCode") if addrs and isinstance(addrs[0], dict) else "") or ""
+        if st and state and st.upper() != state.upper():
+            continue
+        c = _candidate_from_item(it)
+        addr = c["address"]
+        if not addr:
+            continue
+        key = store_norm(addr)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(c)
+        if len(candidates) >= limit:
+            break
+
+    if not items:
+        return {"status": "warn",
+                "message": f"Crexi 接口第 {page_no} 页无候选（共 {total} 条 / "
+                           f"{total_pages} 页），已超出真实页数" if total else
+                           f"Crexi 接口在 {city}, {state} 没搜到出租房源（城市名需具体）",
+                "candidates": [], "screenshot": "", "total_pages": total_pages,
+                "not_found": page_no > 1}
+
+    tested = sum(1 for c in candidates if any(s.get("monthly") for s in c["spaces"]))
+    msg = (f"Crexi 接口第 {page_no}/{total_pages} 页采集到 {len(candidates)} 个候选"
+           f"（该条件共 {total} 条房源；其中 {tested} 个自带月租，可直接判价）")
+    return {"status": "pass", "message": msg, "candidates": candidates,
+            "screenshot": "", "total_pages": total_pages}
 
 
 def candidates_from_urls(urls: list) -> dict:

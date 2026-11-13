@@ -294,18 +294,24 @@ class TaskRunner:
             # 因此只要粗判不通过，就必须进详情页看「套间表」再定。
             pstate, pmonthly = _price_state(cand)
             # 是否值得开详情页（每条 3-8s，是前半程最大耗时）：
-            #   * 卡片自己写 Undisclosed/价格面议 → 详情页只有同一句话，
-            #     拿不到数字，开了纯浪费（实测 44 条全是这种情况）
+            #   * 卡片写 Undisclosed/价格面议 → 也必须开页：详情页常有套间表
+            #     （面积+单价）、经纪人电话，卡片那句话不代表详情页没数字
             #   * 卡片完全没显示价格 → 仍开页（有一部分能在详情页补到真实价格）
             #   * 联系方式/面积缺失仍要开页：SOP 要求中介+电话是硬字段，
             #     而且 email 从未在卡片上出现过，不能拿它当开页理由
             undisclosed = bool(cand.get("undisclosed"))
-            # 该数据源以详情页为唯一价格口径（Crexi）：卡片价不参与淘汰，
-            # 除"价格未披露"外一律进详情页看套间表（实测 63% 的淘汰必须看套间表）
+            # 该数据源以详情页为唯一价格口径（Crexi）：卡片价不参与淘汰，一律进详情页看套间表
             detail_prices = bool(getattr(feed, "DETAIL_IS_PRICE_SOURCE", False))
-            if undisclosed:
-                # 价格未披露：详情页也是同一句话，开了也拿不到数字 → 直接转人工
+            # 搜索接口已直接给出套间级月租（crexi 的 leaseDetails.totalMonthly）→
+            # 价格口径就是详情页那套，不必再开页，省 3-8s/条
+            has_api_price = any(s.get("monthly") is not None
+                                for s in (cand.get("spaces") or []))
+            if has_api_price:
                 need_detail = False
+            elif undisclosed:
+                # 价格未披露不等于详情页没价格：一律开页核实（套间表/经纪人/面积），
+                # 只有详情页确实拿不到价格时才转人工
+                need_detail = True
             elif detail_prices:
                 need_detail = True
             else:
@@ -323,7 +329,7 @@ class TaskRunner:
                 "screenshots": [],  # SOP：搜索页截图不入档
             })
             shots = []
-            spaces: list = []
+            spaces: list = list(cand.get("spaces") or [])
             info: dict = {}
 
             # SOP：价格/中介姓名/联系方式/面积都是硬性字段——搜索卡片缺哪个就去详情页补抓
@@ -365,7 +371,29 @@ class TaskRunner:
                 if not fitted:
                     priced = [s for s in spaces if s.get("monthly") is not None]
                     if not priced:
-                        note = "套间价格无法换算成月租，需人工核对"
+                        # 单价栏被误填成「每月总价」的房源（$5,200/SF/MO × 1,171 SF 这种）：
+                        # 若那个数字本身已超预算，无论按单价还是按总价解释都超 → 可判死
+                        suspect = [s for s in spaces if s.get("suspected_total")]
+                        if suspect and min(s["suspected_total"] for s in suspect) > price_max:
+                            bad = min(suspect, key=lambda s: s["suspected_total"])
+                            note = (f"单价栏数据异常（{bad['rate']} × {bad['size']} SF 不合理，"
+                                    f"疑似把每月总价填进单价栏）：按总价 ${bad['suspected_total']:,.0f}/月"
+                                    f"也已超 ${price_max}/月，淘汰")
+                            store.update_record(record_id, conclusion="不通过", notes=note)
+                            self.emit(f"  {note}", "warn")
+                            continue
+                        # 区分「数据缺失」和「换算失败」：全部套间都没单价 = 数据源不报价，
+                        # 文案要直接说"需询价"，别写成"无法换算"让人以为解析出问题
+                        sizes = sorted(int(s["size"]) for s in spaces
+                                       if str(s.get("size") or "").isdigit())
+                        if suspect:
+                            note = (f"套间单价异常（{suspect[0]['rate']}，疑似总价 "
+                                    f"${suspect[0]['suspected_total']:,.0f}/月，落在预算内需复核）")
+                        elif not any(s.get("rate") for s in spaces) and sizes:
+                            note = (f"详情页全部 {len(spaces)} 个套间均未披露单价"
+                                    f"（{sizes[0]:,}–{sizes[-1]:,} SF），需向经纪人询价")
+                        else:
+                            note = "套间价格无法换算成月租，需人工核对"
                         store.update_record(record_id, conclusion="待人工", notes=note)
                         self.emit(f"  {note} → 转人工，继续下一个", "warn")
                         continue
@@ -377,15 +405,19 @@ class TaskRunner:
                     continue
                 # 预算内取「面积最大」的那间（同样合规，空间更实用）
                 monthly, sp = max(fitted, key=lambda x: int(x[1]["size"]))
-                cand["price"], cand["area"] = sp["rate"], sp["size"]
+                # 单价可能未披露（套间只有 Total Monthly Rent）→ 价格字段写总价，避免留空
+                rate_txt = sp["rate"] or f"${monthly:,.0f}/月（总价）"
+                calc = (f"{sp['size']} SF × {sp['rate']} ≈ ${monthly:,.0f}/月"
+                        if sp["rate"] else f"{sp['size']} SF，总月租 ${monthly:,.0f}")
+                cand["price"], cand["area"] = rate_txt, sp["size"]
                 cand["suite_name"] = sp["name"]
                 cand["suite_no"] = _suite_no(sp["name"])
                 store.update_record(
-                    record_id, price=f"{sp['rate']}（{sp['name']} {sp['size']} SF）",
+                    record_id, price=f"{rate_txt}（{sp['name']} {sp['size']} SF）",
                     area=sp["size"],
-                    notes=f"采用套间 {sp['name']}：{sp['size']} SF × {sp['rate']} ≈ ${monthly:,.0f}/月")
-                self.emit(f"  套间 {sp['name']}：{sp['size']} SF × {sp['rate']} "
-                          f"≈ ${monthly:,.0f}/月 → 在 ${price_min}-${price_max}/月 内", "pass")
+                    notes=f"采用套间 {sp['name']}：{calc}")
+                self.emit(f"  套间 {sp['name']}：{calc}"
+                          f" → 在 ${price_min}-${price_max}/月 内", "pass")
             else:
                 pstate, pmonthly = _price_state(cand)
                 if pstate == "over":
@@ -397,9 +429,10 @@ class TaskRunner:
                 if pstate == "unknown":
                     # 预算无法判定时不放行（否则 $/SF/YR 缺面积会算出错误月租）
                     if undisclosed:
-                        note = (f"价格未披露（Undisclosed/面议），面积 "
-                                f"{cand.get('area') or '未知'} SF，"
-                                f"未开详情页，需人工核对是否 ≤${price_max}/月")
+                        # 已进过详情页仍无价格：写明"详情页也没有数字"，别让人以为是漏开页
+                        seen = "详情页也只有 Undisclosed 且无套间总价" if need_detail else "未开详情页"
+                        note = (f"价格未披露（Undisclosed/面议），{seen}，面积 "
+                                f"{cand.get('area') or '未知'} SF，需人工核对是否 ≤${price_max}/月")
                     else:
                         note = (f"价格无法判定预算：{cand.get('price') or '未抓到价格'}"
                                 f"，面积 {cand.get('area') or '未知'} SF，"
@@ -524,11 +557,14 @@ class TaskRunner:
                                             screenshots=shots)
                         self.emit(f"  {note} → 转待人工，继续下一个", "warn")
                         continue
-                    note = f"Smarty 未通过（含 Suite 尝试）：{r2['message'][:80]}"
-                    store.update_record(record_id, conclusion="不通过",
+                    # 地址本身有效、只是缺房间号且挖不到 → 不能判死：
+                    # 房源和价格都是真实的（实测 10524 Watterson Trail 790 SF $1,200/月
+                    # 就在预算内），只是 Smarty 要求 secondary。转待人工，不写失败档案。
+                    note = (f"地址有效但缺房间号（{r2['message'][:60]}），"
+                            f"Smarty 未挖到可验证的套间号，需人工确认具体套间")
+                    store.update_record(record_id, conclusion="待人工",
                                         notes=note, screenshots=shots)
-                    store.add_failed_address(addr, "Smarty", note, building=True)
-                    self.emit("该地址所有 Suite 均未通过，淘汰，处理下一个候选", "warn")
+                    self.emit(f"  {note} → 转待人工，继续下一个", "warn")
                     continue
             elif r2["status"] == "fail":
                 note = f"Smarty 未通过：{r2['message'][:80]}"
