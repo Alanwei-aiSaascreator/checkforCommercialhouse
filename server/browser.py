@@ -271,17 +271,25 @@ def block_translate(page) -> None:
     为什么必须全局做：Crexi / OpenCorporates 都会按浏览器语言自动把页面翻成中文，
     翻完文案变成「每平方英尺每月 4 美元」「未找到任何公司」，
     所有英文正则（价格、Found N companies）全部失效（实测：查重步骤因此误判）。
+
+    注意：**只能用域名窄匹配，不能用 page.route("**/*")**。全局 route 会让所有请求
+    都走 Playwright 的 Fetch 拦截层，跨源资源（CBRE 的 mediaassets.cbre.com 上的
+    CSS/主 JS）会被浏览器按 CORP 重新校验并拒收，报
+    "ERR_BLOCKED_BY_RESPONSE.NotSameOrigin" —— 页面随即退化成只有文字的裸 HTML，
+    SPA 不渲染、卡片和详情链接全都没有（实测 CBRE 列表页首次加载即如此）。
     """
     def _handler(route):
-        low = route.request.url.lower()
-        if any(h in low for h in _TRANSLATE_HOSTS):
-            return route.abort()
-        return route.continue_()
+        try:
+            route.abort()
+        except Exception:
+            pass
 
-    try:
-        page.route("**/*", _handler)
-    except Exception:
-        pass
+    for pat in ("**/*translate.goog/**", "**/translate-pa.googleapis.com/**",
+                "**/translate.googleapis.com/**", "**/translate.google.com/**"):
+        try:
+            page.route(pat, _handler)
+        except Exception:
+            pass
 
 
 _exit_ip_cache = {"t": 0.0, "v": ""}

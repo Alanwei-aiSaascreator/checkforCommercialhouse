@@ -8,8 +8,12 @@ import json
 import re
 
 from .. import browser
+from . import paginate
 
 _BASE = "https://www.loopnet.com"
+# 分页条明写 "Page 4 of 19"（真值，不需要二分探测），只在越界时用它兜第二道底：
+# LoopNet 越界通常返回 404 页，但偶发也会把第 1 页再发一遍。
+PAGE_OK_SIGNAL = True
 
 _LIKING_JS = """
 () => {
@@ -98,16 +102,26 @@ def monthly_price(price_text: str, area: str = "") -> float | None:
     except ValueError:
         return None
     low = (price_text or "").lower()
-    try:
-        area_n = float(re.sub(r"[^\d.]", "", str(area))) if area else 0.0
-    except ValueError:
-        area_n = 0.0
+    # 面积只接受「数字 / 数字 + SF 等单位」；OfficeSpace 会把人数写进面积列
+    # （"20 PPL"），强行抽数字会变成 20 SF 去乘单价，必须拒绝
+    area_n = 0.0
+    m_area = re.fullmatch(r"\s*([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft|sf|square\s*feet)?\s*",
+                          str(area or ""), re.I)
+    if m_area:
+        try:
+            area_n = float(m_area.group(1).replace(",", ""))
+        except ValueError:
+            area_n = 0.0
     # 每平方英尺口径：必须结合面积才能得到「该房源总月租」
     #   总月租 = 每英尺价格 × 面积 ÷ 12（$/SF/YR）
     #   总月租 = 每英尺价格 × 面积      （$/SF/MO）
-    if re.search(r"sf\s*/\s*mo", low):
+    # 注意 sqft / sq ft / square feet 都要算进来：只写 "sf/mo" 会漏掉
+    # "$4.50/sqft/mo"（CBRE 卡片的默认口径），落到下面的 "$/SF 按年" 分支，
+    # 把月租算成 1/12，$6,165/月的房源会被判成 $514/月而误放行（实测踩坑）。
+    _sq = r"(?:sq\.?\s*ft|sqft|square\s*(?:feet|foot)|sf)"
+    if re.search(rf"{_sq}\s*/\s*(?:mo|month|monthly)(?![a-z])", low):
         return val * area_n if area_n else None
-    if re.search(r"sf\s*/\s*yr", low):
+    if re.search(rf"{_sq}\s*/\s*(?:yr|year|annual)", low):
         return val * area_n / 12 if area_n else None
     # "$6 per rentable square" / "$30 per square foot" 同样是每英尺单价（LoopNet 惯例按年）
     if re.search(r"(?:per|/)\s*(?:rentable\s+)?(?:square(?:\s*(?:foot|feet))?|sq\.?\s*ft|sf)\b", low):
@@ -367,6 +381,13 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
                     "total_pages": max(page_no - 1, 0), "not_found": True}
         cards = page.evaluate(_LIKING_JS) or []
         total_pages = _parse_total_pages(page) if cards else 0
+        info = paginate.check(page, page_no)
+        if page_no > 1 and info["page_ok"] is False:
+            return {"status": "warn", "not_found": True, "page_ok": False,
+                    "message": f"LoopNet 第 {page_no} 页超出末页"
+                               f"（站点回落到第 {info['actual']} 页）",
+                    "candidates": [], "screenshot": search_shot or "",
+                    "total_pages": max(page_no - 1, 0)}
     except Exception as e:
         return {"status": "fail", "message": f"LoopNet 访问失败: {e}", "candidates": [],
                 "screenshot": "", "total_pages": 0}
@@ -405,7 +426,7 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
            f"LoopNet 第 {page_no} 页未解析到候选地址（卡片结构可能变化，已留档搜索页截图）")
     return {"status": "pass" if candidates else "warn", "message": msg,
             "candidates": candidates, "screenshot": search_shot or "",
-            "total_pages": total_pages}
+            "total_pages": total_pages, "page_ok": True}
 
 
 def candidates_from_urls(urls: list) -> dict:

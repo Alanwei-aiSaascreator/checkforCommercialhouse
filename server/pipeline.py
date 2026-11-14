@@ -29,6 +29,23 @@ def feed_of(source: str):
     return FEEDS.get((source or "loopnet").strip().lower()) or FEEDS["loopnet"]
 
 
+def _detail_addr_better(cur: str, det: str) -> bool:
+    """详情页地址是否比卡片地址更完整可用。
+
+    为什么需要：OfficeSpace 的列表卡片**不显示城市/州**（只有 "501 Union Street"），
+    Smarty 拿这种残缺地址必然查不到，会把好房源误淘汰。详情页有完整地址
+    （"810 Dominican Drive, Nashville, TN 37228"），只要门牌号一致就采用它。
+    """
+    if not det or not re.match(r"^\d{1,6}", det):
+        return False
+    if not re.search(r"[A-Z]{2}\s+\d{5}", det):
+        return False
+    if re.search(r"\d{5}", cur or ""):        # 卡片已有邮编，不必换
+        return False
+    m1, m2 = re.match(r"^\d{1,6}", cur or ""), re.match(r"^\d{1,6}", det)
+    return bool(m1 and m2 and m1.group(0) == m2.group(0))
+
+
 def _manual_candidates(urls: list, source: str = "loopnet") -> dict:
     """手动链接：只解析与当前步骤1 数据源同站的链接。
 
@@ -62,6 +79,7 @@ class TaskRunner:
         self.events: queue.Queue = queue.Queue()
         self.done = False
         self.stopped = False
+        self.current_record = 0      # 正在核查的记录 id（中止时用它兜底改判）
 
     def stop(self) -> None:
         """协作式终止：当前操作完成后立即停止，不再处理后续候选。"""
@@ -80,6 +98,17 @@ class TaskRunner:
             self.emit(f"任务异常终止: {e}", "error")
             self.emit(tb[-1500:], "error")
         finally:
+            # 被中止/异常时，正在核查的那条记录还停在"待人工"（建表默认值），
+            # 统一改判为不通过，保证记录里不出现待人工
+            if self.current_record:
+                try:
+                    rec = store.get_record(self.current_record)
+                    if rec and rec.get("conclusion") == "待人工":
+                        store.update_record(
+                            self.current_record, conclusion="不通过",
+                            notes="任务中止/异常，未完成验证，按淘汰处理")
+                except Exception:
+                    pass
             self.done = True
             if self.stopped:
                 self.events.put({"time": datetime.now().strftime("%H:%M:%S"),
@@ -118,10 +147,39 @@ class TaskRunner:
             used: set = set()
             visits = 0
             total_pages = 0
+            cached_total = store.page_limit_get(skey)     # 上次实测的真实末页
             reset_done = False
             plan: list = []
+
+            def _probe_last_page(upper: int) -> int:
+                """二分探测真实末页。列表页上的「共 N 条」估值靠不住：实测 Chicago 办公室
+                ≤$2000/月 报 1323 条（≈44 页），实际只能翻到第 16 页——第 17 页起站点
+                既不报错也不返回空，而是把第 1 页原样再发一遍。所以只能用「请求页码 vs
+                页面当前页标记」当信号做二分，log2(44)≈6 次请求探出真值。
+                只有「列表页条数估值不可信 + 能上报页码标记」的数据源才做二分；
+                其他源（LoopNet/CityFeet/Crexi 的分页条就是真值）直接沿用估值。"""
+                if not (getattr(feed, "PAGE_OK_SIGNAL", False)
+                        and getattr(feed, "PAGES_ESTIMATE_UNRELIABLE", False)):
+                    return max(int(upper), 1)
+                lo, hi = 1, max(int(upper), 1)
+                while lo < hi and not self.stopped:
+                    mid = (lo + hi + 1) // 2
+                    r = feed.search_candidates(city, state, price_min, price_max,
+                                               limit=per_page, tag=f"task{self.task_id}",
+                                               page=mid)
+                    if r.get("page_ok") is False:       # 明确回落 → 该页不存在
+                        hi = mid - 1
+                    elif r.get("page_ok"):              # 页码标记匹配 → 该页存在
+                        lo = mid
+                    else:                               # 没给标记/加载失败 → 不敢下结论，收手
+                        break
+                return lo
             while not self.stopped and approved < target:
                 if not plan:
+                    if not total_pages and cached_total:
+                        total_pages = cached_total
+                        self.emit(f"  {src_label} 该搜索条件实测末页为第 {total_pages} 页"
+                                  f"（沿用上次探测结果，过期自动重探）")
                     if not total_pages:
                         # 总页数未知（数据源没暴露分页条）：必须逐页往下探，
                         # 否则会永远只跑第 1 页——实测 CityFeet 卡在首页反复抓同一批，
@@ -175,25 +233,51 @@ class TaskRunner:
                     if r1["status"] == "fail" and "拦截" in r1["message"]:
                         self.emit(f"{src_label} 被反爬拦截，停止自动搜索", "error")
                         return
+                    # 城市名不存在（站点回落成州级列表）：换页也没意义，直接终止并提示
+                    if r1.get("bad_city"):
+                        self.emit(r1["message"], "error")
+                        return
                     # 第 1 页就 404 = 搜索地区本身无效（如把州名当城市填），
                     # 再抽 20 页只是重复 404，直接终止并给出可操作提示
                     if r1.get("not_found") and page_no == 1:
                         self.emit(r1["message"], "error")
                         return
-                    # 404 页：说明抽样超出真实总页数 → 收窄页池，别再碰更高的页
+                    # 越界页：404，或站点把第 1 页内容静默再发一遍（页码不匹配）
                     if r1.get("not_found"):
                         real = int(r1.get("total_pages") or 0) or max(page_no - 1, 0)
                         if real and (not total_pages or real < total_pages):
                             total_pages = real
-                            self.emit(f"  实测第 {page_no} 页为 404，真实总页数收窄为 "
+                            why = ("页码越界（站点回落成第 1 页）" if r1.get("page_ok") is False
+                                   else "空页/404")
+                            self.emit(f"  实测第 {page_no} 页为{why}，真实总页数收窄为 "
                                       f"{total_pages} 页，后续只抽 1-{total_pages}", "warn")
+                            if r1.get("page_ok") is False:   # 确定性信号才写缓存
+                                store.page_limit_set(skey, total_pages)
                         continue
                     # 正常页（非 404）落库为「已检查」，后续任务随机跳页时直接跳过
                     store.page_mark(skey, page_no)
                     seen_pages.add(page_no)
                     if not total_pages and r1.get("total_pages"):
-                        total_pages = int(r1["total_pages"])
-                        self.emit(f"  {src_label} 该搜索条件下共 {total_pages} 页（约 {per_page} 条/页）")
+                        est = int(r1["total_pages"])
+                        if (est > 1 and getattr(feed, "PAGES_ESTIMATE_UNRELIABLE", False)
+                                and getattr(feed, "PAGE_OK_SIGNAL", False)):
+                            self.emit(f"  列表页估值 {est} 页，正在二分探测真实末页"
+                                      f"（约 6 次请求，避免在越界页上空转）...")
+                        total_pages = _probe_last_page(est) if est > 1 else est
+                        if total_pages < 2 <= est and est >= 5:
+                            # 每个探测页都"回落成第 1 页"，多半不是真只有 1 页，
+                            # 而是整站忽略了页码（重定向/参数被吃）→ 保守按估值遍历
+                            self.emit(f"  {src_label} 末页探测异常（全部回落，结果=1），"
+                                      f"改按列表估值 {est} 页遍历", "warn")
+                            total_pages = est
+                        if total_pages < est:
+                            self.emit(f"  {src_label} 列表页写的是 {est} 页（约 {per_page} 条/页），"
+                                      f"但实测末页只有第 {total_pages} 页——越界页码会被站点"
+                                      f"静默回落成第 1 页，已按实测值走", "warn")
+                        else:
+                            self.emit(f"  {src_label} 该搜索条件下共 {total_pages} 页"
+                                      f"（约 {per_page} 条/页）")
+                        store.page_limit_set(skey, total_pages)
                     fresh, skip_known, skip_failed = [], 0, 0
                     for c in r1["candidates"]:
                         if store.normalize(c["address"]) in seen_addrs:
@@ -348,10 +432,13 @@ class TaskRunner:
                 "agent": cand.get("agent", ""), "phone": cand.get("phone", ""),
                 "email": cand.get("email", ""), "area": cand.get("area", ""),
                 "listing_url": cand.get("listing_url", ""),
-                "step1": f"pass：{src_label} 采集（价格 {cand.get('price', '未知')}）",
+                "step1": (f"pass：{src_label} 采集（价格 {cand.get('price', '未知')}"
+                          + (f"，可容纳 {cand['area_ppl']} PPL" if cand.get("area_ppl") else "")
+                          + "）"),
                 "source": source,   # 记录归属哪条线（LoopNet / Crexi），两条线分开查看/导出
                 "screenshots": [],  # SOP：搜索页截图不入档
             })
+            self.current_record = record_id
             shots = []
             spaces: list = list(cand.get("spaces") or [])
             info: dict = {}
@@ -368,22 +455,39 @@ class TaskRunner:
                     # 该数据源以详情页价格为准：卡片价直接换成详情页价，
                     # 避免同一房源出现"卡片说超预算、套间表说在预算内"两套数字
                     cand["price"] = info["price"]
-                    if info.get("area"):
-                        cand["area"] = info["area"]
+                    det_area = str(info.get("area") or "")
+                    card_area = str(cand.get("area") or "")
+                    # 面积优先级：真实平方英尺 > 人数（"20 PPL"）> 空。
+                    # 详情页若只给人数，不能盖掉卡片上的真实 SF（实测 501 Union 被盖成 125）
+                    if det_area and (not card_area
+                                     or (det_area.isdigit() and not card_area.isdigit())):
+                        cand["area"] = det_area
+                        cand["area_ppl"] = int(info.get("area_ppl") or 0)
+                # 卡片地址缺城市/州/邮编时（OfficeSpace 卡片一律没有），用详情页完整地址
+                det_addr = (info.get("address") or "").strip()
+                if _detail_addr_better(addr, det_addr):
+                    addr = clean_address(det_addr)
+                    cand["address"] = addr
+                    store.update_record(record_id, address=addr)
+                    self.emit(f"  采用详情页完整地址：{addr}")
                 if any(info.get(k) for k in ("agent", "phone", "email", "price", "area")):
                     store.update_record(record_id, agent=cand.get("agent", ""),
                                         phone=cand.get("phone", ""),
                                         email=cand.get("email", ""),
                                         price=cand.get("price", ""),
                                         area=cand.get("area", ""))
+                    area_txt = str(cand.get("area") or "未知")
+                    if area_txt.isdigit():
+                        area_txt += " SF"        # 人数写法（"20 PPL"）后面不再加 SF
                     self.emit(f"  价格：{cand.get('price') or '未知'} | 中介：{cand.get('agent') or '未知'}"
                               f" | 电话：{cand.get('phone') or '未知'} | 邮箱：{cand.get('email') or '未知'}"
-                              f" | 面积：{cand.get('area') or '未知'} SF")
+                              f" | 面积：{area_txt}")
                 else:
                     self.emit("  详情页未解析到价格/经纪人信息，字段留空（自动流程继续）", "warn")
                 if spaces:
                     self.emit("  解析到可租套间：" + "、".join(
-                        f"{s['name']} {s['size']} SF" for s in spaces[:6])
+                        f"{s['name']} {s['size'] + ' SF' if str(s['size']).isdigit() else s['size']}".strip()
+                        for s in spaces[:6])
                         + f"（共 {len(spaces)} 个）")
 
             # 价格判定：有套间 → 按「套间月租」判断（选最小且落在预算内的那间）；
@@ -412,14 +516,21 @@ class TaskRunner:
                                        if str(s.get("size") or "").isdigit())
                         if suspect:
                             note = (f"套间单价异常（{suspect[0]['rate']}，疑似总价 "
-                                    f"${suspect[0]['suspected_total']:,.0f}/月，落在预算内需复核）")
-                        elif not any(s.get("rate") for s in spaces) and sizes:
-                            note = (f"详情页全部 {len(spaces)} 个套间均未披露单价"
-                                    f"（{sizes[0]:,}–{sizes[-1]:,} SF），需向经纪人询价")
-                        else:
-                            note = "套间价格无法换算成月租，需人工核对"
-                        store.update_record(record_id, conclusion="待人工", notes=note)
-                        self.emit(f"  {note} → 转人工，继续下一个", "warn")
+                                    f"${suspect[0]['suspected_total']:,.0f}/月，无法确信在预算内）")
+                            store.update_record(record_id, conclusion="不通过", notes=note)
+                            self.emit(f"  {note} → 淘汰", "warn")
+                            continue
+                        if not any(s.get("rate") for s in spaces) and sizes:
+                            # 全部套间都不报价 = 数据源不给价，无法判定预算 → 直接淘汰，
+                            # 不再花时间扒经纪人电话（用户要求：面议房源不用跟进）
+                            note = (f"全部 {len(spaces)} 个套间均未报价"
+                                    f"（{sizes[0]:,}–{sizes[-1]:,} SF），无法判定预算，直接淘汰")
+                            store.update_record(record_id, conclusion="不通过", notes=note)
+                            self.emit(f"  {note}", "warn")
+                            continue
+                        note = "套间价格无法换算成月租，无法判定预算，直接淘汰"
+                        store.update_record(record_id, conclusion="不通过", notes=note)
+                        self.emit(f"  {note}", "warn")
                         continue
                     cheapest = min(priced, key=lambda s: s["monthly"])
                     note = (f"所有套间均超预算：最小 {cheapest['name']} {cheapest['size']} SF "
@@ -453,16 +564,21 @@ class TaskRunner:
                 if pstate == "unknown":
                     # 预算无法判定时不放行（否则 $/SF/YR 缺面积会算出错误月租）
                     if undisclosed:
-                        # 已进过详情页仍无价格：写明"详情页也没有数字"，别让人以为是漏开页
-                        seen = "详情页也只有 Undisclosed 且无套间总价" if need_detail else "未开详情页"
-                        note = (f"价格未披露（Undisclosed/面议），{seen}，面积 "
-                                f"{cand.get('area') or '未知'} SF，需人工核对是否 ≤${price_max}/月")
-                    else:
-                        note = (f"价格无法判定预算：{cand.get('price') or '未抓到价格'}"
-                                f"，面积 {cand.get('area') or '未知'} SF，"
-                                f"需人工核对是否 ≤${price_max}/月")
-                    store.update_record(record_id, conclusion="待人工", notes=note)
-                    self.emit(f"  {note} → 转人工，继续下一个", "warn")
+                        # 完全没报价（Contact Broker For Pricing / Undisclosed）：
+                        # 连价格口径都没有，无法判断是否符合预算 → 直接淘汰。
+                        # 这类房源不再去扒经纪人电话：跟进一个"面议"房源没有意义。
+                        seen = "详情页也只有 Undisclosed 且无套间报价" if need_detail else "未开详情页"
+                        note = (f"价格面议/未披露（{seen}），无任何可换算的报价，"
+                                f"无法判定是否 ≤${price_max}/月，直接淘汰")
+                        store.update_record(record_id, conclusion="不通过", notes=note)
+                        self.emit(f"  {note}", "warn")
+                        continue
+                    # 有价格但缺面积/口径算不出月租 → 同样视为无法判定，直接淘汰
+                    note = (f"价格无法换算成月租：{cand.get('price') or '未抓到价格'}"
+                            f"，面积 {cand.get('area') or '未知'} SF，"
+                            f"无法判定是否 ≤${price_max}/月，直接淘汰")
+                    store.update_record(record_id, conclusion="不通过", notes=note)
+                    self.emit(f"  {note}", "warn")
                     continue
 
             # 步骤1.5 办公房源预筛（SOP 补充：明显非办公房源直接不用，360 全景图优先）
@@ -572,23 +688,22 @@ class TaskRunner:
                     if self.stopped:
                         store.update_record(record_id, conclusion="不通过", notes="Smarty 额度耗尽，未完成验证")
                         break
-                    # 挖号通道被限流（429/401）时不能算"这地址不合格"——它只是没查到，
-                    # 转待人工而不登记失败档案，避免把好地址误杀（下次重跑还能挖）
+                    # 挖号通道被限流（429/401）时其实没查到，但仍按"验证不完整"淘汰：
+                    # 不写失败档案，下次重跑还能重新挖（用户要求：不留待人工）
                     mine_reason = getattr(smarty, "_web_mine_last_error", "") or ""
                     if smarty.channel_down(mine_reason):
-                        note = f"缺房间号且挖号通道限流（{mine_reason[:60]}），未验证完，建议稍后重跑"
-                        store.update_record(record_id, conclusion="待人工", notes=note,
+                        note = f"缺房间号且挖号通道限流（{mine_reason[:60]}），未验证完，按淘汰处理"
+                        store.update_record(record_id, conclusion="不通过", notes=note,
                                             screenshots=shots)
-                        self.emit(f"  {note} → 转待人工，继续下一个", "warn")
+                        self.emit(f"  {note}", "warn")
                         continue
-                    # 地址本身有效、只是缺房间号且挖不到 → 不能判死：
-                    # 房源和价格都是真实的（实测 10524 Watterson Trail 790 SF $1,200/月
-                    # 就在预算内），只是 Smarty 要求 secondary。转待人工，不写失败档案。
+                    # 地址本身有效、只是缺房间号且挖不到 → 无法给出可邮寄的完整地址，
+                    # 按淘汰处理；不写失败档案（下次挖号通道恢复后还能再试）
                     note = (f"缺房间号且 Smarty 未挖到可验证套间"
-                            f"（{r2['message'][:70]}），需人工确认具体套间")
-                    store.update_record(record_id, conclusion="待人工",
+                            f"（{r2['message'][:70]}），无法验证完整地址，直接淘汰")
+                    store.update_record(record_id, conclusion="不通过",
                                         notes=note, screenshots=shots)
-                    self.emit(f"  {note} → 转待人工，继续下一个", "warn")
+                    self.emit(f"  {note}", "warn")
                     continue
             elif r2["status"] == "fail":
                 note = f"Smarty 未通过：{r2['message'][:80]}"
@@ -599,13 +714,13 @@ class TaskRunner:
                 continue
             if r2["status"] == "suspect":
                 # 限流/网络类失败是"这次没查到"，不是"这地址不合格"：
-                # 转待人工、不写失败档案（否则好地址被拉黑，重跑也救不回来）
+                # 结论按淘汰走，但不写失败档案（否则好地址被永久拉黑，重跑也救不回来）
                 _transient = ("429", "限流", "请求失败", "请求异常", "timeout", "超时")
                 if any(k in r2["message"] for k in _transient):
-                    note = f"Smarty 限流/网络未验证完（{r2['message'][:60]}），建议稍后重跑"
-                    store.update_record(record_id, conclusion="待人工", notes=note,
+                    note = f"Smarty 限流/网络未验证完（{r2['message'][:60]}），按淘汰处理"
+                    store.update_record(record_id, conclusion="不通过", notes=note,
                                         screenshots=shots)
-                    self.emit(f"  {note} → 转待人工，继续下一个", "warn")
+                    self.emit(f"  {note}", "warn")
                     continue
                 note = f"Smarty 结果不明确，全自动模式保守淘汰：{r2['message'][:80]}"
                 store.update_record(record_id, conclusion="不通过", notes=note)

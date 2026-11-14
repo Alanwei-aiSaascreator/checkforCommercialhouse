@@ -21,6 +21,12 @@ from .loopnet import monthly_price
 
 _BASE = "https://www.commercialcafe.com"
 DETAIL_IS_PRICE_SOURCE = True
+# search_candidates 会上报 page_ok（请求页码是否等于页面上的当前页标记），
+# pipeline 据此二分探测真实末页——越界页会被站点静默回落成第 1 页。
+PAGE_OK_SIGNAL = True
+# 列表页上「共 N 条」的估值不可信（实测报 1323 条≈44 页，实际只能翻到 16 页），
+# 所以 pipeline 会二分探测真实末页再遍历。
+PAGES_ESTIMATE_UNRELIABLE = True
 _PROFILE = "chrome_profile_feeds"
 
 _BLOCK_KEYWORDS = ("access denied", "are you a robot", "unusual traffic", "captcha",
@@ -63,11 +69,22 @@ def _city_path(city: str, state: str, base: str = "") -> str:
     return f"{base or _BASE}/commercial-real-estate/us/{state.strip().lower()}/{c}/"
 
 
-def _list_url(city: str, state: str, page: int, base: str = "") -> str:
+def _list_url(city: str, state: str, page: int, base: str = "",
+              price_max: int = 0) -> str:
     """分页参数是 **Page（大写 P）**：?listingType=lease&Page=2。
-    小写 page 无效，会永远返回第 1 页（实测翻页后内容完全一样）。"""
+    小写 page 无效，会永远返回第 1 页（实测翻页后内容完全一样）。
+
+    站点自带的筛选条件可以直接拼进 URL（实测页面筛选栏会正确回显）：
+      PropertyType=Office  → 筛选栏显示 "Office, Coworking"
+      PriceMin/PriceMax + priceOption=FlatAmount → 筛选栏显示 "$0 - $2000"
+    先用站点筛选把范围收窄，比抓全量回来再自己过滤干净得多。
+    """
     url = _city_path(city, state, base)
-    q = "?listingType=lease" + (f"&Page={page}" if page > 1 else "")
+    q = "?listingType=lease&PropertyType=Office"
+    if price_max and int(price_max) > 0:
+        q += f"&PriceMin=0&PriceMax={int(price_max)}&priceOption=FlatAmount"
+    if page > 1:
+        q += f"&Page={page}"
     return url + q
 
 
@@ -89,7 +106,16 @@ _PAGES_JS = r"""
             .map(m => +m[1].replace(/,/g, "")).filter(n => n > 0);
         if (all.length) total = Math.max(...all);
     }
-    return {maxPage: nums.length ? Math.max(...nums) : 0, totalListings: total};
+    // 当前页标记：页码超出末页时站点会静默回落到第 1 页，
+    // 只能靠它发现「请求第 26 页、实际给了第 1 页」。
+    let current = 0;
+    for (const sel of ['[aria-current=page]', '.pagination .active', '.page-item.active a']) {
+        const el = document.querySelector(sel);
+        if (!el) continue;
+        const m = /(\d+)/.exec(el.innerText || "");
+        if (m) { current = +m[1]; break; }
+    }
+    return {maxPage: nums.length ? Math.max(...nums) : 0, totalListings: total, current: current};
 }
 """
 
@@ -193,7 +219,9 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
                       limit: int = 30, tag: str = "search", page: int = 1,
                       base: str = "") -> dict:
     page_no = max(int(page or 1), 1)
-    url = _list_url(city, state, page_no, base)
+    url = _list_url(city, state, page_no, base, price_max=price_max)
+    # 同一套解析被 commercialsearch 复用，日志里别把它写成 CommercialCafe
+    site = "CommercialSearch" if "commercialsearch" in (base or "").lower() else "CommercialCafe"
     shot = ""
     pages = 0
     cards: list = []
@@ -219,6 +247,16 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
             low = (pg.evaluate("() => document.body.innerText") or "").lower()
         except Exception:
             low = ""
+        # 城市名拼错/不存在时，站点不报错而是把 URL 重定向到**州级**列表
+        # （实测 "salt lack city" → /office/us/ut/ "Utah Office Space for Rent"）。
+        # 这时抓到的其实是全州房源，而且每页都回落成第 1 页、末页探测会得出"只有 1 页"。
+        # 必须当场失败，否则会把整州数据当成本市跑完一整轮。
+        final_url = (pg.url or "").lower()
+        if re.search(r"/(?:commercial-real-estate|office)/us/[a-z]{2}/?(?:[?#]|$)", final_url):
+            return {"status": "fail", "bad_city": True,
+                    "message": (f"{site} 找不到城市 “{city}, {state}”：站点已回落到州级列表 "
+                                f"{pg.url} —— 请检查城市拼写（要填具体城市，如 Salt Lake City）"),
+                    "candidates": [], "screenshot": shot, "total_pages": 0}
         # 总页数：优先用「365 listings / 每页 30」算，退回分页条最大页码
         try:
             pgn = pg.evaluate(_PAGES_JS) or {}
@@ -226,17 +264,25 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
             pgn = {}
         _total_listings = int(pgn.get("totalListings") or 0)
         pages = ((_total_listings + 29) // 30) if _total_listings else int(pgn.get("maxPage") or 0)
+        # 页码超界时站点不报错，而是静默把第 1 页的内容再发一遍（实测 Chicago 第 17 页起
+        # 全部回落成第 1 页）。不识别这个，翻页循环就会反复"换页"却永远是同一批房源。
+        cur_page = int(pgn.get("current") or 0)
+        if page_no > 1 and cur_page and cur_page != page_no:
+            return {"status": "warn", "not_found": True, "page_ok": False,
+                    "message": (f"{site} 第 {page_no} 页超出末页"
+                                f"（站点回落到第 {cur_page} 页），真实末页更靠前"),
+                    "candidates": [], "screenshot": shot, "total_pages": 0}
         if not cards and any(k in low for k in _BLOCK_KEYWORDS):
             return {"status": "fail",
-                    "message": "CommercialCafe 被 Cloudflare 拦截：稍后重试（挑战页需等 10~15s）",
+                    "message": f"{site} 被 Cloudflare 拦截：稍后重试（挑战页需等 10~15s）",
                     "candidates": [], "screenshot": shot, "total_pages": 0}
         if not cards:
             return {"status": "warn",
-                    "message": f"CommercialCafe 第 {page_no} 页无候选（{city}, {state}）",
+                    "message": f"{site} 第 {page_no} 页无候选（{city}, {state}）",
                     "candidates": [], "screenshot": shot, "total_pages": pages,
-                    "not_found": page_no > 1}
+                    "not_found": page_no > 1, "page_ok": True}
     except Exception as e:
-        return {"status": "fail", "message": f"CommercialCafe 访问失败: {str(e)[:80]}",
+        return {"status": "fail", "message": f"{site} 访问失败: {str(e)[:80]}",
                 "candidates": [], "screenshot": shot, "total_pages": 0}
     finally:
         browser.safe_close(pg)
@@ -259,10 +305,11 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
         if len(candidates) >= limit:
             break
 
-    msg = (f"CommercialCafe 第 {page_no}/{pages or '?'} 页采集到 {len(candidates)} 个候选"
-           if candidates else f"CommercialCafe 第 {page_no} 页未解析到候选")
+    msg = (f"{site} 第 {page_no}/{pages or '?'} 页采集到 {len(candidates)} 个候选"
+           if candidates else f"{site} 第 {page_no} 页未解析到候选")
     return {"status": "pass" if candidates else "warn", "message": msg,
-            "candidates": candidates, "screenshot": shot, "total_pages": pages}
+            "candidates": candidates, "screenshot": shot, "total_pages": pages,
+            "page_ok": True}
 
 
 def fetch_broker_info(listing_url: str) -> dict:

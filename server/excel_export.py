@@ -15,7 +15,7 @@ from openpyxl.utils import get_column_letter
 
 from . import config
 
-COLUMNS = ["编码", "序号", "地址", "价格", "面积", "中介姓名", "电话",
+COLUMNS = ["编码", "序号", "地址", "价格", "面积/人数", "中介姓名", "电话",
            "网址", "smarty截图", "街景截图", "查重截图", "邮箱", "数据源"]
 
 # 列宽（字符数；截图列略宽以容纳缩略图）
@@ -39,10 +39,21 @@ def _price_display(price: str, area: str) -> str:
     return f"${monthly:,.0f}/月"
 
 
+_SOURCE_NAMES = {
+    "loopnet": "LoopNet",
+    "crexi": "Crexi",
+    "cityfeet": "CityFeet",
+    "commercialcafe": "CommercialCafe",
+    "commercialsearch": "CommercialSearch",
+    "officespace": "OfficeSpace",
+    "cbre": "CBRE",
+}
+
+
 def _source_display(source: str) -> str:
-    """数据源列：LoopNet / Crexi（历史记录没有 source 字段则留空）。"""
+    """数据源列：7 个数据源都要有中文/品牌名（否则导出这列是空的）。"""
     s = (source or "").strip().lower()
-    return "Crexi" if s == "crexi" else ("LoopNet" if s == "loopnet" else "")
+    return _SOURCE_NAMES.get(s, s.upper() if s else "")
 
 
 def _classify_shots(screenshots: list) -> tuple:

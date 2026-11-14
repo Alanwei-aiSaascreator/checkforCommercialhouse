@@ -18,10 +18,12 @@
 import re
 
 from .. import browser
+from . import paginate
 from .loopnet import _parse_area, monthly_price
 
 _BASE = "https://www.cityfeet.com"
 DETAIL_IS_PRICE_SOURCE = True
+PAGE_OK_SIGNAL = True      # 当前页从 <title> 的 "- Page N -" 读，越界时回落第 1 页
 # 主配置带着 Crexi 登录态，也因此被 Akamai 记住：实测 CityFeet 对主配置直接
 # Access Denied，全新配置 200。免登录数据源统一走独立配置目录。
 _PROFILE = "chrome_profile_feeds"
@@ -180,6 +182,22 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
             total = int(pg.evaluate(_PAGES_JS) or 0)
         except Exception:
             total = 0
+        # CityFeet 页面没有 aria-current 之类的标记，当前页只写在 <title>：
+        #   第 1 页 "Chicago Office Space For Lease - CityFeet"
+        #   第 3 页 "Chicago Office Space For Lease - Page 3 - CityFeet"
+        cur = 0
+        try:
+            title = pg.title() or ""
+            m = re.search(r"-\s*Page\s*(\d+)\s*-", title, re.I)
+            cur = int(m.group(1)) if m else (1 if "for lease" in title.lower() else 0)
+        except Exception:
+            cur = 0
+        if page_no > 1 and cur and cur != page_no:
+            r = paginate.out_of_range(page_no, cur)
+            r["message"] = f"CityFeet 第 {page_no} 页超出末页（站点回落到第 {cur} 页）"
+            r["screenshot"] = shot
+            r["total_pages"] = total      # 分页条是准的，直接把真值带给上层
+            return r
         if any(k in low for k in _BLOCK_KEYWORDS):
             return {"status": "fail",
                     "message": "CityFeet 拦截（验证码/限流）：请稍后重试或换节点",
@@ -225,7 +243,8 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
            f"（{city} {_PTYPE} 出租；价格以详情页为准）"
            if candidates else f"CityFeet 第 {page_no} 页未解析到候选")
     return {"status": "pass" if candidates else "warn", "message": msg,
-            "candidates": candidates, "screenshot": shot, "total_pages": total}
+            "candidates": candidates, "screenshot": shot, "total_pages": total,
+            "page_ok": True}
 
 
 def fetch_broker_info(listing_url: str) -> dict:

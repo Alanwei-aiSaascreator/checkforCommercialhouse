@@ -68,6 +68,11 @@ CREATE TABLE IF NOT EXISTS mined_suites (
     note TEXT DEFAULT '',
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS page_limits (
+    search_key TEXT PRIMARY KEY,     -- 与 searched_pages 同一套 key
+    total_pages INTEGER NOT NULL,    -- 实测出来的真实末页（列表页文案的条数估值不可信）
+    checked_at TEXT NOT NULL
+);
 """
 
 # 允许 update_record 更新的列
@@ -309,6 +314,38 @@ def page_reset(key: str) -> int:
             cur = con.execute("DELETE FROM searched_pages WHERE search_key=?", (key,))
             con.commit()
             return cur.rowcount
+        finally:
+            con.close()
+
+
+# ---------- 真实末页探测结果（列表页条数估值靠不住，实测一次就记住） ----------
+
+def page_limit_get(key: str, max_age_days: int = 7) -> int:
+    """该搜索条件实测的末页页码；超过 max_age_days 视为过期（房源会增减）→ 返回 0。"""
+    con = _con()
+    try:
+        row = con.execute(
+            "SELECT total_pages, checked_at FROM page_limits WHERE search_key=?", (key,)).fetchone()
+    finally:
+        con.close()
+    if not row:
+        return 0
+    try:
+        age = (datetime.now() - datetime.fromisoformat(row[1])).total_seconds() / 86400
+    except Exception:
+        return 0
+    return int(row[0]) if age <= max_age_days else 0
+
+
+def page_limit_set(key: str, total_pages: int) -> None:
+    with _lock:
+        con = _con()
+        try:
+            con.execute(
+                "INSERT OR REPLACE INTO page_limits (search_key, total_pages, checked_at) "
+                "VALUES (?,?,?)",
+                (key, int(total_pages), datetime.now().isoformat(timespec="seconds")))
+            con.commit()
         finally:
             con.close()
 

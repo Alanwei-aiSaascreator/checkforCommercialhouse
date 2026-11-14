@@ -1,5 +1,9 @@
 """步骤3：Google Maps 街景 + DeepSeek 视觉模型对比建筑外观（全自动）。"""
+import hashlib
+import json
 import re
+import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -7,10 +11,99 @@ import httpx
 from .. import config, deepseek_client
 from ..browser import goto_retry as _goto_retry, new_page, safe_close, shot
 
+# 站点通用占位图（默认城市天际线插图、logo 等）在几十个房源里字节完全相同。
+# 按内容哈希登记：同一张图出现在 ≥3 个不同房源 → 判为占位图，后续直接丢弃。
+_HASH_DB = Path(config.DATA_DIR) / "photo_hashes.json"
+_HASH_LOCK = threading.Lock()
+_SHARED_AT = 3      # 跨几个房源重复才算占位图（1~2 次可能是同楼重复挂牌，放行）
+_HASH_MAX = 8000    # 注册表上限，超出按最后出现时间淘汰
+
+
+def _load_hashes() -> dict:
+    try:
+        db = json.loads(_HASH_DB.read_text(encoding="utf-8"))
+        if isinstance(db, dict):
+            return db
+    except Exception:
+        pass
+    return {}
+
+
+def _save_hashes(db: dict) -> None:
+    tmp = _HASH_DB.with_suffix(".tmp")
+    tmp.write_text(json.dumps(db, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(_HASH_DB)
+
+
+def _seed_hashes(db: dict) -> None:
+    """首次运行把已落盘的历史房源图登记一遍——库里已经在流传的占位图
+    立刻生效，不必等它再被重复下载 3 次才认出来。"""
+    for p in Path(config.SHOTS_DIR).glob("*_photo*"):
+        m = re.match(r"^(.*?)_photo\d+\.(?:jpg|jpeg|png|webp|gif)$", p.name, re.I)
+        if not m:
+            continue
+        try:
+            h = hashlib.blake2b(p.read_bytes(), digest_size=16).hexdigest()
+        except Exception:
+            continue
+        rec = db.get(h)
+        if not isinstance(rec, dict):
+            rec = {"n": 0, "tags": [], "t": 0}
+            db[h] = rec
+        tag = m.group(1)
+        if tag not in rec["tags"]:
+            rec["tags"] = (rec["tags"] + [tag])[-10:]
+            rec["n"] = int(rec.get("n") or 0) + 1
+        rec["t"] = int(p.stat().st_mtime)
+
+
+def _is_shared_photo(body: bytes, tag: str) -> bool:
+    """登记这张图并判断它是否为站点占位图（跨房源重复 ≥_SHARED_AT 次）。"""
+    h = hashlib.blake2b(body, digest_size=16).hexdigest()
+    with _HASH_LOCK:
+        db = _load_hashes()
+        if not db.get("_seeded"):
+            db.pop("_seeded", None)
+            _seed_hashes(db)
+            db["_seeded"] = 1
+        rec = db.get(h)
+        if not isinstance(rec, dict):
+            rec = {"n": 0, "tags": [], "t": 0}
+            db[h] = rec
+        if tag not in rec["tags"]:
+            rec["tags"] = (rec["tags"] + [tag])[-10:]
+            rec["n"] = int(rec.get("n") or 0) + 1
+        rec["t"] = int(time.time())
+        shared = int(rec.get("n") or 0) >= _SHARED_AT
+        if len(db) > _HASH_MAX:      # 淘汰老条目，避免文件无限膨胀
+            keys = sorted((k for k in db if k != "_seeded"),
+                          key=lambda k: (db[k].get("t") or 0))
+            for k in keys[:len(keys) - _HASH_MAX]:
+                db.pop(k, None)
+        _save_hashes(db)
+    return shared
+
 
 def _strip_unit(address: str) -> str:
     """SOP：街景搜索前去掉房间号 Ste/Suite/Room。"""
     return re.sub(r"\b(suite|ste|room|rm|unit|#)\s*\w+", " ", address, flags=re.I).strip(" ,")
+
+
+def _save_photo(body: bytes, tag: str, idx: int) -> str | None:
+    """按魔数落盘：扩展名跟着真实格式走，SVG/HTML/错误页直接丢弃。
+    以前一律写 .jpg，于是把站点占位 SVG 存成 jpg，DeepSeek 收到
+    data:image/jpeg,<svg> 就返回 400 unsupported image（实测）。
+    另外按内容哈希挡掉站点通用占位图，别让它混进 AI 预筛/外观对比。"""
+    mime = deepseek_client.image_mime(body)
+    ext = {"image/jpeg": "jpg", "image/png": "png",
+           "image/webp": "webp", "image/gif": "gif"}.get(mime)
+    if not ext:
+        return None
+    if _is_shared_photo(body, tag):
+        return None
+    p = Path(config.SHOTS_DIR) / f"{tag}_photo{idx}.{ext}"
+    p.write_bytes(body)
+    return str(p)
 
 
 def _is_loopnet(url: str) -> bool:
@@ -75,9 +168,10 @@ def _grab_listing_photos(listing_url: str, tag: str, limit: int = 3) -> list[str
                 body = resp.body()
                 if len(body) < 8000:  # 太小的是占位图
                     continue
-                p = Path(config.SHOTS_DIR) / f"{tag}_photo{len(paths)}.jpg"
-                p.write_bytes(body)
-                paths.append(str(p))
+                p = _save_photo(body, tag, len(paths))
+                if not p:
+                    continue
+                paths.append(p)
             except Exception:
                 continue
     except Exception:
@@ -109,6 +203,9 @@ def _grab_listing_photos(listing_url: str, tag: str, limit: int = 3) -> list[str
                     p = Path(config.SHOTS_DIR) / f"{tag}_photo{i}.png"
                     img.screenshot(path=str(p), timeout=15000)
                     if p.exists() and p.stat().st_size > 8000:
+                        if _is_shared_photo(p.read_bytes(), tag):   # 占位图，删掉不留档
+                            p.unlink(missing_ok=True)
+                            continue
                         paths.append(str(p))
                     if len(paths) >= limit:
                         break
@@ -145,9 +242,10 @@ def download_photo_urls(urls: list, tag: str, referer: str = "", limit: int = 3)
                 body = resp.body()
                 if len(body) < 8000:      # 太小的是占位图
                     continue
-                p = Path(config.SHOTS_DIR) / f"{tag}_photo{len(paths)}.jpg"
-                p.write_bytes(body)
-                paths.append(str(p))
+                p = _save_photo(body, tag, len(paths))
+                if not p:
+                    continue
+                paths.append(p)
             except Exception:
                 continue
     finally:

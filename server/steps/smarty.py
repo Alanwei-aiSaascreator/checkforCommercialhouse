@@ -268,7 +268,7 @@ def verify_address(address: str, tag: str = "smarty") -> dict:
 #   - 自有密钥不可用（未配置/401/402 额度用完）时才退回官网 demo key 兜底
 #   - demo key 是 smarty.com 演示页的公共凭证，全世界共用额度，连打十几次必 429，
 #     所以只有兜底时才用，且限速 1.1s/次
-#   - 两条通道都不可用 → 上层转"待人工"，不把地址判死（下次重跑还能挖）
+#   - 两条通道都不可用 → 上层按"淘汰"处理，但不写失败档案（下次重跑还能挖）
 
 # 新版接口（旧的 us-autocomplete.api.smartystreets.com/suggest 已退役，别再指回去）
 _AUTOCOMPLETE_URL = "https://us-autocomplete.api.smarty.com/v2/lookup"
@@ -393,7 +393,7 @@ def _probe_dpv(client: httpx.Client, street: str, demo: bool) -> tuple:
 
 def channel_down(note: str) -> bool:
     """挖号通道故障（限流/鉴权/额度）≠ 这个地址没有房号：
-    上层据此转"待人工"，不写失败档案（下次重跑还能挖）。"""
+    上层据此按"淘汰"处理，不写失败档案（下次重跑还能挖）。"""
     return any(k in (note or "") for k in ("通道不可用", "限流"))
 
 

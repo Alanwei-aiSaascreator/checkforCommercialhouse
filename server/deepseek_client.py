@@ -45,12 +45,44 @@ _PROMPT = """你是商业地产核查专家。前面几张图是【同一地址�
  "key_differences": ["差异或存疑点"]}"""
 
 
+_MAGIC = ((b"\xff\xd8\xff", "image/jpeg"),
+          (b"\x89PNG\r\n\x1a\n", "image/png"),
+          (b"GIF87a", "image/gif"),
+          (b"GIF89a", "image/gif"))
+
+
+def image_mime(data: bytes) -> str:
+    """按文件魔数判断真实格式（扩展名完全不可信：站点 CDN 会把 webp/svg
+    的字节存成 xxx.jpg）。返回 mime；不是位图（SVG/HTML 错误页等）返回空串。"""
+    for magic, mime in _MAGIC:
+        if data.startswith(magic):
+            return mime
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[4:12] in (b"ftypavif", b"ftypavis"):
+        return "image/avif"
+    return ""
+
+
 def _data_url(path: str) -> str:
-    suffix = Path(path).suffix.lower().lstrip(".") or "png"
-    if suffix == "jpg":
-        suffix = "jpeg"
-    b64 = base64.b64encode(Path(path).read_bytes()).decode()
-    return f"data:image/{suffix};base64,{b64}"
+    """转 data URL。以前直接拿扩展名当 mime，站点把 webp/svg 存成 .jpg 时
+    会发出 data:image/jpeg,<webp 字节>，DeepSeek 直接 400
+    "You have uploaded an unsupported image"（实测 r177_photo1 是 SVG）。"""
+    b = Path(path).read_bytes()
+    mime = image_mime(b)
+    if mime == "image/avif":        # API 只收 webp/png/jpeg/gif，AVIF 转 PNG
+        try:
+            from io import BytesIO
+
+            from PIL import Image
+            out = BytesIO()
+            Image.open(BytesIO(b)).convert("RGB").save(out, "PNG")
+            b, mime = out.getvalue(), "image/png"
+        except Exception:
+            mime = ""
+    if not mime:
+        raise ValueError(f"不是模型可用的图片格式（疑似 SVG/HTML 占位图）：{Path(path).name}")
+    return f"data:{mime};base64,{base64.b64encode(b).decode()}"
 
 
 def _extract_json(text: str) -> dict:
@@ -89,10 +121,17 @@ def check_office_photos(image_paths: list) -> dict:
     if not config.DEEPSEEK_API_KEY:
         raise RuntimeError("未配置 DEEPSEEK_API_KEY，无法进行办公房源预筛")
     content = [{"type": "text", "text": _OFFICE_PROMPT}]
-    for i, p in enumerate(image_paths, 1):
-        label = {"type": "text", "text": f"（第 {i} 张照片）"}
-        content.append(label)
-        content.append({"type": "image_url", "image_url": {"url": _data_url(p)}})
+    n = 0
+    for p in image_paths:
+        try:                     # 单张脏图（SVG/占位）不该拖垮整次调用
+            url = _data_url(p)
+        except Exception:
+            continue
+        n += 1
+        content.append({"type": "text", "text": f"（第 {n} 张照片）"})
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    if n == 0:
+        raise ValueError("没有可用于预筛的有效房源照片")
     text = _chat_content(content, 1500)
     if not text.strip():
         raise ValueError("模型返回空内容（推理 token 耗尽限额，已重试仍失败）")
@@ -149,12 +188,19 @@ def compare_images(street_views: list, listing_photos: list) -> dict:
         raise RuntimeError(
             "未配置 DEEPSEEK_API_KEY（请在环境变量或 data/config.json 中配置后重启服务）")
     content = [{"type": "text", "text": _PROMPT}]
-    for i, p in enumerate(street_views, 1):
-        content.append({"type": "text", "text": f"（街景视角 {i}，朝向可能不同）"})
-        content.append({"type": "image_url", "image_url": {"url": _data_url(p)}})
-    for i, p in enumerate(listing_photos, 1):
-        content.append({"type": "text", "text": f"（房源照片 {i}）"})
-        content.append({"type": "image_url", "image_url": {"url": _data_url(p)}})
+    for label, paths in (("街景视角{}，朝向可能不同", street_views),
+                         ("房源照片{}", listing_photos)):
+        n = 0
+        for p in paths:
+            try:             # 跳过脏图，避免整次对比因一张占位图 400
+                url = _data_url(p)
+            except Exception:
+                continue
+            n += 1
+            content.append({"type": "text", "text": "（" + label.format(n) + "）"})
+            content.append({"type": "image_url", "image_url": {"url": url}})
+    if len(content) == 1:
+        raise ValueError("没有可用于对比的有效图片")
     text = _chat_content(content, 3000)
     if not text.strip():
         raise ValueError("模型返回空内容（推理 token 耗尽限额，已重试仍失败）")

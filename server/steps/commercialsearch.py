@@ -8,6 +8,8 @@ from . import commercialcafe as _cc
 
 _BASE = "https://www.commercialsearch.com"
 DETAIL_IS_PRICE_SOURCE = True
+PAGE_OK_SIGNAL = True              # 复用 commercialcafe 的 page_ok 页码标记
+PAGES_ESTIMATE_UNRELIABLE = True   # 同上：条数估值不可信，需要二分探真实末页
 
 
 def search_candidates(city: str, state: str, price_min: int, price_max: int,

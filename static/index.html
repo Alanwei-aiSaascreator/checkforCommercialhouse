@@ -186,8 +186,8 @@
       </div>
       <div style="overflow-x:auto">
         <table>
-          <thead><tr><th style="width:30px"><input type="checkbox" id="recPickAll" title="全选当前列表"></th><th>时间</th><th>地址</th><th>电话</th><th>价格</th><th>面积(SF)</th><th>四步结果</th><th>结论</th><th>截图</th><th>操作</th></tr></thead>
-          <tbody id="recordsBody"><tr><td colspan="10" class="empty">加载中...</td></tr></tbody>
+          <thead><tr><th style="width:30px"><input type="checkbox" id="recPickAll" title="全选当前列表"></th><th>时间</th><th>数据源</th><th>地址</th><th>电话</th><th>邮箱</th><th>价格</th><th>面积/人数</th><th>四步结果</th><th>结论</th><th>截图</th><th>操作</th></tr></thead>
+          <tbody id="recordsBody"><tr><td colspan="12" class="empty">加载中...</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -402,9 +402,11 @@ async function loadRecords() {
     return `<tr>
       <td><input type="checkbox" class="recPick" value="${r.id}"></td>
       <td style="white-space:nowrap">${esc((r.created_at || "").replace("T", " "))}</td>
-      <td class="addr"><a href="${esc(r.listing_url)}" target="_blank" rel="noopener">${esc(r.address)}</a>${srcChip(r.source)}
-        ${r.agent ? `<div class="steps">${esc(r.agent)}${r.email ? " · " + esc(r.email) : ""}</div>` : ""}</td>
+      <td style="white-space:nowrap">${srcChip(r.source) || "—"}</td>
+      <td class="addr"><a href="${esc(r.listing_url)}" target="_blank" rel="noopener">${esc(r.address)}</a>
+        ${r.agent ? `<div class="steps">${esc(r.agent)}</div>` : ""}</td>
       <td style="white-space:nowrap">${esc(r.phone || "—")}</td>
+      <td style="white-space:nowrap">${esc(r.email || "—")}</td>
       <td style="white-space:nowrap">${esc(r.price || "—")}</td>
       <td style="white-space:nowrap">${esc(r.area || "—")}</td>
       <td class="steps">${esc(r.step1 || "")}<br>${esc(r.step2 || "")}<br>${esc(r.step3 || "")}<br>${esc(r.step4 || "")}</td>
