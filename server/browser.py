@@ -94,17 +94,22 @@ def _reset():
     _stop_pw()
 
 
-def _launch_kw(**extra):
+def _launch_kw(background=False, **extra):
     """统一的启动参数（有头 + 关自动翻译 + 关自动化标记）。
+
+    采集任务默认把 Chrome 以最小化窗口启动：保留真实浏览器、Cookie、截图和
+    登录能力，但不会反复弹窗遮挡用户。人工登录工具不传 background，仍会正常显示窗口。
 
     Translate* 必须关掉：Crexi / CityFeet 等站会被 Chrome 自动翻译成中文，
     页面文案变成「每平方英尺/月 x 美元」，所有英文标签/价格正则都会失效。
     """
-    kw = dict(headless=False, viewport=VIEWPORT, locale="en-US",
-              args=["--disable-blink-features=AutomationControlled",
-                    "--lang=en-US",
-                    "--disable-features=Translate,TranslateUI",
-                    "--disable-translate"])
+    args = ["--disable-blink-features=AutomationControlled",
+            "--lang=en-US",
+            "--disable-features=Translate,TranslateUI",
+            "--disable-translate"]
+    if background:
+        args.append("--start-minimized")
+    kw = dict(headless=False, viewport=VIEWPORT, locale="en-US", args=args)
     if config.PROXY_URL:
         kw["proxy"] = {"server": config.PROXY_URL}
     kw.update(extra)
@@ -147,9 +152,9 @@ def new_page_in(profile_name: str):
         try:
             try:
                 ctx = st.pw.chromium.launch_persistent_context(
-                    str(d), channel="chrome", **_launch_kw())
+                    str(d), channel="chrome", **_launch_kw(background=True))
             except Exception:
-                ctx = st.pw.chromium.launch_persistent_context(str(d), **_launch_kw())
+                ctx = st.pw.chromium.launch_persistent_context(str(d), **_launch_kw(background=True))
             page = ctx.new_page()
             extra[profile_name] = ctx
             block_translate(page)
@@ -174,7 +179,7 @@ def _ensure_context():
     profile_dir = _profile_dir()
     if st.pw is None:
         st.pw = sync_playwright().start()
-    launch_kw = _launch_kw()
+    launch_kw = _launch_kw(background=True)
     try:
         try:
             # 优先系统 Chrome（保留真实指纹特征）
