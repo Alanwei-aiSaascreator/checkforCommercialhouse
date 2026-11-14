@@ -5,7 +5,10 @@
 价格/经纪人/面积在卡片缺失时由 pipeline 调 fetch_broker_info 去详情页补抓。
 """
 import json
+import random
 import re
+import threading
+import time
 
 from .. import browser
 from . import paginate
@@ -278,6 +281,47 @@ _BLOCK_KEYWORDS = ("are you a robot", "access denied", "unusual traffic", "captc
 _NOT_FOUND_KEYWORDS = ("we can't find what you're looking for", "might have been moved",
                        "page not found")
 
+# ---- 请求节流（Akamai 速率阈值）----
+# 实测现象：前几个列表页/详情页都正常，跑到第 7~10 个请求起稳定 Access Denied。
+# 说明触发的不是 IP 段封禁而是**速率/节奏**判定。只在"被拒后重试"里加等待没用，
+# 必须在每次请求之前排队，把节奏压到阈值以下。
+_MIN_GAP = 6.0        # 相邻两次请求的最小间隔（秒）
+_JITTER = 3.0         # 随机抖动，避免固定间隔本身成为机器特征
+_BURST = 6            # 连续请求达到该次数后插入一次长冷却
+_COOL = 40.0          # 长冷却时长（秒）
+_throttle_lock = threading.Lock()
+_last_req = {"t": 0.0, "n": 0}
+
+
+def _throttle() -> None:
+    """请求前排队：最小间隔 + 随机抖动 + 每 N 次长冷却。
+    time.sleep 放在锁内，多线程并发调详情页时也能串行化（不会被并发绕过）。"""
+    with _throttle_lock:
+        wait = _last_req["t"] + _MIN_GAP + random.uniform(0, _JITTER) - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _last_req["n"] += 1
+        if _last_req["n"] % _BURST == 0:
+            time.sleep(_COOL + random.uniform(0, 10))
+        _last_req["t"] = time.time()
+
+
+def _cool_down(sec: float = 60.0) -> None:
+    """命中拦截后的冷却。Akamai 的惩罚有衰减期，立刻重试只会继续被拒，
+    还会把惩罚窗口拉长；先停够再回去，成功率明显更高。"""
+    with _throttle_lock:
+        _last_req["n"] = 0
+        time.sleep(sec + random.uniform(0, 8))
+        _last_req["t"] = time.time()
+
+
+def _blocked(page) -> bool:
+    try:
+        body = page.evaluate("() => document.body.innerText").lower()
+    except Exception:
+        return False
+    return any(k in body for k in _BLOCK_KEYWORDS)
+
 
 def _warmup(page) -> None:
     """首页预热：先落主页再进深层 URL，模拟真人浏览路径，
@@ -340,15 +384,19 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
     blocked = False
     total_pages = 0
     try:
+        _throttle()
         _warmup(page)
+        _throttle()
         browser.goto_retry(page, url, timeout=45000, wait=6000)
         search_shot = browser.shot(page, f"{tag}_loopnet")
         body = page.evaluate("() => document.body.innerText").lower()
         blocked = any(k in body for k in _BLOCK_KEYWORDS)
         if blocked:
-            # Access Denied（多为 IP 层拦截）：预热后重试一次
-            page.wait_for_timeout(3000)
+            # 速率触发（不是 IP 段封禁）：先冷够再重试，立刻重试只会继续被拒
+            _cool_down(60)
+            _throttle()
             _warmup(page)
+            _throttle()
             browser.goto_retry(page, url, timeout=45000, wait=8000, retries=1)
             search_shot = browser.shot(page, f"{tag}_loopnet_retry") or search_shot
             body = page.evaluate("() => document.body.innerText").lower()
@@ -356,17 +404,20 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
         if blocked:
             ip = browser.exit_ip()
             return {"status": "fail",
-                    "message": "LoopNet 拦截（Access Denied/Akamai，属出口 IP 被拉黑，与本机代码无关）"
-                               + (f"：当前出口 IP {ip}" if ip else "")
-                               + "。请换一个 LoopNet 能通过的美国节点（SOP：Clash Verge → 系统代理；"
-                                 "机房/云 IP 段常被整段封，优先住宅 IP 节点），换完直接重跑；"
+                    "message": "LoopNet 拦截（Access Denied/Akamai）：冷却 60s 后重试仍被拒。"
+                               "多为请求节奏触发速率阈值（此前几页列表/详情已累积太多请求），"
+                               "或该配置目录被临时拉黑"
+                               + (f"；当前出口 IP {ip}" if ip else "")
+                               + "。建议停 5~10 分钟再跑，或换个美国节点；"
                                  "也可在界面粘房源详情页链接走手动兜底",
                     "candidates": [], "screenshot": search_shot or "", "total_pages": 0}
         # 第 1 页 404 先重试一次：Akamai 抖一下也会返回 404，
         # 只有连试两次都 404 才能判定"这个搜索地区不存在"
         if page_no == 1 and any(k in body for k in _NOT_FOUND_KEYWORDS):
             page.wait_for_timeout(2000)
+            _throttle()
             _warmup(page)
+            _throttle()
             browser.goto_retry(page, url, timeout=45000, wait=6000, retries=1)
             search_shot = browser.shot(page, f"{tag}_loopnet_retry") or search_shot
             body = page.evaluate("() => document.body.innerText").lower()
@@ -441,12 +492,14 @@ def candidates_from_urls(urls: list) -> dict:
     page = browser.new_page_in(_PROFILE)
     shot = ""
     try:
+        _throttle()
         _warmup(page)
         for u in urls:
             u = u.strip()
             if not u:
                 continue
             try:
+                _throttle()
                 browser.goto_retry(page, u, timeout=45000, wait=5000)
                 shot = shot or browser.shot(page, "manual_loopnet")
                 cand = _detail_candidate(page, u)
@@ -501,14 +554,25 @@ def _parse_spaces(page) -> list:
 
 def fetch_broker_info(listing_url: str) -> dict:
     """详情页补抓 价格/经纪人/电话/邮箱/面积 + 各套间面积与单价（spaces）。"""
-    info = {"price": "", "agent": "", "phone": "", "email": "", "area": "", "spaces": []}
+    info = {"price": "", "agent": "", "phone": "", "email": "", "area": "", "spaces": [],
+            "blocked": False}
     if not listing_url:
         return info
     page = browser.new_page_in(_PROFILE)
     try:
         # 固定空等 5s 太贵：DOMContentLoaded 后 3s 足够渲染价格/套间表
         # （提速只压"无意义空等"，不提高请求频率，反爬策略不变）
+        _throttle()
         browser.goto_retry(page, listing_url, timeout=45000, wait=3000)
+        if _blocked(page):
+            # 详情页同样会被速率拦截：冷却后重试一次，仍失败就标记，
+            # 避免把「被拦」当成「无价格/无面积」直接误判淘汰
+            _cool_down(60)
+            _throttle()
+            browser.goto_retry(page, listing_url, timeout=45000, wait=6000, retries=1)
+            if _blocked(page):
+                info["blocked"] = True
+                return info
         text = page.evaluate("() => document.body.innerText.slice(0, 8000)")
         info["price"] = _parse_price(text)
         info["agent"] = _parse_broker(text)

@@ -447,6 +447,11 @@ class TaskRunner:
             if cand.get("listing_url") and need_detail:
                 self.emit("补抓详情页（价格/经纪人/面积/套间表）...")
                 info = feed.fetch_broker_info(cand.get("listing_url", ""))
+                if info.get("blocked"):
+                    # 详情页被速率拦截：字段缺失是"没抓到"而不是"房源没写"，
+                    # 日志里必须区分，否则看结果的人会误以为这套房真没有价格
+                    self.emit("  ⚠ 详情页被反爬拦截（冷却后仍被拒），本条字段可能缺失",
+                              "warn")
                 spaces = info.get("spaces") or []
                 for k in ("agent", "phone", "email", "price", "area"):
                     if info.get(k) and not cand.get(k):
