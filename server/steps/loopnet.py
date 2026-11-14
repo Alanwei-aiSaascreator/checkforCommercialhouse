@@ -10,7 +10,7 @@ import re
 import threading
 import time
 
-from .. import browser
+from .. import browser, config
 from . import paginate
 
 _BASE = "https://www.loopnet.com"
@@ -285,33 +285,66 @@ _NOT_FOUND_KEYWORDS = ("we can't find what you're looking for", "might have been
 # 实测现象：前几个列表页/详情页都正常，跑到第 7~10 个请求起稳定 Access Denied。
 # 说明触发的不是 IP 段封禁而是**速率/节奏**判定。只在"被拒后重试"里加等待没用，
 # 必须在每次请求之前排队，把节奏压到阈值以下。
-_MIN_GAP = 6.0        # 相邻两次请求的最小间隔（秒）
-_JITTER = 3.0         # 随机抖动，避免固定间隔本身成为机器特征
-_BURST = 6            # 连续请求达到该次数后插入一次长冷却
-_COOL = 40.0          # 长冷却时长（秒）
+_MIN_GAP = 12.0       # 相邻两次请求的最小间隔（秒）
+_JITTER = 4.0         # 随机抖动，避免固定间隔本身成为机器特征
+_BURST = 3            # 连续请求达到该次数后插入一次长冷却
+_COOL = 90.0          # 长冷却时长（秒）
+# 当日请求/被拦次数落盘：Akamai 的额度按「出口 IP + 天」累计，跨任务、跨重启都算，
+# 只放内存的话重启一次就归零，等于反复把已经烧掉的配额再撞一遍。
+_STATE = config.DATA_DIR / "loopnet_state.json"
 _throttle_lock = threading.Lock()
 _last_req = {"t": 0.0, "n": 0}
 
 
+def _load_state() -> dict:
+    today = time.strftime("%Y-%m-%d")
+    try:
+        d = json.loads(_STATE.read_text(encoding="utf-8"))
+        if isinstance(d, dict) and d.get("date") == today:
+            return d
+    except Exception:
+        pass
+    return {"date": today, "reqs": 0, "blocks": 0}
+
+
+def _save_state(d: dict) -> None:
+    try:
+        _STATE.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _throttle() -> None:
     """请求前排队：最小间隔 + 随机抖动 + 每 N 次长冷却。
-    time.sleep 放在锁内，多线程并发调详情页时也能串行化（不会被并发绕过）。"""
+
+    当天被拦次数越多，节奏放得越慢（Akamai 的惩罚有累积性：同一 IP 反复触发
+    后，阈值会越来越低）。time.sleep 放在锁内，多线程并发也能串行化。
+    """
     with _throttle_lock:
-        wait = _last_req["t"] + _MIN_GAP + random.uniform(0, _JITTER) - time.time()
+        st = _load_state()
+        factor = 1 + min(int(st.get("blocks", 0)), 3) * 0.6      # 最多放慢到 2.8 倍
+        gap = _MIN_GAP * factor + random.uniform(0, _JITTER * factor)
+        wait = _last_req["t"] + gap - time.time()
         if wait > 0:
             time.sleep(wait)
         _last_req["n"] += 1
         if _last_req["n"] % _BURST == 0:
-            time.sleep(_COOL + random.uniform(0, 10))
+            time.sleep((_COOL + random.uniform(0, 15)) * factor)
         _last_req["t"] = time.time()
+        st["reqs"] = int(st.get("reqs", 0)) + 1
+        _save_state(st)
 
 
-def _cool_down(sec: float = 60.0) -> None:
+def _cool_down(sec: float = 180.0) -> None:
     """命中拦截后的冷却。Akamai 的惩罚有衰减期，立刻重试只会继续被拒，
-    还会把惩罚窗口拉长；先停够再回去，成功率明显更高。"""
+    还会把惩罚窗口拉长；先停够再回去，成功率明显更高。同时记一次 block，
+    让后续请求自动进一步降速。"""
     with _throttle_lock:
         _last_req["n"] = 0
-        time.sleep(sec + random.uniform(0, 8))
+        st = _load_state()
+        st["blocks"] = int(st.get("blocks", 0)) + 1
+        _save_state(st)
+        time.sleep(sec + random.uniform(0, 10))
         _last_req["t"] = time.time()
 
 
@@ -393,7 +426,7 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
         blocked = any(k in body for k in _BLOCK_KEYWORDS)
         if blocked:
             # 速率触发（不是 IP 段封禁）：先冷够再重试，立刻重试只会继续被拒
-            _cool_down(60)
+            _cool_down(180)
             _throttle()
             _warmup(page)
             _throttle()
@@ -403,13 +436,16 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
             blocked = any(k in body for k in _BLOCK_KEYWORDS)
         if blocked:
             ip = browser.exit_ip()
+            st = _load_state()
             return {"status": "fail",
-                    "message": "LoopNet 拦截（Access Denied/Akamai）：冷却 60s 后重试仍被拒。"
-                               "多为请求节奏触发速率阈值（此前几页列表/详情已累积太多请求），"
-                               "或该配置目录被临时拉黑"
+                    "message": "LoopNet 拦截（Access Denied/Akamai）：冷却 180s 后重试仍被拒"
+                               f"（今日已请求 {st.get('reqs', 0)} 次、被拦 {st.get('blocks', 0)} 次）。"
+                               "这是按出口 IP 累计的速率/额度限制，不是代码问题，"
+                               "继续跑只会把惩罚窗口拉长"
                                + (f"；当前出口 IP {ip}" if ip else "")
-                               + "。建议停 5~10 分钟再跑，或换个美国节点；"
-                                 "也可在界面粘房源详情页链接走手动兜底",
+                               + "。建议今天先别跑 LoopNet（换 Crexi / CommercialSearch 出量），"
+                                 "隔 30 分钟以上或换美国节点再试"
+                                 "（状态落在 data/loopnet_state.json，可手动删除以重置计数）",
                     "candidates": [], "screenshot": search_shot or "", "total_pages": 0}
         # 第 1 页 404 先重试一次：Akamai 抖一下也会返回 404，
         # 只有连试两次都 404 才能判定"这个搜索地区不存在"
@@ -567,7 +603,7 @@ def fetch_broker_info(listing_url: str) -> dict:
         if _blocked(page):
             # 详情页同样会被速率拦截：冷却后重试一次，仍失败就标记，
             # 避免把「被拦」当成「无价格/无面积」直接误判淘汰
-            _cool_down(60)
+            _cool_down(180)
             _throttle()
             browser.goto_retry(page, listing_url, timeout=45000, wait=6000, retries=1)
             if _blocked(page):
