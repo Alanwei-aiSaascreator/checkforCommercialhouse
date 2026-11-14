@@ -268,6 +268,10 @@ def _detail_candidate(page, url: str, city: str = "", state: str = "") -> dict:
     }
 
 
+# 主配置带 Crexi 登录态、已被 Akamai 记住：实测同一出口 IP 下主配置直接
+# Access Denied，干净配置正常 200。LoopNet 全程走独立配置目录。
+_PROFILE = "chrome_profile_feeds"
+
 _BLOCK_KEYWORDS = ("are you a robot", "access denied", "unusual traffic", "captcha",
                    "too many requests")
 # 页码越界时 LoopNet 的 404 文案
@@ -330,7 +334,9 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
     """
     page_no = max(int(page or 1), 1)
     url = _search_url(city, state, price_min, price_max, page_no)
-    page = browser.new_page()
+    # 必须用独立配置：主配置 chrome_profile 带 Crexi 登录态，已被 Akamai 记住，
+    # 实测同一代理下主配置 Access Denied / 干净配置正常 200（见 browser.new_page_in）
+    page = browser.new_page_in(_PROFILE)
     blocked = False
     total_pages = 0
     try:
@@ -432,7 +438,7 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
 def candidates_from_urls(urls: list) -> dict:
     """手动房源链接兜底：逐条打开详情页解析候选。"""
     candidates = []
-    page = browser.new_page()
+    page = browser.new_page_in(_PROFILE)
     shot = ""
     try:
         _warmup(page)
@@ -498,7 +504,7 @@ def fetch_broker_info(listing_url: str) -> dict:
     info = {"price": "", "agent": "", "phone": "", "email": "", "area": "", "spaces": []}
     if not listing_url:
         return info
-    page = browser.new_page()
+    page = browser.new_page_in(_PROFILE)
     try:
         # 固定空等 5s 太贵：DOMContentLoaded 后 3s 足够渲染价格/套间表
         # （提速只压"无意义空等"，不提高请求频率，反爬策略不变）
