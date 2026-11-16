@@ -270,6 +270,19 @@ def _geocode(address: str):
     return None
 
 
+def _usable_street_image(path: str) -> bool:
+    """过滤 Google 街景尚未渲染完成时产生的黑屏/空白截图。"""
+    try:
+        from PIL import Image, ImageStat
+        img = Image.open(path).convert("L")
+        small = img.resize((64, 64))
+        mean = ImageStat.Stat(small).mean[0]
+        bright = sum(1 for px in small.getdata() if px > 18) / 4096
+        return mean > 12 and bright > 0.08
+    except Exception:
+        return False
+
+
 def _crop_clean(path: str) -> str:
     """裁掉街景截图里的所有 UI：左侧地址栏、小地图、Google 水印、分享/关闭按钮，
     只保留画面中央的建筑物区域（SOP：截图不得包含网页元素和地址信息）。"""
@@ -307,14 +320,19 @@ def _img_diff(a: str, b: str) -> float:
 
 
 def _activate_panorama(page) -> None:
-    """等待 360 全景画布就绪并点击激活（进入沉浸式全景，画面更大更干净）。"""
+    """等待街景画布完成绘制并点击激活，禁止在未渲染时截图。"""
     try:
         canvas = page.locator("#widget-scene-canvas").first
         if canvas.count():
             canvas.click(timeout=6000)
-            page.wait_for_timeout(2000)
+        # Google 街景使用 WebGL 画布，等待画布尺寸和像素稳定后再截图。
+        page.wait_for_function("""() => {
+            const c = document.querySelector('#widget-scene-canvas');
+            return c && c.width > 300 && c.height > 200;
+        }""", timeout=15000)
+        page.wait_for_timeout(5000)
     except Exception:
-        pass
+        page.wait_for_timeout(5000)
 
 
 def _capture_street_views(page, coords, tag: str, max_views: int = 3) -> list:
@@ -329,14 +347,24 @@ def _capture_street_views(page, coords, tag: str, max_views: int = 3) -> list:
         url = (f"https://www.google.com/maps/@?layer=c&cbll={lat},{lon}"
                f"&cbp=12,{heading},0,0,0")
         try:
-            _goto_retry(page, url, timeout=45000, wait=5000)
+            _goto_retry(page, url, timeout=45000, wait=8000)
             _activate_panorama(page)
         except Exception:
             continue
         s = shot(page, f"{tag}_maps") or ""
         if not s:
             continue
+        if not _usable_street_image(s):
+            # Google 全景画布可能尚未完成绘制，等待后重拍一次，黑屏不送给 AI。
+            page.wait_for_timeout(3500)
+            retry = shot(page, f"{tag}_maps_retry") or ""
+            if retry and _usable_street_image(retry):
+                s = retry
+            else:
+                continue
         s = _crop_clean(s)
+        if not _usable_street_image(s):
+            continue
         # 去重：与已有视角几乎同画面则跳过
         if any(_img_diff(s, t) < 8.0 for t in shots):
             try:
@@ -379,8 +407,10 @@ def check_street_view(address: str, listing_url: str = "", tag: str = "maps",
                     sv.click(timeout=5000)
                     page.wait_for_timeout(4000)
                     s = shot(page, f"{tag}_streetview") or ""
-                    if s:
-                        street_shots = [_crop_clean(s)]
+                    if s and _usable_street_image(s):
+                        cleaned = _crop_clean(s)
+                        if _usable_street_image(cleaned):
+                            street_shots = [cleaned]
             except Exception:
                 pass
     except Exception as e:
@@ -398,7 +428,7 @@ def check_street_view(address: str, listing_url: str = "", tag: str = "maps",
     photos = photos if photos is not None else _grab_listing_photos(listing_url, tag)
     if not street_shots:
         return {"status": "suspect", "screenshot": "", "extra_shots": [],
-                "message": "街景截图失败，无法比对", "detail": {}}
+                "message": "街景未完成渲染或截图全黑，已跳过本次外观判定", "detail": {}}
     if not photos:
         # 全自动模式：无照片可比对时跳过外观环节（街景图已留档），不卡流程
         return {"status": "pass", "screenshot": street_shots[0],

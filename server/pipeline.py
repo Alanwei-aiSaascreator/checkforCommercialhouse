@@ -499,8 +499,18 @@ class TaskRunner:
             # 没有套间 → 才按整栋/整层面积判断
             fitted = [(s["monthly"], s) for s in spaces
                       if s.get("monthly") is not None
-                      and price_min <= s["monthly"] <= price_max]
+                      and price_min <= s["monthly"] <= price_max
+                      and str(s.get("size") or "").replace(",", "").strip().isdigit()]
+            in_budget_missing_size = [s for s in spaces
+                                     if s.get("monthly") is not None
+                                     and price_min <= s["monthly"] <= price_max
+                                     and not str(s.get("size") or "").replace(",", "").strip().isdigit()]
             if spaces:
+                if not fitted and in_budget_missing_size:
+                    note = "预算内套间缺少有效面积，无法选择套间，直接淘汰"
+                    store.update_record(record_id, conclusion="不通过", notes=note)
+                    self.emit(f"  {note}", "warn")
+                    continue
                 if not fitted:
                     priced = [s for s in spaces if s.get("monthly") is not None]
                     if not priced:
@@ -770,8 +780,9 @@ class TaskRunner:
             if r3["status"] != "pass":
                 reason = "AI 判定外观不符" if r3["status"] == "fail" else "街景对比无法完成"
                 store.update_record(record_id, conclusion="不通过", notes=reason)
-                # 精确级登记：视觉问题只拉黑该具体地址，同楼其他 Suite 仍可尝试
-                store.add_failed_address(addr, "街景", reason, building=False)
+                # 黑屏/未渲染属于临时失败，不拉黑地址，避免下次重跑永久跳过。
+                if "全黑" not in r3.get("message", "") and "未完成渲染" not in r3.get("message", ""):
+                    store.add_failed_address(addr, "街景", reason, building=False)
                 self.emit("该地址淘汰，处理下一个候选", "warn")
                 continue
 

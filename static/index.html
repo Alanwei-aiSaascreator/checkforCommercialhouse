@@ -114,10 +114,10 @@
   <div class="page active" id="page-new">
     <div class="card">
       <div class="grid">
-        <div class="field"><label>城市（如 Los Angeles）</label>
-          <input id="city" value="Los Angeles" placeholder="Los Angeles"></div>
-        <div class="field"><label>州缩写（如 CA）</label>
-          <input id="state" value="CA" placeholder="CA" maxlength="2"></div>
+        <div class="field"><label>城市 / City</label>
+          <select id="city" disabled><option value="">请先选择州 / Select a state first</option></select></div>
+        <div class="field"><label>州 / State</label>
+          <select id="state"><option value="">请选择州 / Select a state</option></select></div>
         <div class="field"><label>价格下限（$/月）</label>
           <input id="priceMin" type="number" value="0" min="0"></div>
         <div class="field"><label>价格上限（$/月）</label>
@@ -242,6 +242,38 @@
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
+const STATE_CITIES = {
+  AL: ["Birmingham", "Huntsville", "Mobile", "Montgomery"], AK: ["Anchorage", "Fairbanks", "Juneau", "Wasilla"], AZ: ["Phoenix", "Tucson", "Mesa", "Scottsdale"],
+  AR: ["Little Rock", "Fayetteville", "Fort Smith"], CA: ["Los Angeles", "San Diego", "San Francisco", "San Jose", "Sacramento", "Oakland", "Fresno", "Irvine"],
+  CO: ["Denver", "Colorado Springs", "Aurora", "Fort Collins", "Boulder"], CT: ["Bridgeport", "New Haven", "Hartford", "Stamford"],
+  DE: ["Wilmington", "Dover", "Newark"], FL: ["Miami", "Orlando", "Tampa", "Jacksonville", "Fort Lauderdale", "Tallahassee"],
+  GA: ["Atlanta", "Augusta", "Savannah", "Columbus"], HI: ["Honolulu", "Hilo", "Kailua-Kona"], ID: ["Boise", "Idaho Falls", "Meridian"],
+  IL: ["Chicago", "Aurora", "Rockford", "Springfield", "Naperville"], IN: ["Indianapolis", "Fort Wayne", "Evansville", "South Bend"],
+  IA: ["Des Moines", "Cedar Rapids", "Davenport"], KS: ["Wichita", "Overland Park", "Kansas City", "Topeka"], KY: ["Louisville", "Lexington", "Bowling Green"],
+  LA: ["New Orleans", "Baton Rouge", "Shreveport", "Lafayette"], ME: ["Portland", "Lewiston", "Bangor"], MD: ["Baltimore", "Frederick", "Rockville", "Annapolis"],
+  MA: ["Boston", "Worcester", "Springfield", "Cambridge", "Lowell"], MI: ["Detroit", "Grand Rapids", "Warren", "Ann Arbor"],
+  MN: ["Minneapolis", "Saint Paul", "Rochester", "Duluth"], MS: ["Jackson", "Gulfport", "Southaven"], MO: ["Kansas City", "St. Louis", "Springfield", "Columbia"],
+  MT: ["Billings", "Missoula", "Great Falls", "Bozeman"], NE: ["Omaha", "Lincoln", "Bellevue"], NV: ["Las Vegas", "Henderson", "Reno", "North Las Vegas"],
+  NH: ["Manchester", "Nashua", "Concord"], NJ: ["Newark", "Jersey City", "Paterson", "Trenton", "Edison"], NM: ["Albuquerque", "Las Cruces", "Santa Fe", "Rio Rancho"],
+  NY: ["New York", "Buffalo", "Rochester", "Yonkers", "Syracuse", "Albany"], NC: ["Charlotte", "Raleigh", "Greensboro", "Durham", "Wilmington"],
+  ND: ["Fargo", "Bismarck", "Grand Forks"], OH: ["Columbus", "Cleveland", "Cincinnati", "Toledo", "Akron"], OK: ["Oklahoma City", "Tulsa", "Norman", "Edmond"],
+  OR: ["Portland", "Eugene", "Salem", "Bend", "Beaverton"], PA: ["Philadelphia", "Pittsburgh", "Allentown", "Erie", "Harrisburg"],
+  RI: ["Providence", "Warwick", "Cranston"], SC: ["Charleston", "Columbia", "North Charleston", "Greenville"], SD: ["Sioux Falls", "Rapid City", "Aberdeen"],
+  TN: ["Nashville", "Memphis", "Knoxville", "Chattanooga", "Clarksville"], TX: ["Houston", "Dallas", "Austin", "San Antonio", "Fort Worth", "El Paso", "Arlington", "Plano"],
+  UT: ["Salt Lake City", "West Valley City", "Provo", "Ogden", "St. George"], VT: ["Burlington", "South Burlington", "Rutland"],
+  VA: ["Virginia Beach", "Norfolk", "Richmond", "Arlington", "Alexandria", "Roanoke"], WA: ["Seattle", "Spokane", "Tacoma", "Vancouver", "Bellevue"],
+  WV: ["Charleston", "Huntington", "Morgantown"], WI: ["Milwaukee", "Madison", "Green Bay", "Kenosha"], WY: ["Cheyenne", "Casper", "Laramie"]
+};
+const STATE_NAMES = {
+  AL:"Alabama", AK:"Alaska", AZ:"Arizona", AR:"Arkansas", CA:"California", CO:"Colorado", CT:"Connecticut", DE:"Delaware", FL:"Florida", GA:"Georgia", HI:"Hawaii", ID:"Idaho", IL:"Illinois", IN:"Indiana", IA:"Iowa", KS:"Kansas", KY:"Kentucky", LA:"Louisiana", ME:"Maine", MD:"Maryland", MA:"Massachusetts", MI:"Michigan", MN:"Minnesota", MS:"Mississippi", MO:"Missouri", MT:"Montana", NE:"Nebraska", NV:"Nevada", NH:"New Hampshire", NJ:"New Jersey", NM:"New Mexico", NY:"New York", NC:"North Carolina", ND:"North Dakota", OH:"Ohio", OK:"Oklahoma", OR:"Oregon", PA:"Pennsylvania", RI:"Rhode Island", SC:"South Carolina", SD:"South Dakota", TN:"Tennessee", TX:"Texas", UT:"Utah", VT:"Vermont", VA:"Virginia", WA:"Washington", WV:"West Virginia", WI:"Wisconsin", WY:"Wyoming"
+};
+Object.entries(STATE_NAMES).forEach(([code, name]) => $("#state").add(new Option(`${name} (${code}) / ${name}`, code)));
+$("#state").onchange = () => {
+  const cities = STATE_CITIES[$("#state").value] || [];
+  $("#city").innerHTML = '<option value="">请选择城市 / Select a city</option>' + cities.map(c => `<option>${c}</option>`).join("");
+  $("#city").disabled = !cities.length;
+};
+
 /* ---------- 标签页 ---------- */
 document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
   document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
@@ -290,12 +322,7 @@ $("#startBtn").onclick = async () => {
     target: +$("#target").value || 3, listing_urls: $("#listingUrls").value.trim(),
     source: $("#source").value,
   };
-  if (!body.city || !body.state) return alert("请填写城市和州缩写");
-  // 房源站只支持城市级搜索：填州名/地区名（如 ALASKA）会直接 404
-  const US_STATES = "ALABAMA ALASKA ARIZONA ARKANSAS CALIFORNIA COLORADO CONNECTICUT DELAWARE FLORIDA GEORGIA HAWAII IDAHO ILLINOIS INDIANA IOWA KANSAS KENTUCKY LOUISIANA MAINE MARYLAND MASSACHUSETTS MICHIGAN MINNESOTA MISSISSIPPI MISSOURI MONTANA NEBRASKA NEVADA NEWHAMPSHIRE NEWJERSEY NEWMEXICO NEWYORK NORTHCAROLINA NORTHDAKOTA OHIO OKLAHOMA OREGON PENNSYLVANIA RHODEISLAND SOUTHCAROLINA SOUTHDAKOTA TENNESSEE TEXAS UTAH VERMONT VIRGINIA WASHINGTON WESTVIRGINIA WISCONSIN WYOMING".split(" ");
-  if (US_STATES.includes(body.city.toUpperCase().replace(/[\s_-]/g, ""))) {
-    return alert(`「${body.city}」是州名，房源站只支持城市级搜索。\n请填具体城市（如 Anchorage），州缩写填 ${body.state}。`);
-  }
+  if (!body.city || !body.state) return alert("请选择州和城市 / Please select a state and city");
   const r = await fetch("/api/tasks", {method: "POST", headers: {"Content-Type": "application/json"},
                                        body: JSON.stringify(body)});
   if (!r.ok) return alert((await r.json()).detail || "启动失败");

@@ -18,6 +18,8 @@ DETAIL_IS_PRICE_SOURCE = True
 # 越界页码不会 404/空页，而是把第 1 页再发一遍（实测 Chicago 第 999 页 = 第 1 页），
 # 靠 paginate.check 的页内当前页标记识别。
 PAGE_OK_SIGNAL = True
+# 结果总数/页码在 OfficeSpace 上可能被截断或回落到第 1 页，必须用页面当前页标记实测末页。
+PAGES_ESTIMATE_UNRELIABLE = True
 _PROFILE = "chrome_profile_feeds"
 # OfficeSpace 只提供官方联系渠道（页面无经纪人直连电话/邮箱），
 # 记录里电话/邮箱统一写这句话，避免留空被误判成"漏抓"
@@ -200,6 +202,7 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
     pg = browser.new_page_in(_PROFILE)
     try:
         browser.goto_retry(pg, url, timeout=60000, wait=2500)
+        # 列表可能使用懒加载：滚动几轮后再读取 DOM，避免只拿到首屏卡片。
         for _ in range(8):
             try:
                 cards = pg.evaluate(_CARDS_JS) or []
@@ -207,7 +210,18 @@ def search_candidates(city: str, state: str, price_min: int, price_max: int,
                 cards = []
             if cards:
                 break
-            pg.wait_for_timeout(2000)
+            pg.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            pg.wait_for_timeout(1000)
+        for _ in range(5):
+            before = len(cards)
+            pg.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            pg.wait_for_timeout(800)
+            try:
+                cards = pg.evaluate(_CARDS_JS) or cards
+            except Exception:
+                pass
+            if len(cards) <= before:
+                break
         shot = browser.shot(pg, f"{tag}_officespace")
         try:
             low = (pg.evaluate("() => document.body.innerText") or "").lower()

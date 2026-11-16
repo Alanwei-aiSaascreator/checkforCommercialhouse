@@ -3,6 +3,7 @@
 使用系统 Chrome（channel="chrome"）+ data/chrome_profile 持久化配置，
 保留登录态/ Cookie，降低 LoopNet、OpenCorporates 的反爬拦截概率。
 """
+import ctypes
 import queue
 import threading
 import time
@@ -22,6 +23,46 @@ _lock = threading.Lock()
 _aux = {"thread": None, "queue": None}
 
 VIEWPORT = {"width": 1440, "height": 900}
+
+
+def _minimize_chrome_window(pid):
+    """强制将 Playwright 启动的 Chrome 窗口最小化到任务栏。"""
+    if not hasattr(ctypes, "windll"):
+        return
+    user32 = ctypes.windll.user32
+    hwnds = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def callback(hwnd, _):
+        found_pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(found_pid))
+        cls = ctypes.create_unicode_buffer(128)
+        user32.GetClassNameW(hwnd, cls, 128)
+        same_process = pid and found_pid.value == pid
+        is_chrome = cls.value == "Chrome_WidgetWin_1"
+        if user32.IsWindowVisible(hwnd) and (same_process or (not pid and is_chrome)):
+            hwnds.append(hwnd)
+        return True
+
+    user32.EnumWindows(callback, 0)
+    for hwnd in hwnds:
+        user32.ShowWindow(hwnd, 6)
+
+
+def _minimize_context(context):
+    """在启动、开页和导航后重复最小化，防止 Chrome 再次抢回前台。"""
+    browser = getattr(context, "browser", None)
+    try:
+        pid = browser.pid if browser is not None else None
+    except Exception:
+        pid = None
+
+    def minimize_later():
+        for delay in (0.2, 0.8, 2.0):
+            time.sleep(delay)
+            _minimize_chrome_window(pid)
+
+    threading.Thread(target=minimize_later, daemon=True).start()
 
 
 def _state():
@@ -106,9 +147,14 @@ def _launch_kw(background=False, **extra):
     args = ["--disable-blink-features=AutomationControlled",
             "--lang=en-US",
             "--disable-features=Translate,TranslateUI",
-            "--disable-translate"]
+            "--disable-translate",
+            "--enable-gpu",
+            "--ignore-gpu-blocklist",
+            "--use-angle=d3d11"]
     if background:
-        args.append("--start-minimized")
+        # 保留有头渲染以支持 Google Maps/WebGL；窗口移到屏幕外并最小化，
+        # 不创建无头窗口，避免街景画布在 headless 下出现黑屏。
+        args.extend(["--start-minimized", "--window-position=-32000,-32000"])
     kw = dict(headless=False, viewport=VIEWPORT, locale="en-US", args=args)
     if config.PROXY_URL:
         kw["proxy"] = {"server": config.PROXY_URL}
@@ -157,6 +203,7 @@ def new_page_in(profile_name: str):
                 ctx = st.pw.chromium.launch_persistent_context(str(d), **_launch_kw(background=True))
             page = ctx.new_page()
             extra[profile_name] = ctx
+            _minimize_context(ctx)
             block_translate(page)
             return page
         except Exception as e:
@@ -189,6 +236,7 @@ def _ensure_context():
             _stop_pw()
             st.pw = sync_playwright().start()
             st.context = _launch(profile_dir, **launch_kw)
+        _minimize_context(st.context)
     except Exception:
         # 彻底失败：清理驱动，下次任务从干净状态重试
         _stop_pw()
@@ -332,10 +380,13 @@ def exit_ip() -> str:
 def new_page():
     """新开一个标签页（调用方负责 close）。连接在检查后瞬断时重建并重试一次。"""
     try:
-        page = _ensure_context().new_page()
+        context = _ensure_context()
+        page = context.new_page()
     except Exception:
         _reset()
-        page = _ensure_context().new_page()
+        context = _ensure_context()
+        page = context.new_page()
+    _minimize_context(context)
     block_translate(page)
     return page
 
