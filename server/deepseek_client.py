@@ -165,20 +165,30 @@ def _post_chat(payload: dict, headers: dict, proxies):
 
 
 def _chat_content(content: list, max_tokens: int) -> str:
-    """调 chat/completions 返回 content 文本。deepseek-flash 的 reasoning token
-    会占用 max_tokens，不足时 content 为空（此前 1500 偶发不够）——空回复自动加倍重试一次。"""
+    """调用视觉模型并处理 reasoning token 耗尽。
+
+    DeepSeek 的推理 token 与输出 token 共用上限，视觉输入较多时可能出现
+    HTTP 200 但 content 为空。逐步扩大输出上限，并在最后一次明确要求只返回
+    极短 JSON，避免把一次空回复直接变成街景判定失败。"""
     headers = {"Authorization": f"Bearer {config.DEEPSEEK_API_KEY}"}
     proxies = config.PROXY_URL or None
     text = ""
-    for mt in (max_tokens, max_tokens * 2):
+    attempts = [max_tokens, max(max_tokens * 2, 4000), max(max_tokens * 3, 6000)]
+    for idx, mt in enumerate(attempts):
+        msg_content = content
+        if idx == len(attempts) - 1:
+            msg_content = list(content) + [{"type": "text", "text":
+                "最后一次尝试：只输出一行完整 JSON，reason 不超过 30 字，matched_features 和 key_differences 各最多 2 项。"}]
         payload = {
             "model": config.DEEPSEEK_VISION_MODEL,
-            "messages": [{"role": "user", "content": content}],
+            "messages": [{"role": "user", "content": msg_content}],
             "temperature": 0.1,
             "max_tokens": mt,
         }
         data = _post_chat(payload, headers, proxies)
-        text = data["choices"][0]["message"].get("content") or ""
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        text = message.get("content") or ""
         if text.strip():
             return text
     return text

@@ -112,6 +112,7 @@
   <div class="tabs">
     <button class="tab active" data-page="new">新建核查任务</button>
     <button class="tab" data-page="records">核查记录</button>
+    <button class="tab" data-page="review">待人工复核 <span class="badge" id="reviewBadge">0</span></button>
     <button class="tab" data-page="known">收录地址表</button>
   </div>
 
@@ -244,6 +245,15 @@
     </div>
   </div>
 
+  <!-- 待人工复核专页 -->
+  <div class="page" id="page-review">
+    <div class="card">
+      <h3 class="sec">待人工复核</h3>
+      <div class="steps" style="margin-bottom:12px">这里集中展示自动化证据不足、但没有明确否定证据的记录。请结合房源照片、街景照片、建筑轮廓和入口特征判断。</div>
+      <div id="reviewQueue"><div class="empty">加载中...</div></div>
+    </div>
+  </div>
+
   <!-- 收录地址表 -->
   <div class="page" id="page-known">
     <div class="card">
@@ -320,6 +330,7 @@ document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
   t.classList.add("active");
   $("#page-" + t.dataset.page).classList.add("active");
   if (t.dataset.page === "records") loadRecords();
+  if (t.dataset.page === "review") loadReviewQueue();
   if (t.dataset.page === "known") loadKnown();
 });
 
@@ -525,6 +536,15 @@ async function loadOneRecord(id) {
 window.openRecModal = async id => openRecModal(id, await loadOneRecord(id));
 
 /* ---------- 待人工视觉复核 ---------- */
+async function loadReviewQueue() {
+  const recs = await (await fetch("/api/records?conclusion=" + encodeURIComponent("待人工"))).json();
+  $("#reviewBadge").textContent = recs.length;
+  $("#reviewQueue").innerHTML = recs.length ? recs.map(r =>
+    `<div class="known-item" style="align-items:center; gap:12px">
+      <div style="flex:1"><b>${esc(r.address || "")}</b><div class="steps">${esc(r.source || "")}　${esc(r.price || "—")}　${esc(r.area || "—")}<br>${esc(r.notes || r.step3 || "待判断")}</div></div>
+      <button class="btn sm" onclick="openReview(${r.id})">查看图片并决策</button>
+    </div>`).join("") : `<div class="empty">暂无待人工记录</div>`;
+}
 let reviewingRecord = null;
 function reviewLabel(path) {
   const p = String(path).toLowerCase();
