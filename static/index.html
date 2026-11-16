@@ -227,6 +227,23 @@
     </div>
   </div>
 
+  <!-- 人工复核弹窗 -->
+  <div id="reviewModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:99; align-items:center; justify-content:center">
+    <div class="card" style="width:min(1100px,94vw); max-height:92vh; overflow-y:auto">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:12px">
+        <h3 class="sec" id="reviewTitle">人工复核</h3>
+        <button class="btn gray" id="reviewClose">关闭</button>
+      </div>
+      <div id="reviewSummary" class="steps" style="margin-bottom:12px"></div>
+      <div id="reviewShots" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px"></div>
+      <div style="margin-top:16px; display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap">
+        <button class="btn gray" id="reviewKeep">保持待人工</button>
+        <button class="btn red" id="reviewReject">人工判定不通过</button>
+        <button class="btn" id="reviewPass">人工判定通过</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 收录地址表 -->
   <div class="page" id="page-known">
     <div class="card">
@@ -468,7 +485,7 @@ async function loadRecords() {
       <td style="white-space:nowrap">${esc(r.area || "—")}</td>
       <td class="steps">${esc(r.step1 || "")}<br>${esc(r.step2 || "")}<br>${esc(r.step3 || "")}<br>${esc(r.step4 || "")}</td>
       <td><span class="${badge}">${esc(r.conclusion)}</span>${r.reviewed ? `<div class="steps">已复核</div>` : ""}${r.notes ? `<div class="steps">${esc(r.notes)}</div>` : ""}</td>
-      <td>${shots}</td>
+      <td>${shots}${r.conclusion === "待人工" ? `<button class="btn sm" style="margin-top:5px" onclick="openReview(${r.id})">人工复核</button>` : ""}</td>
       <td style="white-space:nowrap">
         <button class="btn sm gray" onclick="exportOne(${r.id})">导出</button>
         <button class="btn sm gray" style="margin-top:4px" onclick="openRecModal(${r.id})">编辑</button>
@@ -506,6 +523,51 @@ async function loadOneRecord(id) {
   return recs.find(r => r.id === id);
 }
 window.openRecModal = async id => openRecModal(id, await loadOneRecord(id));
+
+/* ---------- 待人工视觉复核 ---------- */
+let reviewingRecord = null;
+function reviewLabel(path) {
+  const p = String(path).toLowerCase();
+  if (p.includes("maps") || p.includes("streetview")) return "Google 街景外部视角";
+  if (p.includes("photo")) return "房源照片（可能为室内/侧面/局部）";
+  if (p.includes("smarty")) return "Smarty 地址验证";
+  if (p.includes("opencorp")) return "OpenCorporates 查重";
+  return "核查截图";
+}
+window.openReview = async id => {
+  const r = await loadOneRecord(id);
+  if (!r) return alert("记录不存在");
+  reviewingRecord = r;
+  $("#reviewTitle").textContent = `人工复核 #${r.id}：${r.address || ""}`;
+  $("#reviewSummary").innerHTML = `来源：${esc(r.source || "—")}　价格：${esc(r.price || "—")}　面积：${esc(r.area || "—")}<br>`
+    + `步骤3：${esc(r.step3 || "")}<br>备注：${esc(r.notes || "—")}`;
+  const pics = (r.screenshots || []).filter(Boolean);
+  $("#reviewShots").innerHTML = pics.length ? pics.map(p =>
+    `<div><div class="steps" style="margin-bottom:4px">${esc(reviewLabel(p))}</div>`
+    + `<img src="${shotUrl(p)}" data-full="${shotUrl(p)}" style="width:100%; max-height:360px; object-fit:contain; background:#111; border-radius:6px"></div>`
+  ).join("") : `<div class="empty">没有可展示的截图</div>`;
+  $("#reviewModal").style.display = "flex";
+};
+$("#reviewClose").onclick = () => { $("#reviewModal").style.display = "none"; reviewingRecord = null; };
+$("#reviewModal").addEventListener("click", e => { if (e.target.id === "reviewModal") $("#reviewClose").click(); });
+async function decideReview(conclusion) {
+  if (!reviewingRecord) return;
+  const label = conclusion === "通过" ? "通过" : conclusion === "不通过" ? "不通过" : "待人工";
+  if (label !== "待人工" && !confirm(`确认将该地址标记为“${label}”？`)) return;
+  const old = reviewingRecord.notes || "";
+  const note = label === "通过" ? "人工复核通过：综合建筑轮廓/设计语言/物理框架判断"
+             : label === "不通过" ? "人工复核不通过：确认不是同一建筑"
+             : old;
+  const resp = await fetch(`/api/records/${reviewingRecord.id}`, {method: "PUT",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({conclusion: label, reviewed: label === "待人工" ? 0 : 1, notes: note})});
+  if (!resp.ok) return alert((await resp.json()).detail || "保存复核结果失败");
+  $("#reviewClose").click();
+  loadRecords();
+}
+$("#reviewPass").onclick = () => decideReview("通过");
+$("#reviewReject").onclick = () => decideReview("不通过");
+$("#reviewKeep").onclick = () => decideReview("待人工");
 
 $("#recSave").onclick = async () => {
   const addr = $("#mAddress").value.trim();
