@@ -3,6 +3,7 @@ import queue
 import random
 import re
 import threading
+import time
 import traceback
 from datetime import datetime
 
@@ -80,10 +81,36 @@ class TaskRunner:
         self.done = False
         self.stopped = False
         self.current_record = 0      # 正在核查的记录 id（中止时用它兜底改判）
+        self.current_step = ""       # 正在执行的步骤名（终止进度提示用）
+        self._stop_at = 0.0
 
     def stop(self) -> None:
-        """协作式终止：当前操作完成后立即停止，不再处理后续候选。"""
+        """协作式终止：当前操作完成后立即停止，不再处理后续候选。
+
+        终止不是瞬时的（当前步骤要安全收尾），期间每 3 秒推送一次进度，
+        让用户清楚看到"终止中"而不是以为页面卡死。"""
+        if self.stopped:
+            return
         self.stopped = True
+        self._stop_at = time.time()
+        step = self.current_step or "收尾"
+        self.events.put({"time": datetime.now().strftime("%H:%M:%S"), "level": "warn",
+                         "message": f"⏹ 已收到终止指令，当前步骤【{step}】正在安全收尾..."})
+
+        def _watch():
+            for _ in range(40):            # 最多播报 ~2 分钟，防止异常悬挂时刷屏
+                if self.done:
+                    return
+                time.sleep(3)
+                if self.done:
+                    return
+                wait = int(time.time() - self._stop_at)
+                cur = self.current_step or "收尾"
+                self.events.put({"time": datetime.now().strftime("%H:%M:%S"), "level": "warn",
+                                 "message": f"⏹ 终止中（已等待 {wait}s）：当前在【{cur}】，"
+                                            f"完成后立即停止，不再处理后续候选..."})
+
+        threading.Thread(target=_watch, daemon=True).start()
 
     def emit(self, msg: str, level: str = "info") -> None:
         self.events.put(
@@ -220,6 +247,7 @@ class TaskRunner:
                         continue
                     used.add(page_no)
                     visits += 1
+                    self.current_step = f"步骤1 {src_label} 采集第{page_no}页"
                     self.emit(f"步骤1：{src_label} 采集候选（第 {page_no}/{total_pages or '?'} 页，"
                               f"已访问 {visits} 页）...")
                     r1 = feed.search_candidates(city, state, price_min, price_max,
@@ -447,6 +475,7 @@ class TaskRunner:
             if self.stopped:
                 break
             if cand.get("listing_url") and need_detail:
+                self.current_step = "补抓详情页"
                 self.emit("补抓详情页（价格/经纪人/面积/套间表）...")
                 info = feed.fetch_broker_info(cand.get("listing_url", ""))
                 if info.get("blocked"):
@@ -651,6 +680,7 @@ class TaskRunner:
                     photos = streetview.download_photo_urls(
                         photo_urls, tag=f"r{record_id}", referer=cand["listing_url"])
                 if not photos:
+                    self.current_step = "下载房源照片 + AI 预筛"
                     self.emit("下载房源照片并做办公适用性 AI 预筛...")
                     photos = streetview.grab_listing_photos(cand["listing_url"], tag=f"r{record_id}")
                 if photos:
@@ -676,6 +706,7 @@ class TaskRunner:
             # 步骤2 Smarty
             if self.stopped:
                 break
+            self.current_step = "步骤2 Smarty 验证"
             self.emit("步骤2：Smarty 验证地址有效性...")
             r2 = smarty.verify_address(addr, tag=f"r{record_id}")
             shots.append(r2.get("screenshot", ""))
@@ -797,6 +828,7 @@ class TaskRunner:
             # 实测单条：街景 ~26s、查重 ~18s，串行 45s → 并行 ~27s。
             if self.stopped:
                 break
+            self.current_step = "步骤3/4 街景AI对比 + 查重（并行）"
             self.emit("步骤3/4 并行：Google Maps 街景+AI 与 OpenCorporates 查重同时进行...")
             # 街景丢给常驻辅助线程（独立 Chrome/配置目录），本线程同时跑查重
             job = browser.submit(lambda: streetview.check_street_view(

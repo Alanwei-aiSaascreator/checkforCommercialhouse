@@ -354,7 +354,13 @@ $("#startBtn").onclick = async () => {
   $("#log").style.display = "block"; $("#log").textContent = ""; $("#shots").style.display = "flex"; $("#shots").innerHTML = "";
   listen(task_id);
 };
-$("#stopBtn").onclick = () => { if (es && es._taskId) fetch(`/api/tasks/${es._taskId}/stop`, {method: "POST"}); };
+$("#stopBtn").onclick = () => {
+  if (!es || !es._taskId) return;
+  $("#stopBtn").disabled = true;
+  $("#stopBtn").textContent = "终止中…（当前步骤安全收尾）";
+  appendLog("已发送终止指令，等待当前步骤收尾（进度见下方日志）...", "warn");
+  fetch(`/api/tasks/${es._taskId}/stop`, {method: "POST"});
+};
 
 function listen(taskId) {
   es = new EventSource(`/api/tasks/${taskId}/events`);
@@ -375,10 +381,12 @@ function listen(taskId) {
   es.addEventListener("done", () => {
     es.close(); running = false;
     $("#startBtn").disabled = false; $("#stopBtn").style.display = "none";
+    $("#stopBtn").disabled = false; $("#stopBtn").textContent = "终止任务";
     appendLog("—— 任务结束 ——", "pass");
   });
   es.onerror = () => { es.close(); running = false;
-    $("#startBtn").disabled = false; $("#stopBtn").style.display = "none"; };
+    $("#startBtn").disabled = false; $("#stopBtn").style.display = "none";
+    $("#stopBtn").disabled = false; $("#stopBtn").textContent = "终止任务"; };
 }
 function appendLog(msg, level) {
   const div = document.createElement("div");
