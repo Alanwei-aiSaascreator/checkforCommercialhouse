@@ -508,9 +508,9 @@ def _item_spaces(item: dict) -> list:
             monthly = None        # 接口偶尔给 0（占位）→ 当无价，别当"$0/月"算合规
         suspected = None
         if monthly is None:
-            if per_mo is not None and per_mo <= _RATE_MAX_MO:
+            if per_mo is not None and 0 < per_mo <= _RATE_MAX_MO:
                 monthly = round(per_mo * size, 2)
-            elif per_yr is not None and per_yr <= _RATE_MAX_YR:
+            elif per_yr is not None and 0 < per_yr <= _RATE_MAX_YR:
                 monthly = round(per_yr * size / 12, 2)
             elif per_mo is not None:
                 suspected = per_mo

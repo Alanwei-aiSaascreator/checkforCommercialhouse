@@ -585,20 +585,19 @@ class TaskRunner:
                                        if str(s.get("size") or "").isdigit())
                         if suspect:
                             note = (f"套间单价异常（{suspect[0]['rate']}，疑似总价 "
-                                    f"${suspect[0]['suspected_total']:,.0f}/月，无法确信在预算内）")
-                            store.update_record(record_id, conclusion="不通过", notes=note)
-                            self.emit(f"  {note} → 淘汰", "warn")
-                            continue
-                        if not any(s.get("rate") for s in spaces) and sizes:
-                            # 全部套间都不报价 = 数据源不给价，无法判定预算 → 直接淘汰，
-                            # 不再花时间扒经纪人电话（用户要求：面议房源不用跟进）
-                            note = (f"全部 {len(spaces)} 个套间均未报价"
-                                    f"（{sizes[0]:,}–{sizes[-1]:,} SF），无法判定预算，直接淘汰")
-                            store.update_record(record_id, conclusion="不通过", notes=note)
+                                    f"${suspect[0]['suspected_total']:,.0f}/月，无法自动确认，转人工复核）")
+                            store.update_record(record_id, conclusion="待人工", notes=note)
                             self.emit(f"  {note}", "warn")
                             continue
-                        note = "套间价格无法换算成月租，无法判定预算，直接淘汰"
-                        store.update_record(record_id, conclusion="不通过", notes=note)
+                        if not any(s.get("rate") for s in spaces) and sizes:
+                            # 没有报价只能说明证据不足，不能证明超预算；转人工避免误杀。
+                            note = (f"全部 {len(spaces)} 个套间均未报价"
+                                    f"（{sizes[0]:,}–{sizes[-1]:,} SF），无法判定预算，转人工复核")
+                            store.update_record(record_id, conclusion="待人工", notes=note)
+                            self.emit(f"  {note}", "warn")
+                            continue
+                        note = "套间价格无法换算成月租，无法判定预算，转人工复核"
+                        store.update_record(record_id, conclusion="待人工", notes=note)
                         self.emit(f"  {note}", "warn")
                         continue
                     cheapest = min(priced, key=lambda s: s["monthly"])
@@ -786,11 +785,10 @@ class TaskRunner:
                                             screenshots=shots)
                         self.emit(f"  {note}", "warn")
                         continue
-                    # 地址本身有效、只是缺房间号且挖不到 → 无法给出可邮寄的完整地址，
-                    # 按淘汰处理；不写失败档案（下次挖号通道恢复后还能再试）
+                    # 地址本身可能有效，只是缺房间号且当前通道没挖到；转人工，避免误杀。
                     note = (f"缺房间号且 Smarty 未挖到可验证套间"
-                            f"（{r2['message'][:70]}），无法验证完整地址，直接淘汰")
-                    store.update_record(record_id, conclusion="不通过",
+                            f"（{r2['message'][:70]}），无法完成自动验证，转人工复核")
+                    store.update_record(record_id, conclusion="待人工",
                                         notes=note, screenshots=shots)
                     self.emit(f"  {note}", "warn")
                     continue
@@ -806,15 +804,15 @@ class TaskRunner:
                 # 结论按淘汰走，但不写失败档案（否则好地址被永久拉黑，重跑也救不回来）
                 _transient = ("429", "限流", "请求失败", "请求异常", "timeout", "超时")
                 if any(k in r2["message"] for k in _transient):
-                    note = f"Smarty 限流/网络未验证完（{r2['message'][:60]}），按淘汰处理"
-                    store.update_record(record_id, conclusion="不通过", notes=note,
+                    note = f"Smarty 限流/网络未验证完（{r2['message'][:60]}），转人工复核"
+                    store.update_record(record_id, conclusion="待人工", notes=note,
                                         screenshots=shots)
                     self.emit(f"  {note}", "warn")
                     continue
-                note = f"Smarty 结果不明确，全自动模式保守淘汰：{r2['message'][:80]}"
-                store.update_record(record_id, conclusion="不通过", notes=note)
-                store.add_failed_address(addr, "Smarty", note, building=True)
-                self.emit("Smarty 结果不明确 → 全自动模式按保守原则淘汰", "warn")
+                note = f"Smarty 结果不明确，无法自动确认：{r2['message'][:80]}，转人工复核"
+                store.update_record(record_id, conclusion="待人工", notes=note,
+                                    screenshots=shots)
+                self.emit("Smarty 结果不明确 → 转人工复核，不写入失败档案", "warn")
                 continue
 
             # SOP：步骤3/4 使用 Smarty 双绿后的标准化地址
@@ -860,12 +858,17 @@ class TaskRunner:
             self.emit(f"步骤3结果：{r3['message']}", "pass" if r3["status"] == "pass" else ("error" if r3["status"] == "fail" else "warn"))
             store.update_record(record_id, step3=f"{r3['status']}：{r3['message']}", screenshots=[s for s in shots if s])
             if r3["status"] != "pass":
-                reason = "AI 判定外观不符" if r3["status"] == "fail" else "街景对比无法完成"
-                store.update_record(record_id, conclusion="不通过", notes=reason)
-                # 黑屏/未渲染属于临时失败，不拉黑地址，避免下次重跑永久跳过。
-                if "全黑" not in r3.get("message", "") and "未完成渲染" not in r3.get("message", ""):
+                if r3["status"] == "fail":
+                    reason = "AI 判定外观不符"
+                    store.update_record(record_id, conclusion="不通过", notes=reason)
+                    # 只有明确建筑矛盾才写入失败档案；临时渲染/证据不足不拉黑。
                     store.add_failed_address(addr, "街景", reason, building=False)
-                self.emit("该地址淘汰，处理下一个候选", "warn")
+                    self.emit("步骤3明确外观不符，处理下一个候选", "warn")
+                    continue
+                # suspect = 有效街景证据不足，不再直接淘汰，保留待人工，避免遮挡/角度差误杀。
+                reason = "街景证据不足，待人工复核（未发现明确建筑矛盾）"
+                store.update_record(record_id, conclusion="待人工", notes=reason)
+                self.emit("步骤3证据不足，转待人工，不淘汰该地址", "warn")
                 continue
 
             # 步骤4 OpenCorporates（结果已在上面与步骤3 并行取得，这里只报状态）
