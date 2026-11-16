@@ -235,6 +235,15 @@
         <input id="knownSearch" placeholder="搜索地址..." style="flex:1; padding:7px 10px; border:1px solid #d1d5db; border-radius:6px; font-size:13px;">
         <button class="btn sm" id="exportKnownBtn">导出 Excel</button>
       </div>
+      <div style="display:flex; gap:8px; margin-bottom:10px; align-items:center; flex-wrap:wrap;">
+        <label style="font-size:13px; display:flex; align-items:center; gap:4px;">
+          <input type="checkbox" id="kSelectAll"> 全选
+        </label>
+        <button class="btn sm" id="kEditToggle">批量编辑</button>
+        <button class="btn sm" id="kSaveEdit" style="display:none">保存修改</button>
+        <button class="btn sm" id="kCancelEdit" style="display:none">取消</button>
+        <button class="btn sm red" id="kDelSel">删除所选</button>
+      </div>
       <div class="field">
         <label>批量导入（一行一个地址）</label>
         <textarea id="knownText" rows="4" placeholder="925 B St, Ste 201, San Diego, CA 92101"></textarea>
@@ -513,6 +522,7 @@ window.deleteRecord = async (id, addr) => {
 
 /* ---------- 收录地址表 ---------- */
 let KNOWN = [];
+let knownEdit = false;
 async function loadKnown() {
   KNOWN = await (await fetch("/api/known")).json();
   renderKnown();
@@ -523,15 +533,65 @@ function renderKnown() {
   $("#knownList").innerHTML = items.length
     ? items.map(k => `
       <div class="known-item">
-        <span class="kaddr" data-id="${k.id}" title="点击修改该地址" style="cursor:pointer">${esc(k.raw)}</span>
+        <label style="display:flex; align-items:center; gap:8px; flex:1; min-width:0;">
+          <input type="checkbox" class="ksel" data-id="${k.id}">
+          ${knownEdit
+            ? `<input class="kinput" data-id="${k.id}" value="${esc(k.raw)}" style="flex:1; padding:5px 8px; border:1px solid #d1d5db; border-radius:4px; font-size:13px;">`
+            : `<span class="kaddr" data-id="${k.id}" title="点击修改该地址" style="cursor:pointer">${esc(k.raw)}</span>`}
+        </label>
         <span class="muted" style="white-space:nowrap">
           #${k.id}
+          ${knownEdit ? "" : `
           <button class="kedit" data-act="edit" data-id="${k.id}">改</button>
-          <button class="kdel" data-act="del" data-id="${k.id}">删</button>
+          <button class="kdel" data-act="del" data-id="${k.id}">删</button>`}
         </span>
       </div>`).join("")
     : `<div class="empty">${KNOWN.length ? "无匹配地址" : "收录表为空"}</div>`;
+  $("#kEditToggle").textContent = knownEdit ? "退出编辑" : "批量编辑";
+  $("#kSaveEdit").style.display = knownEdit ? "" : "none";
+  $("#kCancelEdit").style.display = knownEdit ? "" : "none";
 }
+const selIds = () => [...document.querySelectorAll(".ksel:checked")].map(x => x.dataset.id);
+$("#kSelectAll").onchange = e => {
+  document.querySelectorAll(".known-item").forEach(row => {
+    const cb = row.querySelector(".ksel");
+    if (cb) cb.checked = e.target.checked;
+  });
+};
+$("#kDelSel").onclick = async () => {
+  const ids = selIds();
+  if (!ids.length) return alert("先勾选要删除的地址");
+  if (!confirm(`确定删除所选 ${ids.length} 条地址？\n删除后这些地址以后可能重新出现在候选中。`)) return;
+  const r = await fetch("/api/known/batch_delete", {method: "POST", headers: {"Content-Type": "application/json"},
+                                                   body: JSON.stringify({ids})});
+  if (!r.ok) return alert((await r.json()).detail || "删除失败");
+  const d = await r.json();
+  alert(`已删除 ${d.deleted} 条`);
+  $("#kSelectAll").checked = false;
+  loadKnown();
+};
+$("#kEditToggle").onclick = () => { knownEdit = !knownEdit; renderKnown(); };
+$("#kCancelEdit").onclick = () => { knownEdit = false; renderKnown(); };
+$("#kSaveEdit").onclick = async () => {
+  const items = [...document.querySelectorAll(".kinput")].map(inp => ({
+    id: inp.dataset.id,
+    address: inp.value.trim(),
+  })).filter((it, i) => {
+    const orig = KNOWN.find(k => k.id == it.id);
+    return orig && orig.raw !== it.address;   // 只提交有改动的行
+  });
+  if (!items.length) return alert("没有修改任何地址");
+  const r = await fetch("/api/known/batch_update", {method: "POST", headers: {"Content-Type": "application/json"},
+                                                   body: JSON.stringify({items})});
+  if (!r.ok) return alert((await r.json()).detail || "保存失败");
+  const d = await r.json();
+  let msg = `已更新 ${d.ok} 条`;
+  if (d.duplicate) msg += `，${d.duplicate} 条与其他地址重复被跳过`;
+  if (d.empty) msg += `，${d.empty} 条空地址被跳过`;
+  alert(msg);
+  knownEdit = false;
+  loadKnown();
+};
 $("#knownSearch").oninput = renderKnown;
 $("#knownList").addEventListener("click", async e => {
   const btn = e.target.closest("[data-act]");

@@ -459,6 +459,66 @@ def remove_known_by_id(kid: int) -> bool:
             con.close()
 
 
+def remove_known_ids(ids) -> int:
+    """按 ID 批量移除。返回实际删除条数。"""
+    ids = [int(i) for i in (ids or []) if str(i).strip().lstrip("-").isdigit()]
+    if not ids:
+        return 0
+    with _lock:
+        con = _con()
+        try:
+            cur = con.execute(
+                "DELETE FROM known_addresses WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)
+            con.commit()
+            return cur.rowcount
+        finally:
+            con.close()
+
+
+def update_known_batch(items) -> dict:
+    """按 ID 批量修改地址。
+
+    items: [{"id": 1, "address": "新地址"}, ...]
+    先查重再更新（不依赖 IntegrityError，避免整批回滚），
+    返回 {"ok": 成功数, "duplicate": 与其他条目重复数, "notfound": ID 不存在数, "empty": 空地址数}。"""
+    ok = dup = notfound = empty = 0
+    rows = []
+    for it in (items or []):
+        try:
+            kid = int(it.get("id"))
+        except (TypeError, ValueError):
+            notfound += 1
+            continue
+        addr = (it.get("address") or "").strip()
+        if not addr:
+            empty += 1
+            continue
+        rows.append((kid, normalize(addr), addr))
+    if not rows:
+        return {"ok": 0, "duplicate": 0, "notfound": 0, "empty": empty}
+    with _lock:
+        con = _con()
+        try:
+            for kid, norm, addr in rows:
+                clash = con.execute(
+                    "SELECT 1 FROM known_addresses WHERE address_norm=? AND id<>?",
+                    (norm, kid)).fetchone()
+                if clash:
+                    dup += 1
+                    continue
+                cur = con.execute(
+                    "UPDATE known_addresses SET address_norm=?, raw=? WHERE id=?",
+                    (norm, addr, kid))
+                if cur.rowcount:
+                    ok += 1
+                else:
+                    notfound += 1
+            con.commit()
+        finally:
+            con.close()
+    return {"ok": ok, "duplicate": dup, "notfound": notfound, "empty": empty}
+
+
 def update_known_address(kid: int, new_address: str) -> str:
     """按 ID 修改收录地址（同步重算归一化键）。
 

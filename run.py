@@ -192,6 +192,29 @@ def api_known_delete(kid: int):
     return {"ok": True}
 
 
+@app.post("/api/known/batch_delete")
+def api_known_batch_delete(body: dict):
+    deleted = store.remove_known_ids(body.get("ids") or [])
+    if not deleted:
+        raise HTTPException(400, "没有可删除的条目")
+    return {"ok": True, "deleted": deleted}
+
+
+@app.post("/api/known/batch_update")
+def api_known_batch_update(body: dict):
+    r = store.update_known_batch(body.get("items") or [])
+    if r["ok"] == 0 and (r["duplicate"] or r["empty"] or r["notfound"]):
+        detail = []
+        if r["duplicate"]:
+            detail.append(f"{r['duplicate']} 条与其他地址重复")
+        if r["empty"]:
+            detail.append(f"{r['empty']} 条地址为空")
+        if r["notfound"]:
+            detail.append(f"{r['notfound']} 条 ID 不存在")
+        raise HTTPException(400, "；".join(detail))
+    return {"ok": True, **r}
+
+
 @app.get("/api/known/export")
 def api_known_export():
     """导出收录地址表 Excel（编号 + 地址两列，按 ID 倒序与页面一致）。"""
