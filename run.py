@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -213,6 +213,46 @@ def api_known_batch_update(body: dict):
             detail.append(f"{r['notfound']} 条 ID 不存在")
         raise HTTPException(400, "；".join(detail))
     return {"ok": True, **r}
+
+
+@app.post("/api/known/import_excel")
+async def api_known_import_excel(file: UploadFile = File(...)):
+    """导入 Excel 收录地址（.xlsx）。
+
+    解析规则：逐行逐格扫描，凡是像地址的文本（含逗号或数字开头，长度 ≥8）
+    都收进来；表头/备注等非地址文本会被过滤。与流水线同一套归一化去重。"""
+    import io
+    import re as _re
+    import openpyxl
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "文件为空")
+    if len(data) > 4 and data[:4] != b"PK\x03\x04":
+        raise HTTPException(400, "只支持 .xlsx 格式（旧版 .xls 请先另存为 .xlsx）")
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception as e:
+        raise HTTPException(400, f"Excel 读取失败: {type(e).__name__}")
+    addrs = []
+    try:
+        for row in wb.active.iter_rows(values_only=True):
+            for cell in row:
+                if not isinstance(cell, str):
+                    continue
+                s = cell.strip()
+                if len(s) < 8:
+                    continue
+                if _re.match(r"^\d", s) and ("," in s or " " in s):
+                    addrs.append(s)
+                elif _re.match(r"^[A-Z0-9]", s) and s.count(",") >= 2:
+                    addrs.append(s)   # "Ste 302A, 1150 N State St, Chicago, IL" 类倒装
+    finally:
+        wb.close()
+    if not addrs:
+        raise HTTPException(400, "Excel 里没有解析到地址（需要一行一个地址的文本列）")
+    added = store.import_known_addresses(addrs, source="excel")
+    return {"ok": True, "total": len(addrs), "added": added}
 
 
 @app.get("/api/known/export")

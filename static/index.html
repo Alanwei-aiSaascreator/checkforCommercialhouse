@@ -245,10 +245,14 @@
         <button class="btn sm red" id="kDelSel">删除所选</button>
       </div>
       <div class="field">
-        <label>批量导入（一行一个地址）</label>
+        <label>批量导入（一行一个地址，或直接导入 Excel）</label>
         <textarea id="knownText" rows="4" placeholder="925 B St, Ste 201, San Diego, CA 92101"></textarea>
       </div>
-      <div style="margin-top:10px"><button class="btn sm" id="importBtn">导入</button></div>
+      <div style="margin-top:10px; display:flex; gap:8px;">
+        <button class="btn sm" id="importBtn">导入文本</button>
+        <button class="btn sm" id="importExcelBtn">导入 Excel</button>
+        <input type="file" id="knownExcel" accept=".xlsx" style="display:none">
+      </div>
       <div class="known-list" id="knownList"><div class="empty">加载中...</div></div>
     </div>
   </div>
@@ -624,6 +628,19 @@ $("#importBtn").onclick = async () => {
   const res = await r.json();
   alert(res.ok ? `导入成功，新增 ${res.added} 条` : (res.detail || "导入失败"));
   $("#knownText").value = "";
+  loadKnown();
+};
+$("#importExcelBtn").onclick = () => $("#knownExcel").click();
+$("#knownExcel").onchange = async () => {
+  const f = $("#knownExcel").files[0];
+  if (!f) return;
+  const fd = new FormData();
+  fd.append("file", f);
+  const r = await fetch("/api/known/import_excel", {method: "POST", body: fd});
+  const res = await r.json();
+  alert(res.ok ? `导入成功：解析 ${res.total} 个地址，新增 ${res.added} 条（重复自动跳过）`
+               : (typeof res.detail === "string" ? res.detail : (res.detail && res.detail[0] && res.detail[0].msg) || "导入失败"));
+  $("#knownExcel").value = "";
   loadKnown();
 };
 

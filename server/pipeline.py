@@ -444,6 +444,8 @@ class TaskRunner:
             info: dict = {}
 
             # SOP：价格/中介姓名/联系方式/面积都是硬性字段——搜索卡片缺哪个就去详情页补抓
+            if self.stopped:
+                break
             if cand.get("listing_url") and need_detail:
                 self.emit("补抓详情页（价格/经纪人/面积/套间表）...")
                 info = feed.fetch_broker_info(cand.get("listing_url", ""))
@@ -571,8 +573,19 @@ class TaskRunner:
             else:
                 pstate, pmonthly = _price_state(cand)
                 if pstate == "over":
+                    if info.get("blocked"):
+                        # 详情页被反爬拦截 → 套间表可能根本没读到，整栋折算大概率误杀
+                        #（整层 $30/SF × 1,440 SF 超预算，但里面的小套间常常在预算内）。
+                        # 这种情况不判死，转待人工复核。
+                        note = (f"详情页被反爬拦截，按整栋折算 ≈ ${pmonthly:,.0f}/月超预算，"
+                                f"但套间表未读到，可能存在预算内小套间 → 待人工复核")
+                        store.update_record(record_id, conclusion="待人工", notes=note)
+                        self.emit(f"  {note}", "warn")
+                        continue
+                    src_note = ("详情页已核实无套间明细" if need_detail and cand.get("listing_url")
+                                else "未开详情页（卡片即整租价）")
                     note = (f"价格超区间：{cand.get('price') or '未知'} ≈ ${pmonthly:,.0f}/月，"
-                            f"要求 ${price_min}-${price_max}/月（该房源无套间明细，按整栋算）")
+                            f"要求 ${price_min}-${price_max}/月（{src_note}，按整栋/整层算）")
                     store.update_record(record_id, conclusion="不通过", notes=note)
                     self.emit(f"  {note} → 淘汰该房源", "warn")
                     continue
@@ -588,7 +601,14 @@ class TaskRunner:
                         store.update_record(record_id, conclusion="不通过", notes=note)
                         self.emit(f"  {note}", "warn")
                         continue
-                    # 有价格但缺面积/口径算不出月租 → 同样视为无法判定，直接淘汰
+                    # 有价格但缺面积/口径算不出月租 → 同样视为无法判定，直接淘汰；
+                    # 但详情页被拦截导致字段缺失的不判死（可能详情页有套间表），转待人工
+                    if info.get("blocked"):
+                        note = (f"详情页被反爬拦截，价格字段缺失（卡片价 {cand.get('price') or '无'}），"
+                                f"无法判定预算，转待人工复核")
+                        store.update_record(record_id, conclusion="待人工", notes=note)
+                        self.emit(f"  {note}", "warn")
+                        continue
                     note = (f"价格无法换算成月租：{cand.get('price') or '未抓到价格'}"
                             f"，面积 {cand.get('area') or '未知'} SF，"
                             f"无法判定是否 ≤${price_max}/月，直接淘汰")
@@ -764,11 +784,18 @@ class TaskRunner:
             except Exception as e:
                 r4 = {"status": "suspect", "screenshot": "",
                       "message": f"查重步骤异常: {type(e).__name__}: {e}"}
+            # 终止后只等 20s：不拖着任务等街景跑完（正常跑完最多 420s）
             try:
-                r3 = job.result(timeout=420)
+                r3 = job.result(timeout=20 if self.stopped else 420)
             except Exception as e:
-                r3 = {"status": "suspect", "screenshot": "", "extra_shots": [],
-                      "message": f"街景步骤异常: {type(e).__name__}: {e}"}
+                if self.stopped:
+                    r3 = {"status": "suspect", "screenshot": "", "extra_shots": [],
+                          "message": "任务已终止，街景对比未完成"}
+                    store.update_record(record_id, conclusion="待人工",
+                                        notes="任务手动终止，该地址未完成核查，可重跑或人工复核")
+                else:
+                    r3 = {"status": "suspect", "screenshot": "", "extra_shots": [],
+                          "message": f"街景步骤异常: {type(e).__name__}: {e}"}
             if not isinstance(r3, dict) or "status" not in r3:
                 r3 = {"status": "suspect", "screenshot": "", "extra_shots": [],
                       "message": "街景步骤无有效返回"}
