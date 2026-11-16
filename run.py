@@ -173,6 +173,50 @@ def api_known_import(body: dict):
     return {"ok": True, "added": added}
 
 
+@app.put("/api/known/{kid}")
+def api_known_update(kid: int, body: dict):
+    status = store.update_known_address(kid, body.get("address") or "")
+    if status == "empty":
+        raise HTTPException(400, "地址必填")
+    if status == "duplicate":
+        raise HTTPException(400, "该地址已存在于收录表（归一化后重复）")
+    if status == "notfound":
+        raise HTTPException(404, "收录地址不存在")
+    return {"ok": True}
+
+
+@app.delete("/api/known/{kid}")
+def api_known_delete(kid: int):
+    if not store.remove_known_by_id(kid):
+        raise HTTPException(404, "收录地址不存在")
+    return {"ok": True}
+
+
+@app.get("/api/known/export")
+def api_known_export():
+    """导出收录地址表 Excel（编号 + 地址两列，按 ID 倒序与页面一致）。"""
+    import io
+    import urllib.parse
+    import openpyxl
+
+    items = store.list_known()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "收录地址表"
+    ws.append(["编号", "地址"])
+    for k in items:
+        ws.append([k["id"], k["raw"]])
+    ws.column_dimensions["A"].width = 8
+    ws.column_dimensions["B"].width = 60
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = urllib.parse.quote("收录地址表.xlsx")
+    return StreamingResponse(
+        buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"})
+
+
 # ---------- 任务 ----------
 
 @app.post("/api/tasks")

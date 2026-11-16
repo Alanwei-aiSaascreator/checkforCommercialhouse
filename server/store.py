@@ -447,6 +447,41 @@ def remove_known_address(address: str) -> bool:
             con.close()
 
 
+def remove_known_by_id(kid: int) -> bool:
+    """按 ID 从收录表移除单条。"""
+    with _lock:
+        con = _con()
+        try:
+            cur = con.execute("DELETE FROM known_addresses WHERE id=?", (int(kid),))
+            con.commit()
+            return cur.rowcount > 0
+        finally:
+            con.close()
+
+
+def update_known_address(kid: int, new_address: str) -> str:
+    """按 ID 修改收录地址（同步重算归一化键）。
+
+    返回 "ok" / "notfound" / "duplicate" / "empty"。"""
+    new_address = (new_address or "").strip()
+    if not new_address:
+        return "empty"
+    with _lock:
+        con = _con()
+        try:
+            try:
+                cur = con.execute(
+                    "UPDATE known_addresses SET address_norm=?, raw=? WHERE id=?",
+                    (normalize(new_address), new_address, int(kid)))
+                con.commit()
+            except sqlite3.IntegrityError:
+                con.rollback()
+                return "duplicate"
+            return "ok" if cur.rowcount > 0 else "notfound"
+        finally:
+            con.close()
+
+
 def list_known() -> list[dict]:
     con = _con()
     try:

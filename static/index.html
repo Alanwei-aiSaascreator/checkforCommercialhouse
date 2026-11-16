@@ -85,8 +85,13 @@
 
   /* 已收录列表 */
   .known-list { margin-top: 14px; max-height: 380px; overflow-y: auto; }
-  .known-item { padding: 8px 12px; border-bottom: 1px solid #f3f4f6; font-size: 13px; display: flex; justify-content: space-between; }
+  .known-item { padding: 8px 12px; border-bottom: 1px solid #f3f4f6; font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }
   .known-item span.muted { color: #9ca3af; }
+  .kedit, .kdel { margin-left: 4px; padding: 1px 7px; font-size: 12px; border: 1px solid #d1d5db;
+                  border-radius: 4px; background: #fff; cursor: pointer; color: #374151; }
+  .kedit:hover { background: #eff6ff; border-color: #93c5fd; }
+  .kdel { color: #b91c1c; }
+  .kdel:hover { background: #fef2f2; border-color: #fca5a5; }
 
   /* 灯箱 */
   #lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 99;
@@ -226,6 +231,10 @@
   <div class="page" id="page-known">
     <div class="card">
       <h3 class="sec">收录地址表（已核查通过，用于后续查重）</h3>
+      <div style="display:flex; gap:8px; margin-bottom:12px; align-items:center;">
+        <input id="knownSearch" placeholder="搜索地址..." style="flex:1; padding:7px 10px; border:1px solid #d1d5db; border-radius:6px; font-size:13px;">
+        <button class="btn sm" id="exportKnownBtn">导出 Excel</button>
+      </div>
       <div class="field">
         <label>批量导入（一行一个地址）</label>
         <textarea id="knownText" rows="4" placeholder="925 B St, Ste 201, San Diego, CA 92101"></textarea>
@@ -503,12 +512,50 @@ window.deleteRecord = async (id, addr) => {
 };
 
 /* ---------- 收录地址表 ---------- */
+let KNOWN = [];
 async function loadKnown() {
-  const items = await (await fetch("/api/known")).json();
-  $("#knownList").innerHTML = items.length
-    ? items.map(k => `<div class="known-item"><span>${esc(k.raw)}</span><span class="muted">#${k.id}</span></div>`).join("")
-    : `<div class="empty">收录表为空</div>`;
+  KNOWN = await (await fetch("/api/known")).json();
+  renderKnown();
 }
+function renderKnown() {
+  const kw = $("#knownSearch").value.trim().toLowerCase();
+  const items = KNOWN.filter(k => !kw || String(k.raw).toLowerCase().includes(kw));
+  $("#knownList").innerHTML = items.length
+    ? items.map(k => `
+      <div class="known-item">
+        <span class="kaddr" data-id="${k.id}" title="点击修改该地址" style="cursor:pointer">${esc(k.raw)}</span>
+        <span class="muted" style="white-space:nowrap">
+          #${k.id}
+          <button class="kedit" data-act="edit" data-id="${k.id}">改</button>
+          <button class="kdel" data-act="del" data-id="${k.id}">删</button>
+        </span>
+      </div>`).join("")
+    : `<div class="empty">${KNOWN.length ? "无匹配地址" : "收录表为空"}</div>`;
+}
+$("#knownSearch").oninput = renderKnown;
+$("#knownList").addEventListener("click", async e => {
+  const btn = e.target.closest("[data-act]");
+  const id = btn ? btn.dataset.id : e.target.dataset.id;
+  if (!id) return;
+  if (btn && btn.dataset.act === "del") {
+    const item = KNOWN.find(k => k.id == id);
+    if (!confirm(`从收录表删除该地址？删除后此地址以后可能重新出现在候选中：\n${item ? item.raw : ""}`)) return;
+    const r = await fetch("/api/known/" + id, {method: "DELETE"});
+    if (!r.ok) return alert((await r.json()).detail || "删除失败");
+    loadKnown();
+    return;
+  }
+  // 编辑（点地址或"改"按钮）
+  const item = KNOWN.find(k => k.id == id);
+  if (!item) return;
+  const nu = prompt("修改地址（保存后按新地址参与查重）：", item.raw);
+  if (nu === null || !nu.trim() || nu.trim() === item.raw) return;
+  const r = await fetch("/api/known/" + id, {method: "PUT", headers: {"Content-Type": "application/json"},
+                                            body: JSON.stringify({address: nu.trim()})});
+  if (!r.ok) return alert((await r.json()).detail || "修改失败");
+  loadKnown();
+});
+$("#exportKnownBtn").onclick = () => { location.href = "/api/known/export"; };
 $("#importBtn").onclick = async () => {
   const text = $("#knownText").value.trim();
   if (!text) return;
