@@ -785,10 +785,11 @@ class TaskRunner:
                                             screenshots=shots)
                         self.emit(f"  {note}", "warn")
                         continue
-                    # 地址本身可能有效，只是缺房间号且当前通道没挖到；转人工，避免误杀。
-                    note = (f"缺房间号且 Smarty 未挖到可验证套间"
-                            f"（{r2['message'][:70]}），无法完成自动验证，转人工复核")
-                    store.update_record(record_id, conclusion="待人工",
+                    # Smarty 已明确该地址缺有效房间号（missing secondary / dpv_match=D）：
+                    # 结论明确，直接淘汰，不转人工（人工也无法补出房间号）
+                    note = (f"Smarty 确认该楼缺有效房间号（{r2['message'][:70]}），"
+                            f"无完整可邮寄地址，直接淘汰")
+                    store.update_record(record_id, conclusion="不通过",
                                         notes=note, screenshots=shots)
                     self.emit(f"  {note}", "warn")
                     continue
