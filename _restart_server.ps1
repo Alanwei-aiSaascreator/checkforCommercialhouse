@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
-$root = 'c:\Users\26562\CodeBuddy\20261111100641'
-$proj = Join-Path $root 'address-check'
+# 项目根目录 = 本脚本所在目录（跨设备通用，不再写死路径）
+$proj = $PSScriptRoot
+$root = $proj
 
 # 杀掉所有 run.py 服务进程（CIM 按 CommandLine 匹配——Get-Process 无 CommandLine 属性，
 # 旧脚本因此从未杀掉旧实例，导致新实例绑定端口失败、服务一直跑旧代码）

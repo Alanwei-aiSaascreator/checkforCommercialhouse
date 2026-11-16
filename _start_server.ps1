@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
-$root = 'c:\Users\26562\CodeBuddy\20261111100641'
-$proj = Join-Path $root 'address-check'
+# 项目根目录 = 本脚本所在目录（跨设备通用，不再写死路径）
+$proj = $PSScriptRoot
+$root = $proj
 $p = Start-Process -FilePath (Join-Path $proj '.venv\Scripts\python.exe') -ArgumentList 'run.py' `
     -WorkingDirectory $proj `
     -RedirectStandardOutput (Join-Path $root '_srv_out.log') `
