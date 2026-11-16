@@ -498,7 +498,30 @@ class TaskRunner:
                         + f"（共 {len(spaces)} 个）")
 
             # 价格判定：有套间 → 按「套间月租」判断（选最小且落在预算内的那间）；
-            # 没有套间 → 才按整栋/整层面积判断
+            # 没有套间 → 先跨源查 Crexi 套间价（自动兜底），实在没有才按整栋/整层算
+            if not spaces:
+                _ps0, _pm0 = _price_state(cand)
+                if _ps0 != "pass" or info.get("blocked"):
+                    # 整栋折算会拒 / 无法判定 / 详情页被拦 → 都值得查一次套间价：
+                    # LoopNet 的楼层大空间常可分租，Crexi 接口直接给套间月租（免开详情页）
+                    self.emit("  本地无套间数据，跨源查询 Crexi 套间月租（自动兜底）...")
+                    try:
+                        lk = crexi.lookup_suites_by_address(addr)
+                    except Exception as e:
+                        lk = {}
+                        self.emit(f"  跨源查询异常：{type(e).__name__}: {e}", "warn")
+                    if lk.get("spaces"):
+                        spaces = lk["spaces"]
+                        if lk.get("listing_url") and not cand.get("listing_url"):
+                            cand["listing_url"] = lk["listing_url"]
+                            store.update_record(record_id, listing_url=lk["listing_url"])
+                        if lk.get("address"):
+                            cand.setdefault("crexi_addr", lk["address"])
+                        self.emit(f"  ✓ Crexi 命中该楼盘 {len(spaces)} 个套间，"
+                                  f"按套间月租自动判定（无需人工）", "pass")
+                    else:
+                        self.emit("  Crexi 未命中同楼盘套间数据，按整栋/整层口径判定", "warn")
+
             fitted = [(s["monthly"], s) for s in spaces
                       if s.get("monthly") is not None
                       and price_min <= s["monthly"] <= price_max

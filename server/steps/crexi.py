@@ -590,16 +590,7 @@ def _candidate_from_item(item: dict) -> dict:
     }
 
 
-def _api_search(pg, city: str, state: str, page_no: int, size: int) -> dict:
-    payload = {
-        "excludeFilters": [], "excludeSort": [], "ids": [], "boundingBox": None,
-        "filters": {"address": {"mode": "Include",
-                                "structuredValues": [f"{city}, {state}"],
-                                "type": "Plain", "values": []}},
-        "from": (page_no - 1) * size, "searchTypes": ["Lease"], "size": size,
-        "sorting": {"searchAttributes.crexiSearchRank": "Descending",
-                    "listingAttributes.dateActivated": "Descending"},
-    }
+def _api_fetch(pg, payload: dict) -> dict:
     last: dict = {}
     for attempt in range(2):
         try:
@@ -615,6 +606,19 @@ def _api_search(pg, city: str, state: str, page_no: int, size: int) -> dict:
         except Exception:
             pass
     return last
+
+
+def _api_search(pg, city: str, state: str, page_no: int, size: int) -> dict:
+    payload = {
+        "excludeFilters": [], "excludeSort": [], "ids": [], "boundingBox": None,
+        "filters": {"address": {"mode": "Include",
+                                "structuredValues": [f"{city}, {state}"],
+                                "type": "Plain", "values": []}},
+        "from": (page_no - 1) * size, "searchTypes": ["Lease"], "size": size,
+        "sorting": {"searchAttributes.crexiSearchRank": "Descending",
+                    "listingAttributes.dateActivated": "Descending"},
+    }
+    return _api_fetch(pg, payload)
 
 
 def search_candidates(city: str, state: str, price_min: int, price_max: int,
@@ -777,3 +781,67 @@ def fetch_broker_info(listing_url: str) -> dict:
 def store_norm(addr: str) -> str:
     from .. import store
     return store.normalize(addr)
+
+
+def lookup_suites_by_address(address: str) -> dict:
+    """按楼栋地址在 Crexi 接口查同楼盘的套间级月租（跨数据源自动兜底）。
+
+    用途：LoopNet 详情页被反爬拦截 / 没解析到套间表时，按整栋面积折算月租
+    会误杀预算内的小套间（整层 1,440 SF 超预算 ≠ 里面的 Ste 302A 336 SF 超预算）。
+    Crexi 接口直接给 leaseDetails[].totalMonthly，不用开详情页就能拿到套间价。
+
+    地址匹配：先精确（归一化后相同，含楼栋级去 Suite）；没有则退而求其次
+    取「同门牌号」的唯一结果。返回 {"spaces": [...], "listing_url": ...}，
+    查不到返回 {}（pipeline 按原逻辑继续）。"""
+    import json as _json
+    q = (address or "").strip()
+    if not q:
+        return {}
+    try:
+        pg = _api_page()
+    except Exception:
+        return {}
+    parts = [p.strip() for p in q.split(",") if p.strip()]
+    query = ", ".join(parts[:2]) if len(parts) >= 2 else q   # 街址+城市，尾巴邮编反而降命中
+    payload = {
+        "excludeFilters": [], "excludeSort": [], "ids": [], "boundingBox": None,
+        "filters": {"address": {"mode": "Include",
+                                "structuredValues": [query],
+                                "type": "Plain", "values": []}},
+        "from": 0, "searchTypes": ["Lease"], "size": 20,
+        "sorting": {"searchAttributes.crexiSearchRank": "Descending",
+                    "listingAttributes.dateActivated": "Descending"},
+    }
+    try:
+        res = _api_fetch(pg, payload)
+        if res.get("status") != 200:
+            return {}
+        data = _json.loads(res.get("text") or "{}")
+    except Exception:
+        return {}
+    from .. import store as _store
+    target = _store.normalize(q)
+    if not target:
+        return {}
+    t_street = target.split()[0]
+    exact, same_street = None, None
+    for it in data.get("items") or []:
+        try:
+            cand = _candidate_from_item(it)
+        except Exception:
+            continue
+        if not cand.get("spaces"):
+            continue
+        na = _store.normalize(cand.get("address") or "")
+        if not na:
+            continue
+        if na == target:
+            exact = cand
+            break
+        if same_street is None and na.split()[0] == t_street:
+            same_street = cand     # 同门牌号兜底（同街号不同 Suite 常见）
+    best = exact or same_street
+    if not best:
+        return {}
+    return {"spaces": best["spaces"], "listing_url": best.get("listing_url", ""),
+            "address": best.get("address", "")}
