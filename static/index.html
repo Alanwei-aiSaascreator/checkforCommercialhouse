@@ -97,6 +97,9 @@
   #lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 99;
               align-items: center; justify-content: center; cursor: zoom-out; }
   #lightbox img { max-width: 92vw; max-height: 92vh; border-radius: 8px; }
+  .record-details summary { cursor: pointer; color: #2563eb; font-weight: 600; }
+  .record-details summary::marker { color: #64748b; }
+  .record-details div { margin: 6px 0 8px; white-space: pre-wrap; line-height: 1.45; max-width: 520px; }
 </style>
 </head>
 <body>
@@ -494,9 +497,11 @@ async function loadRecords() {
       <td style="white-space:nowrap">${esc(r.email || "—")}</td>
       <td style="white-space:nowrap">${esc(r.price || "—")}</td>
       <td style="white-space:nowrap">${esc(r.area || "—")}</td>
-      <td class="steps">${esc(r.step1 || "")}<br>${esc(r.step2 || "")}<br>${esc(r.step3 || "")}<br>${esc(r.step4 || "")}</td>
-      <td><span class="${badge}">${esc(r.conclusion)}</span>${r.reviewed ? `<div class="steps">已复核</div>` : ""}${r.notes ? `<div class="steps">${esc(r.notes)}</div>` : ""}</td>
-      <td>${shots}${r.conclusion === "待人工" ? `<button class="btn sm" style="margin-top:5px" onclick="openReview(${r.id})">人工复核</button>` : ""}</td>
+      <td class="steps record-details">
+        ${[["步骤1",r.step1],["步骤2",r.step2],["步骤3",r.step3],["步骤4",r.step4]].filter(x => x[1]).map(x => `<details><summary>${x[0]}</summary><div>${esc(x[1])}</div></details>`).join("")}
+      </td>
+      <td><span class="${badge}">${esc(r.conclusion)}</span>${r.reviewed ? `<div class="steps">已复核</div>` : ""}${r.notes ? `<details class="record-details"><summary>查看备注</summary><div>${esc(r.notes)}</div></details>` : ""}</td>
+      <td>${shots}<button class="btn sm gray" style="margin-top:5px" onclick="openReview(${r.id})">查看对比图片</button>${r.conclusion === "待人工" ? `<button class="btn sm" style="margin-top:5px" onclick="openReview(${r.id})">人工复核</button>` : ""}</td>
       <td style="white-space:nowrap">
         <button class="btn sm gray" onclick="exportOne(${r.id})">导出</button>
         <button class="btn sm gray" style="margin-top:4px" onclick="openRecModal(${r.id})">编辑</button>

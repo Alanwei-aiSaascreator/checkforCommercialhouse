@@ -330,12 +330,12 @@ def _activate_panorama(page) -> None:
             const c = document.querySelector('#widget-scene-canvas');
             return c && c.width > 300 && c.height > 200;
         }""", timeout=15000)
-        page.wait_for_timeout(5000)
+        page.wait_for_timeout(2500)
     except Exception:
-        page.wait_for_timeout(5000)
+        page.wait_for_timeout(2500)
 
 
-def _capture_street_views(page, coords, tag: str, max_views: int = 3) -> list:
+def _capture_street_views(page, coords, tag: str, max_views: int = 2) -> list:
     """多朝向采集街景：cbp=12,<heading> 旋转全景（0/90/180/270°），
     保证至少有一张正对目标建筑，图像去重后最多保留 max_views 张。
 
@@ -347,7 +347,7 @@ def _capture_street_views(page, coords, tag: str, max_views: int = 3) -> list:
         url = (f"https://www.google.com/maps/@?layer=c&cbll={lat},{lon}"
                f"&cbp=12,{heading},0,0,0")
         try:
-            _goto_retry(page, url, timeout=45000, wait=8000)
+            _goto_retry(page, url, timeout=45000, wait=5000)
             _activate_panorama(page)
         except Exception:
             continue
@@ -356,7 +356,7 @@ def _capture_street_views(page, coords, tag: str, max_views: int = 3) -> list:
             continue
         if not _usable_street_image(s):
             # Google 全景画布可能尚未完成绘制，等待后重拍一次，黑屏不送给 AI。
-            page.wait_for_timeout(3500)
+            page.wait_for_timeout(2000)
             retry = shot(page, f"{tag}_maps_retry") or ""
             if retry and _usable_street_image(retry):
                 s = retry
