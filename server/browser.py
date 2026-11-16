@@ -39,8 +39,9 @@ def _minimize_chrome_window(pid):
         cls = ctypes.create_unicode_buffer(128)
         user32.GetClassNameW(hwnd, cls, 128)
         same_process = pid and found_pid.value == pid
-        is_chrome = cls.value == "Chrome_WidgetWin_1"
-        if user32.IsWindowVisible(hwnd) and (same_process or (not pid and is_chrome)):
+        # 只最小化本程序启动的 Chrome 进程；禁止"找不到 PID 就最小化所有
+        # Chrome 窗口"的兜底——那会把用户自己开着的浏览器一并压下去。
+        if pid and same_process and user32.IsWindowVisible(hwnd):
             hwnds.append(hwnd)
         return True
 
