@@ -581,16 +581,48 @@ async function decideReview(conclusion) {
   if (!reviewingRecord) return;
   const label = conclusion === "通过" ? "通过" : conclusion === "不通过" ? "不通过" : "待人工";
   if (label !== "待人工" && !confirm(`确认将该地址标记为“${label}”？`)) return;
-  const old = reviewingRecord.notes || "";
+  // 主核查任务进行时浏览器/额度都归主任务，不允许判定
+  try {
+    const st = await (await fetch("/api/status")).json();
+    if (st.task_running) return alert("主核查任务正在进行中，暂不允许人工判定，请等任务结束再复核");
+    if (st.recheck_running) return alert("已有补充核查在进行，请稍候再判定");
+  } catch {}
+  const rec = reviewingRecord;
+  const old = rec.notes || "";
   const note = label === "通过" ? "人工复核通过：综合建筑轮廓/设计语言/物理框架判断"
              : label === "不通过" ? "人工复核不通过：确认不是同一建筑"
              : old;
-  const resp = await fetch(`/api/records/${reviewingRecord.id}`, {method: "PUT",
+  const resp = await fetch(`/api/records/${rec.id}`, {method: "PUT",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({conclusion: label, reviewed: label === "待人工" ? 0 : 1, notes: note})});
   if (!resp.ok) return alert((await resp.json()).detail || "保存复核结果失败");
   $("#reviewClose").click();
   loadRecords();
+  // 判定后缺步骤3/4 的记录自动补跑街景对比 + 查重，补全档案
+  if (label !== "待人工" && !(rec.step3 && rec.step4)) {
+    const rr = await fetch(`/api/records/${rec.id}/recheck34`, {method: "POST"});
+    if (rr.ok) {
+      pollRecheck(rec.id);
+    } else {
+      const e = await rr.json().catch(() => ({}));
+      alert(e.detail || "补充核查未能开始");
+    }
+  }
+}
+async function pollRecheck(id) {
+  alert("已开始补充核查步骤3（街景AI对比）和步骤4（查重），完成后会弹窗提示，期间请勿开始新任务。");
+  const timer = setInterval(async () => {
+    let st;
+    try { st = await (await fetch("/api/recheck-status")).json(); } catch { return; }
+    if (st.recheck_running) return;
+    clearInterval(timer);
+    loadRecords();
+    const r = await loadOneRecord(id).catch(() => null);
+    if (!r) return;
+    let msg = `补充核查完成：\n步骤3：${r.step3 || "—"}\n步骤4：${r.step4 || "—"}`;
+    if (r.conclusion === "待人工") msg += "\n\n补充核查发现异常，该记录已退回待人工，请重新复核";
+    alert(msg);
+  }, 5000);
 }
 $("#reviewPass").onclick = () => decideReview("通过");
 $("#reviewReject").onclick = () => decideReview("不通过");

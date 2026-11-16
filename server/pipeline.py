@@ -927,3 +927,92 @@ def start_task(task_id: str, params: dict) -> TaskRunner:
     # "using Sync API inside the asyncio loop"。全新线程则干净无环。
     threading.Thread(target=_run_and_cleanup, daemon=True, name=f"task-{task_id}").start()
     return runner
+
+
+# ---------- 人工判定后的补充核查（步骤3/4） ----------
+#
+# 场景：记录缺步骤3/4（如人工在待人工页直接判了通过），判定后自动补跑
+# 街景AI对比 + 查重，把档案补全。主核查任务运行期间不允许判定/补充核查
+# （浏览器和 Smarty 额度都归主任务用，混跑会互相干扰）。
+
+_RECHECK: dict = {"running": False, "record_id": None}
+
+
+def task_running() -> bool:
+    """是否有主核查任务还在跑（含收尾阶段）。"""
+    return any(not r.done for r in RUNNERS.values())
+
+
+def recheck_status() -> dict:
+    return dict(_RECHECK)
+
+
+def recheck_steps_34(record_id: int) -> dict:
+    """为缺步骤3/4 的记录补跑这两步（异步启动，立即返回）。
+
+    结果处理：
+      * 步骤3/4 无明确矛盾 → 保留人工结论，只补全档案；
+      * 任一步明确 fail → 退回「待人工」并加注（人工判定时还没看到这两步结果，
+        有明确矛盾必须让人重新确认，不能让带矛盾的记录留在"通过"里）。
+    """
+    if task_running():
+        return {"ok": False, "message": "主核查任务进行中，暂不能补充核查，请等任务结束"}
+    if _RECHECK["running"]:
+        return {"ok": False, "message": "已有补充核查在进行，请稍候"}
+    rec = store.get_record(record_id)
+    if rec is None:
+        return {"ok": False, "message": "记录不存在"}
+    if rec.get("step3") and rec.get("step4"):
+        return {"ok": True, "started": False, "message": "该记录已有步骤3/4，无需补充"}
+    if not (rec.get("address") or "").strip():
+        return {"ok": False, "message": "记录缺少地址，无法补充核查"}
+
+    _RECHECK.update(running=True, record_id=record_id)
+
+    def _work():
+        try:
+            addr = rec["address"].strip()
+            url = rec.get("listing_url") or ""
+            tag = f"r{record_id}"
+            shots = [s for s in (rec.get("screenshots") or []) if s]
+            # 房源照片：优先复用已下载的，没有再抓一次（给 AI 做外观比对用）
+            photos = [s for s in shots if "photo" in s.lower()][:3]
+            if url and not photos:
+                try:
+                    photos = streetview.grab_listing_photos(url, tag=tag) or []
+                except Exception:
+                    photos = []
+            job = browser.submit(lambda: streetview.check_street_view(
+                addr, url, tag=tag, photos=photos))
+            try:
+                r4 = opencorporates.check_duplicates(addr, tag=tag)
+            except Exception as e:
+                r4 = {"status": "suspect", "screenshot": "",
+                      "message": f"查重步骤异常: {type(e).__name__}: {e}"}
+            try:
+                r3 = job.result(timeout=420)
+            except Exception as e:
+                r3 = {"status": "suspect", "screenshot": "", "extra_shots": [],
+                      "message": f"街景步骤异常: {type(e).__name__}: {e}"}
+            for s in [r3.get("screenshot", ""), *(r3.get("extra_shots") or []),
+                      r4.get("screenshot", "")]:
+                if s and s not in shots:
+                    shots.append(s)
+            step3 = f"{r3['status']}：{r3['message']}"
+            step4 = f"{r4['status']}：{r4['message']}"
+            updates: dict = {"step3": step3, "step4": step4, "screenshots": shots}
+            if r3["status"] == "fail" or r4["status"] == "fail":
+                old_note = rec.get("notes") or ""
+                suffix = "人工判定后补充步骤3/4发现异常，已退回待人工，请重新复核"
+                updates.update(conclusion="待人工", reviewed=0,
+                               notes=f"{old_note}；{suffix}" if old_note else suffix)
+            store.update_record(record_id, **updates)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            # 本线程的 Chrome 必须关掉，否则占住配置目录影响下次任务
+            browser.close_current()
+            _RECHECK.update(running=False, record_id=None)
+
+    threading.Thread(target=_work, daemon=True, name=f"recheck-{record_id}").start()
+    return {"ok": True, "started": True, "message": "补充核查已开始"}

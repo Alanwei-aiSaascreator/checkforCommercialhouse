@@ -29,7 +29,8 @@ from fastapi.staticfiles import StaticFiles
 from server import store
 from server import excel_export
 from server.steps import smarty
-from server.pipeline import FEEDS, RUNNERS, start_task
+from server.pipeline import (FEEDS, RUNNERS, start_task, task_running,
+                             recheck_status, recheck_steps_34)
 
 BASE = Path(__file__).resolve().parent
 SHOTS = Path(store.config.SHOTS_DIR).resolve()
@@ -117,6 +118,27 @@ def api_record_delete(record_id: int):
     if not store.delete_record(record_id):
         raise HTTPException(404, "记录不存在")
     return {"ok": True}
+
+
+# ---------- 运行状态 / 补充核查 ----------
+
+@app.get("/api/status")
+def api_status():
+    """主任务与补充核查的运行状态（前端用它禁止任务进行中的人工判定）。"""
+    st = recheck_status()
+    return {"task_running": task_running(), "recheck_running": st.get("running", False),
+            "recheck_record_id": st.get("record_id")}
+
+
+@app.post("/api/records/{record_id}/recheck34")
+def api_record_recheck34(record_id: int):
+    """人工判定后补跑步骤3/4（街景AI对比 + 查重），异步执行。"""
+    if task_running():
+        raise HTTPException(409, "主核查任务进行中，暂不能补充核查，请等任务结束")
+    r = recheck_steps_34(record_id)
+    if not r.get("ok"):
+        raise HTTPException(409, r.get("message", "无法开始补充核查"))
+    return r
 
 
 # ---------- 历史清理 ----------
