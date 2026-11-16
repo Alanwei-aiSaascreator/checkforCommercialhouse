@@ -5,6 +5,7 @@
 """
 import ctypes
 import queue
+import subprocess
 import threading
 import time
 
@@ -48,6 +49,31 @@ def _minimize_chrome_window(pid):
     user32.EnumWindows(callback, 0)
     for hwnd in hwnds:
         user32.ShowWindow(hwnd, 6)
+
+
+def _kill_stale_profile_chrome(profile_dir: str) -> None:
+    """杀掉仍占用该配置目录的残留 Chrome/Chromium 进程。
+
+    场景：上次任务异常终止后，Chrome 进程还活着并锁着 user-data-dir，
+    下次启动报 "Opening in existing browser session"。只按命令行里的
+    配置目录路径精确匹配，不影响用户自己开着的浏览器。"""
+    if not hasattr(subprocess, "run"):
+        return
+    d = str(profile_dir).replace("'", "''")
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+          f"Where-Object {{ $_.CommandLine -like '*{d}*' }} | "
+          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       capture_output=True, timeout=25)
+        time.sleep(1.5)          # 等文件锁释放
+    except Exception:
+        pass
+
+
+def _is_profile_locked_error(e: Exception) -> bool:
+    s = str(e)
+    return "Opening in existing browser session" in s or "user data directory is already in use" in s
 
 
 def _minimize_context(context):
@@ -97,7 +123,14 @@ def _stop_pw():
 
 
 def _launch(profile_dir, **extra):
-    return _state().pw.chromium.launch_persistent_context(str(profile_dir), **extra)
+    try:
+        return _state().pw.chromium.launch_persistent_context(str(profile_dir), **extra)
+    except Exception as e:
+        if _is_profile_locked_error(e):
+            # 上次任务残留的 Chrome 还锁着配置目录 → 精确清理后重试一次
+            _kill_stale_profile_chrome(str(profile_dir))
+            return _state().pw.chromium.launch_persistent_context(str(profile_dir), **extra)
+        raise
 
 
 def _alive() -> bool:
@@ -200,8 +233,13 @@ def new_page_in(profile_name: str):
             try:
                 ctx = st.pw.chromium.launch_persistent_context(
                     str(d), channel="chrome", **_launch_kw(background=True))
-            except Exception:
-                ctx = st.pw.chromium.launch_persistent_context(str(d), **_launch_kw(background=True))
+            except Exception as e:
+                if _is_profile_locked_error(e):
+                    _kill_stale_profile_chrome(str(d))
+                    ctx = st.pw.chromium.launch_persistent_context(
+                        str(d), channel="chrome", **_launch_kw(background=True))
+                else:
+                    ctx = st.pw.chromium.launch_persistent_context(str(d), **_launch_kw(background=True))
             page = ctx.new_page()
             extra[profile_name] = ctx
             _minimize_context(ctx)
