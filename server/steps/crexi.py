@@ -14,6 +14,7 @@
     否则 "$4/SF/MO" 变成「每平方英尺每月 4 美元」，所有价格正则全废
 """
 import re
+import threading
 
 from .. import browser
 from .loopnet import _parse_area, _parse_price, monthly_price
@@ -431,23 +432,27 @@ async ([url, payload]) => {
 }
 """
 
-_api_pg = {"pg": None}
+_api_tls = threading.local()
 
 
 def _api_page():
-    """复用同一个 tab 发接口请求（每次新建要多等一次首页渲染，约 8s）。
+    """返回当前线程专属的 Crexi API 页面。
 
-    必须停在 crexi.com 域名下且过了 Cloudflare 挑战：否则页内 fetch 是跨域/被拦，
-    报 "TypeError: Failed to fetch"（实测杀过 Chrome 进程后必现）。
+    Playwright Sync API 的 Page 不能跨线程共享；模块级缓存会把旧任务线程的
+    Page 带到新任务，或把对象带入 Uvicorn 的 asyncio 线程，触发 Sync API 报错。
     """
-    pg = _api_pg.get("pg")
+    cache = getattr(_api_tls, "cache", None)
+    if cache is None:
+        cache = _api_tls.cache = {"pg": None}
+    pg = cache.get("pg")
+    # 复用同一个 tab 发接口请求；必须停在 crexi.com 域名并通过挑战。
     if pg is not None:
         try:
             if not pg.is_closed() and "crexi.com" in (pg.url or ""):
                 if "just a moment" not in (pg.title() or "").lower():
                     return pg
         except Exception:
-            pass
+            cache["pg"] = None
     pg = browser.new_page()
     browser.goto_retry(pg, _BASE, timeout=60000, wait=2500)
     for _ in range(8):
@@ -457,7 +462,7 @@ def _api_page():
         except Exception:
             pass
         pg.wait_for_timeout(1500)
-    _api_pg["pg"] = pg
+    cache["pg"] = pg
     return pg
 
 
