@@ -131,12 +131,12 @@ class TaskRunner:
             self.emit(f"任务异常终止: {e}", "error")
             self.emit(tb[-1500:], "error")
         finally:
-            # 被中止/异常时，正在核查的那条记录还停在"待人工"（建表默认值），
-            # 统一改判为不通过，保证记录里不出现待人工
+            # 被中止/异常时，正在核查的那条记录还停在"核查中"，
+            # 统一改判为不通过，保证半成品记录不进人工队列
             if self.current_record:
                 try:
                     rec = store.get_record(self.current_record)
-                    if rec and rec.get("conclusion") == "待人工":
+                    if rec and rec.get("conclusion") in ("待人工", "核查中") and not rec.get("notes"):
                         store.update_record(
                             self.current_record, conclusion="不通过",
                             notes="任务中止/异常，未完成验证，按淘汰处理")

@@ -157,6 +157,29 @@ def _migrate(con: sqlite3.Connection) -> None:
     cols = {r["name"] for r in con.execute("PRAGMA table_info(records)")}
     if "source" not in cols:
         con.execute("ALTER TABLE records ADD COLUMN source TEXT DEFAULT ''")
+    # 清理历史残留：结论是"待人工"但没有任何证据（无备注、无截图、非流水线记录）
+    # 的行——多为任务中断/异常时留下的半成品，人工无从看起，统一改为不通过。
+    # 流水线记录有 source 标记且转人工时必带 notes，不会被误伤。
+    con.execute(
+        """UPDATE records SET conclusion='不通过',
+               notes='历史残留：核查未完成，无人工可看的信息，自动清理'
+           WHERE conclusion='待人工' AND notes='' AND screenshots='[]'
+             AND IFNULL(source,'')=''"""
+    )
+    con.execute(
+        """UPDATE records SET conclusion='不通过',
+               notes=CASE WHEN notes='' THEN '历史残留：核查未完成，自动清理'
+                          ELSE notes END
+           WHERE conclusion='核查中' AND IFNULL(source,'')!=''"""
+    )
+    # 流水线半成品：任务中断时还没跑到判定步骤（无备注/无截图/步骤2都没到），
+    # 挂着"待人工"却没有任何可看的信息，同样自动清理。
+    con.execute(
+        """UPDATE records SET conclusion='不通过',
+               notes='历史残留：核查未完成（任务中断），自动清理'
+           WHERE conclusion='待人工' AND notes='' AND screenshots='[]'
+             AND step2='' AND IFNULL(source,'')!=''"""
+    )
 
 
 def init_db() -> None:
@@ -172,20 +195,23 @@ def init_db() -> None:
 
 def insert_record(d: dict) -> int:
     addr = d.get("address", "")
+    # 新记录默认"核查中"：流水线跑到判定步骤才会写终局结论。
+    # 不再把"待人工"当默认值——否则任务运行中/中断时，半成品记录全堆进人工队列。
+    conclusion = d.get("conclusion", "核查中")
     with _lock:
         con = _con()
         try:
             cur = con.execute(
                 """INSERT INTO records (created_at, address, address_norm, price, agent,
-                     phone, email, listing_url, step1, screenshots, area, source)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     phone, email, listing_url, step1, screenshots, area, source, conclusion)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     datetime.now().isoformat(timespec="seconds"),
                     addr, normalize(addr),
                     d.get("price", ""), d.get("agent", ""), d.get("phone", ""),
                     d.get("email", ""), d.get("listing_url", ""),
                     d.get("step1", ""), json.dumps(d.get("screenshots") or [], ensure_ascii=False),
-                    d.get("area", ""), d.get("source", ""),
+                    d.get("area", ""), d.get("source", ""), conclusion,
                 ),
             )
             con.commit()

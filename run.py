@@ -49,7 +49,7 @@ def index():
 
 _EDITABLE_FIELDS = ("address", "price", "area", "agent", "phone", "email",
                     "listing_url", "conclusion", "notes", "reviewed")
-_CONCLUSIONS = ("通过", "不通过", "待人工")
+_CONCLUSIONS = ("通过", "不通过", "待人工", "核查中")
 
 
 @app.get("/api/records")
