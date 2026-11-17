@@ -86,7 +86,8 @@ _PAGES_JS = r"""
 _DETAIL_JS = r"""
 () => {
     const txt = e => e ? (e.innerText || "").trim() : "";
-    const out = {h1: "", price: "", building: "", brokers: [], brokerage: "", spaces: []};
+    const out = {h1: "", price: "", building: "", brokers: [], brokerage: "", spaces: [],
+                 phones: [], emails: []};
     out.h1 = txt(document.querySelector("h1"));
     const pp = document.querySelector("[data-cy=primary-price]");
     if (pp) out.price = (pp.innerText || "").split("\n")[0].trim();
@@ -105,6 +106,11 @@ _DETAIL_JS = r"""
         .map(txt).filter(Boolean);
     const m = (document.body.innerText || "").match(/Listed by\s*([^\n]+)/);
     out.brokerage = m ? m[1].trim() : "";
+    // 登录态下经纪人电话/邮箱会渲染成 tel:/mailto: 链接（未登录打码没有）
+    out.phones = [...document.querySelectorAll("a[href^='tel:']")]
+        .map(a => (a.href || "").replace(/^tel:/i, "").trim()).filter(Boolean);
+    out.emails = [...document.querySelectorAll("a[href^='mailto:']")]
+        .map(a => (a.href || "").replace(/^mailto:/i, "").trim()).filter(Boolean);
     // 套间：取整块文案（前 3 行 = 套间名/单价/面积，块内后面还有
     // Rentable SqFt、Total Monthly Rent —— 单价写 "Undisclosed" 时唯一能拿到月租的地方）
     out.spaces = [...document.querySelectorAll("[data-cy=space]")].map(e =>
@@ -313,12 +319,18 @@ def _detail_candidate(page, url: str) -> dict:
     # 真地址一定含门牌号——不含数字就判为解析失败，宁可空也不要脏地址进库
     if not re.search(r"\d", addr):
         addr = ""
+    # 登录态下详情页有 tel:/mailto: 链接 → 取真实联系方式；
+    # 未登录打码时列表为空 → 留空（不猜、不伪造），交给跨源交叉查询兜底
+    phones = [p for p in (info.get("phones") or [])
+              if re.match(r"^[\d\s()+.\-]{7,}$", str(p))]
+    emails = [e for e in (info.get("emails") or [])
+              if "@" in str(e) and "." in str(e)]
     return {
         "address": addr,
         "price": (info.get("price") or "").strip(),
         "agent": agent,
-        "phone": "",            # 未登录打码，不伪造
-        "email": "",
+        "phone": phones[0] if phones else "",   # 未登录打码，不伪造
+        "email": emails[0] if emails else "",
         "area": building,
         "undisclosed": "undisclosed" in str(info.get("price") or "").lower(),
         "listing_url": url,
@@ -548,6 +560,9 @@ def _candidate_from_item(item: dict) -> dict:
         agent = f"{agent}（{agency}）"
     elif not agent:
         agent = agency
+    # 登录态下搜索接口可能直接带 broker 电话/邮箱（未登录为空/缺字段）
+    api_phone = str(b.get("phone") or "").strip()
+    api_email = str(b.get("email") or "").strip()
 
     spaces = _item_spaces(item)
     rng = item.get("leaseRateRange") or {}
@@ -585,8 +600,8 @@ def _candidate_from_item(item: dict) -> dict:
         "address": addr,
         "price": price,
         "agent": agent,
-        "phone": "",
-        "email": "",
+        "phone": api_phone if re.match(r"^[\d\s()+.\-]{7,}$", api_phone) else "",
+        "email": api_email if "@" in api_email and "." in api_email else "",
         "area": area,
         "undisclosed": not bool(spaces and any(s.get("monthly") for s in spaces)
                                 or total_monthly),
@@ -766,7 +781,7 @@ def fetch_broker_info(listing_url: str) -> dict:
                 break
             pg.wait_for_timeout(800)
         cand = _detail_candidate(pg, listing_url)
-        for k in ("price", "agent", "area"):
+        for k in ("price", "agent", "area", "phone", "email"):
             info[k] = cand.get(k, "")
         info["spaces"] = cand.get("spaces") or []
         # 图片多为懒加载：轻滚一屏再取 URL（实测 800ms 大图基本齐）

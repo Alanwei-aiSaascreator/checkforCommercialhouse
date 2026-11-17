@@ -298,7 +298,8 @@ _DETAIL_JS = r"""
         .map(i => i.currentSrc || i.src || "")
         .filter(s => s.startsWith("http"));
     return {text: t, imgs: imgs.slice(0, 10),
-            phone: ((document.querySelector("a[href^='tel:']") || {}).href || "").replace("tel:", "")};
+            phone: ((document.querySelector("a[href^='tel:']") || {}).href || "").replace("tel:", ""),
+            email: ((document.querySelector("a[href^='mailto:']") || {}).href || "").replace("mailto:", "")};
 }
 """
 
@@ -385,10 +386,12 @@ def fetch_broker_info(listing_url: str) -> dict:
                     info["agent"] = f"{lines[i + 1]}（{lines[i + 2]}）"
                 break
 
-        # OfficeSpace 不给经纪人直连方式（页面只有平台联系表单/官方热线），
-        # 所以电话/邮箱统一写提示语，不写空也不写平台客服号（那是无效线索）
-        info["phone"] = OFFICIAL_CONTACT
-        info["email"] = OFFICIAL_CONTACT
+        # 页面上真有 tel:/mailto: 链接时优先用真实联系方式；
+        # 没有才退回平台提示语（页面只有联系表单/官方热线时属无效线索）
+        tel = (data.get("phone") or "").strip()
+        mail = (data.get("email") or "").strip()
+        info["phone"] = tel if re.match(r"^[\d\s()+.-]{7,}$", tel) else OFFICIAL_CONTACT
+        info["email"] = mail if "@" in mail and "." in mail else OFFICIAL_CONTACT
         info["photo_urls"] = [u for u in (data.get("imgs") or [])
                               if "logo" not in u.lower() and "icon" not in u.lower()]
 

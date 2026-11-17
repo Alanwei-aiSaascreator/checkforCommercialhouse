@@ -11,6 +11,7 @@ from . import browser, config, deepseek_client, store
 from .addrutil import clean_address
 from .steps import (cbre, commercialcafe, commercialsearch, crexi, cityfeet, loopnet,
                     officespace, smarty, streetview, opencorporates)
+from .steps import cross_lookup
 
 # 步骤1 数据源注册表：source key → (模块, 展示名, 详情页域名)
 # 新数据源只要实现 search_candidates / fetch_broker_info（+ candidates_from_urls）
@@ -445,10 +446,11 @@ class TaskRunner:
             # 该数据源以详情页为唯一价格口径（Crexi）：卡片价不参与淘汰，一律进详情页看套间表
             detail_prices = bool(getattr(feed, "DETAIL_IS_PRICE_SOURCE", False))
             # 搜索接口已直接给出套间级月租（crexi 的 leaseDetails.totalMonthly）→
-            # 价格口径就是详情页那套，不必再开页，省 3-8s/条
+            # 价格口径就是详情页那套，不必再开页，省 3-8s/条。
+            # 但电话缺失时仍要开页：Crexi 登录态下详情页才渲染 tel: 链接（电话硬字段）
             has_api_price = any(s.get("monthly") is not None
                                 for s in (cand.get("spaces") or []))
-            if has_api_price:
+            if has_api_price and str(cand.get("phone") or "").strip():
                 need_detail = False
             elif undisclosed:
                 # 价格未披露不等于详情页没价格：一律开页核实（套间表/经纪人/面积），
@@ -490,8 +492,13 @@ class TaskRunner:
                     self.emit("  ⚠ 详情页被反爬拦截（冷却后仍被拒），本条字段可能缺失",
                               "warn")
                 spaces = info.get("spaces") or []
+                # 占位语（"请联系该官网工作人员"）不算已有值：详情页拿到真实
+                # 电话/邮箱时要能覆盖它（OfficeSpace 卡片默认写占位语）
+                _ph = officespace.OFFICIAL_CONTACT
                 for k in ("agent", "phone", "email", "price", "area"):
-                    if info.get(k) and not cand.get(k):
+                    iv = str(info.get(k) or "")
+                    cv = str(cand.get(k) or "")
+                    if iv and (not cv or cv == _ph):
                         cand[k] = info[k]
                 if detail_prices and info.get("price"):
                     # 该数据源以详情页价格为准：卡片价直接换成详情页价，
@@ -706,6 +713,33 @@ class TaskRunner:
                         self.emit(f"  AI 预筛调用失败（不阻断流程，稍后街景对比兜底）：{e}", "warn")
                 else:
                     self.emit("  未抓到房源照片，跳过预筛（街景步骤将跳过外观比对）", "warn")
+
+            # SOP：电话是硬字段。本源没给电话（Crexi 未登录打码 / CommercialCafe
+            # 只有表单 / 占位语）→ 拿地址去其它平台交叉查同楼盘的挂牌。
+            # 放在价格/预筛都过关之后：只给真正可能通过核查的候选花交叉查询的时间。
+            if self.stopped:
+                break
+            _ph = officespace.OFFICIAL_CONTACT
+            if not str(cand.get("phone") or "").strip() or cand.get("phone") == _ph:
+                self.current_step = "跨源交叉查询经纪人电话"
+                self.emit("  本源未提供经纪人电话 → 跨数据源交叉查询（LoopNet/Crexi）...")
+                try:
+                    cr = cross_lookup.lookup_contact(addr, exclude_source=source)
+                except Exception as e:
+                    cr = {}
+                    self.emit(f"  交叉查询异常（不阻断流程）：{e}", "warn")
+                if cr.get("phone"):
+                    cand["phone"] = cr["phone"]
+                    if cr.get("agent") and not str(cand.get("agent") or "").strip():
+                        cand["agent"] = cr["agent"]
+                    if cr.get("email") and not str(cand.get("email") or "").strip():
+                        cand["email"] = cr["email"]
+                    self.emit(f"  ✓ 交叉命中（{cr.get('source')}）：{cr['phone']}", "pass")
+                    store.update_record(record_id, phone=cand["phone"],
+                                        agent=cand.get("agent", ""),
+                                        email=cand.get("email", ""))
+                else:
+                    self.emit("  交叉查询未命中同楼盘挂牌，电话留空", "warn")
 
             # 步骤2 Smarty
             if self.stopped:
