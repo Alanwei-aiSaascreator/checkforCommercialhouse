@@ -585,8 +585,9 @@ class TaskRunner:
                                        if str(s.get("size") or "").isdigit())
                         if suspect:
                             note = (f"套间单价异常（{suspect[0]['rate']}，疑似总价 "
-                                    f"${suspect[0]['suspected_total']:,.0f}/月，无法自动确认，转人工复核）")
-                            store.update_record(record_id, conclusion="待人工", notes=note)
+                                    f"${suspect[0]['suspected_total']:,.0f}/月），本轮无法确认，跳过")
+                            # 报价口径异常不是人工视觉核查事项；不写失败档案，后续重跑可再尝试。
+                            store.update_record(record_id, conclusion="不通过", notes=note)
                             self.emit(f"  {note}", "warn")
                             continue
                         if not any(s.get("rate") for s in spaces) and sizes:
@@ -625,12 +626,10 @@ class TaskRunner:
                 pstate, pmonthly = _price_state(cand)
                 if pstate == "over":
                     if info.get("blocked"):
-                        # 详情页被反爬拦截 → 套间表可能根本没读到，整栋折算大概率误杀
-                        #（整层 $30/SF × 1,440 SF 超预算，但里面的小套间常常在预算内）。
-                        # 这种情况不判死，转待人工复核。
-                        note = (f"详情页被反爬拦截，按整栋折算 ≈ ${pmonthly:,.0f}/月超预算，"
-                                f"但套间表未读到，可能存在预算内小套间 → 待人工复核")
-                        store.update_record(record_id, conclusion="待人工", notes=note)
+                        # 详情页未能确认套间明细：不进入人工视觉队列，跳过本轮候选。
+                        note = (f"详情页被反爬拦截，整栋折算 ≈ ${pmonthly:,.0f}/月超预算，"
+                                f"套间报价未确认，本轮跳过")
+                        store.update_record(record_id, conclusion="不通过", notes=note)
                         self.emit(f"  {note}", "warn")
                         continue
                     src_note = ("详情页已核实无套间明细" if need_detail and cand.get("listing_url")
@@ -656,8 +655,8 @@ class TaskRunner:
                     # 但详情页被拦截导致字段缺失的不判死（可能详情页有套间表），转待人工
                     if info.get("blocked"):
                         note = (f"详情页被反爬拦截，价格字段缺失（卡片价 {cand.get('price') or '无'}），"
-                                f"无法判定预算，转待人工复核")
-                        store.update_record(record_id, conclusion="待人工", notes=note)
+                                f"本轮无法确认报价，跳过")
+                        store.update_record(record_id, conclusion="不通过", notes=note)
                         self.emit(f"  {note}", "warn")
                         continue
                     note = (f"价格无法换算成月租：{cand.get('price') or '未抓到价格'}"
@@ -801,19 +800,12 @@ class TaskRunner:
                 self.emit("该地址淘汰，处理下一个候选", "warn")
                 continue
             if r2["status"] == "suspect":
-                # 限流/网络类失败是"这次没查到"，不是"这地址不合格"：
-                # 结论按淘汰走，但不写失败档案（否则好地址被永久拉黑，重跑也救不回来）
-                _transient = ("429", "限流", "请求失败", "请求异常", "timeout", "超时")
-                if any(k in r2["message"] for k in _transient):
-                    note = f"Smarty 限流/网络未验证完（{r2['message'][:60]}），转人工复核"
-                    store.update_record(record_id, conclusion="待人工", notes=note,
-                                        screenshots=shots)
-                    self.emit(f"  {note}", "warn")
-                    continue
-                note = f"Smarty 结果不明确，无法自动确认：{r2['message'][:80]}，转人工复核"
-                store.update_record(record_id, conclusion="待人工", notes=note,
+                # Smarty 未明确通过/失败时，不属于视觉人工核查；本轮直接跳过。
+                # 不写失败地址档案，后续重跑仍可重新验证，避免人工队列被接口故障灌满。
+                note = f"Smarty 未完成有效验证，本轮跳过：{r2['message'][:100]}"
+                store.update_record(record_id, conclusion="不通过", notes=note,
                                     screenshots=shots)
-                self.emit("Smarty 结果不明确 → 转人工复核，不写入失败档案", "warn")
+                self.emit(f"  {note}（不进入人工队列）", "warn")
                 continue
 
             # SOP：步骤3/4 使用 Smarty 双绿后的标准化地址
@@ -866,10 +858,20 @@ class TaskRunner:
                     store.add_failed_address(addr, "街景", reason, building=False)
                     self.emit("步骤3明确外观不符，处理下一个候选", "warn")
                     continue
-                # suspect = 有效街景证据不足，不再直接淘汰，保留待人工，避免遮挡/角度差误杀。
-                reason = "街景证据不足，待人工复核（未发现明确建筑矛盾）"
+                # 技术失败不是人工视觉判断：避免 Google/DeepSeek 暂态故障把队列灌满。
+                # 只有 AI 已完成对比但结论为 suspect，才需要人工看图确认。
+                msg = str(r3.get("message") or "")
+                technical = ("访问失败" in msg or "未完成渲染" in msg or
+                             "截图全黑" in msg or "调用失败" in msg or
+                             "无有效返回" in msg or "未完成" in msg)
+                if technical:
+                    reason = f"步骤3技术问题，本轮跳过：{msg[:180]}"
+                    store.update_record(record_id, conclusion="不通过", notes=reason)
+                    self.emit(f"{reason}（不进入人工队列）", "warn")
+                    continue
+                reason = "街景AI已完成但证据不足，待人工复核（未发现明确建筑矛盾）"
                 store.update_record(record_id, conclusion="待人工", notes=reason)
-                self.emit("步骤3证据不足，转待人工，不淘汰该地址", "warn")
+                self.emit("步骤3 AI 证据不足，转待人工", "warn")
                 continue
 
             # 步骤4 OpenCorporates（结果已在上面与步骤3 并行取得，这里只报状态）
@@ -879,12 +881,15 @@ class TaskRunner:
             store.update_record(record_id, step4=f"{r4['status']}：{r4['message']}", screenshots=[s for s in shots if s])
 
             if r4["status"] != "pass":
-                note = "查重公司数超标" if r4["status"] == "fail" else "查重结果无法解析"
-                store.update_record(record_id, conclusion="不通过", notes=note)
-                # 公司数超标按楼栋级（同楼注册公司一样多）；解析失败仅精确级
-                store.add_failed_address(addr, "查重", note,
-                                         building=(r4["status"] == "fail"))
-                self.emit("该地址淘汰，处理下一个候选", "warn")
+                if r4["status"] == "fail":
+                    note = "查重公司数超标"
+                    store.update_record(record_id, conclusion="不通过", notes=note)
+                    store.add_failed_address(addr, "查重", note, building=True)
+                else:
+                    # 查重暂态/解析失败不是地址不合格，不进入人工视觉队列，也不写失败档案。
+                    note = f"查重本轮未完成，跳过：{r4.get('message', '')[:160]}"
+                    store.update_record(record_id, conclusion="不通过", notes=note)
+                self.emit("该地址未完成查重，本轮跳过", "warn")
                 continue
 
             # 四步全过 → 通过并写入收录表（供后续查重）
@@ -1003,8 +1008,14 @@ def recheck_steps_34(record_id: int) -> dict:
             updates: dict = {"step3": step3, "step4": step4, "screenshots": shots}
             if r3["status"] == "fail" or r4["status"] == "fail":
                 old_note = rec.get("notes") or ""
-                suffix = "人工判定后补充步骤3/4发现异常，已退回待人工，请重新复核"
+                suffix = "人工判定后补充步骤3/4发现明确异常，已退回待人工，请重新复核"
                 updates.update(conclusion="待人工", reviewed=0,
+                               notes=f"{old_note}；{suffix}" if old_note else suffix)
+            elif r3["status"] != "pass" or r4["status"] != "pass":
+                # 补充核查技术失败不应让原人工通过继续保持通过，也不应伪装成视觉待人工。
+                old_note = rec.get("notes") or ""
+                suffix = "人工判定后补充步骤3/4未完成，本轮暂不保留通过结论"
+                updates.update(conclusion="不通过", reviewed=0,
                                notes=f"{old_note}；{suffix}" if old_note else suffix)
             store.update_record(record_id, **updates)
         except Exception:
