@@ -347,7 +347,7 @@ def _capture_street_views(page, coords, tag: str, max_views: int = 2) -> list:
         url = (f"https://www.google.com/maps/@?layer=c&cbll={lat},{lon}"
                f"&cbp=12,{heading},0,0,0")
         try:
-            _goto_retry(page, url, timeout=45000, wait=5000)
+            _goto_retry(page, url, timeout=45000, wait=8000)
             _activate_panorama(page)
         except Exception:
             continue
@@ -355,12 +355,17 @@ def _capture_street_views(page, coords, tag: str, max_views: int = 2) -> list:
         if not s:
             continue
         if not _usable_street_image(s):
-            # Google 全景画布可能尚未完成绘制，等待后重拍一次，黑屏不送给 AI。
-            page.wait_for_timeout(2000)
-            retry = shot(page, f"{tag}_maps_retry") or ""
-            if retry and _usable_street_image(retry):
-                s = retry
-            else:
+            # Google 全景画布可能尚未完成绘制（慢代理下瓦片加载要更久），
+            # 分两轮等待重拍，黑屏不送给 AI。
+            ok = False
+            for extra in (3000, 6000):
+                page.wait_for_timeout(extra)
+                retry = shot(page, f"{tag}_maps_retry") or ""
+                if retry and _usable_street_image(retry):
+                    s = retry
+                    ok = True
+                    break
+            if not ok:
                 continue
         s = _crop_clean(s)
         if not _usable_street_image(s):

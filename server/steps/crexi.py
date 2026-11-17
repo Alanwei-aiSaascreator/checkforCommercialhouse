@@ -767,19 +767,23 @@ def fetch_broker_info(listing_url: str) -> dict:
         return info
     pg = browser.new_page()
     try:
-        # 不再固定空等：实测价格/套间表约 2.4s 就绪，改为"等元素出现即走"
-        # （最多再等 8s；拦截页会一直等不到，仍走原有失败路径）
+        # 不再固定空等：实测价格/套间表约 2.4s 就绪，改为"等元素出现即走"。
+        # 慢代理/慢网络下页面渲染和 Cloudflare 过渡页都要更久：最多等 ~22s，
+        # 期间若卡在 "just a moment" 过渡页，等待它自己放行后再继续等元素。
         browser.goto_retry(pg, listing_url, timeout=60000, wait=800)
         # 只等「套间表」元素：价格元素先出现时套间/经纪人还没渲染完（实测会解析出空中介、
-        # 价格里混进 "| 507 days on market"），所以以 space 为准，等到就走（最多约 6.4s）
-        for _ in range(8):
+        # 价格里混进 "| 507 days on market"），所以以 space 为准，等到就走
+        for _ in range(22):
             try:
+                title = (pg.title() or "").lower()
                 ready = pg.evaluate("() => document.querySelectorAll('[data-cy=space]').length")
             except Exception:
-                ready = 0
+                title, ready = "", 0
             if ready:
                 break
-            pg.wait_for_timeout(800)
+            if "just a moment" in title or "checking your browser" in title:
+                pass    # 过渡页：继续等它放行（最多到 22s）
+            pg.wait_for_timeout(1000)
         cand = _detail_candidate(pg, listing_url)
         for k in ("price", "agent", "area", "phone", "email"):
             info[k] = cand.get(k, "")
