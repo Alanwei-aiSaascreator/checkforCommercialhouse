@@ -253,8 +253,11 @@
   <!-- 待人工复核专页 -->
   <div class="page" id="page-review">
     <div class="card">
-      <h3 class="sec">待人工复核</h3>
-      <div class="steps" style="margin-bottom:12px">这里集中展示自动化证据不足、但没有明确否定证据的记录。请结合房源照片、街景照片、建筑轮廓和入口特征判断。</div>
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px">
+        <h3 class="sec">待人工复核</h3>
+        <button class="btn sm" onclick="openRecModal(null)">新增人工核查</button>
+      </div>
+      <div class="steps" style="margin-bottom:12px">这里集中展示自动化证据不足、但没有明确否定证据的记录。请结合房源照片、街景照片、建筑轮廓和入口特征判断。此页面支持新增、查看、修改、删除。</div>
       <div id="reviewQueue"><div class="empty">加载中...</div></div>
     </div>
   </div>
@@ -503,7 +506,7 @@ async function loadRecords() {
         ${[["步骤1",r.step1],["步骤2",r.step2],["步骤3",r.step3],["步骤4",r.step4]].filter(x => x[1]).map(x => `<details><summary>${x[0]}</summary><div>${esc(x[1])}</div></details>`).join("")}
       </td>
       <td><span class="${badge}">${esc(r.conclusion)}</span>${r.reviewed ? `<div class="review-tag">已人工复核</div>` : ""}${r.notes ? `<details class="record-details"><summary>查看备注</summary><div>${esc(r.notes)}</div></details>` : ""}</td>
-      <td>${shots}<button class="btn sm gray" style="margin-top:5px" onclick="openReview(${r.id})">查看对比图片</button>${r.conclusion === "待人工" ? `<button class="btn sm" style="margin-top:5px" onclick="openReview(${r.id})">人工复核</button>` : ""}</td>
+      <td>${shots}<button class="btn sm gray" style="margin-top:5px" onclick="openReview(${r.id})">查看对比图片</button>${r.conclusion === "待人工" ? `<button class="btn sm" style="margin-top:5px" onclick="openReview(${r.id})">人工复核</button>` : ""}${r.conclusion === "通过" && !(r.step3 && r.step4) ? `<button class="btn sm" style="margin-top:5px" onclick="startRecheck34(${r.id})">进入步骤3/4</button>` : ""}</td>
       <td style="white-space:nowrap">
         <button class="btn sm gray" onclick="exportOne(${r.id})">导出</button>
         <button class="btn sm gray" style="margin-top:4px" onclick="openRecModal(${r.id})">编辑</button>
@@ -549,7 +552,11 @@ async function loadReviewQueue() {
   $("#reviewQueue").innerHTML = recs.length ? recs.map(r =>
     `<div class="known-item" style="align-items:center; gap:12px">
       <div style="flex:1"><b>${esc(r.address || "")}</b><div class="steps">${esc(r.source || "")}　${esc(r.price || "—")}　${esc(r.area || "—")}<br>${esc(r.notes || r.step3 || "待判断")}</div></div>
-      <button class="btn sm" onclick="openReview(${r.id})">查看图片并决策</button>
+      <div style="display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end">
+        <button class="btn sm" onclick="openReview(${r.id})">查看图片并决策</button>
+        <button class="btn sm gray" onclick="openRecModal(${r.id})">编辑</button>
+        <button class="btn sm red" onclick="deleteRecord(${r.id}, ${JSON.stringify(r.address).replace(/"/g, "&quot;")})">删除</button>
+      </div>
     </div>`).join("") : `<div class="empty">暂无待人工记录</div>`;
 }
 let reviewingRecord = null;
@@ -581,12 +588,15 @@ async function decideReview(conclusion) {
   if (!reviewingRecord) return;
   const label = conclusion === "通过" ? "通过" : conclusion === "不通过" ? "不通过" : "待人工";
   if (label !== "待人工" && !confirm(`确认将该地址标记为“${label}”？`)) return;
-  // 主核查任务进行时浏览器/额度都归主任务，不允许判定
-  try {
-    const st = await (await fetch("/api/status")).json();
-    if (st.task_running) return alert("主核查任务正在进行中，暂不允许人工判定，请等任务结束再复核");
-    if (st.recheck_running) return alert("已有补充核查在进行，请稍候再判定");
-  } catch {}
+  // 只有“通过”会触发后续步骤；主任务进行时禁止通过。
+  // “不通过”只是结束当前房源，不占用后续核查资源，允许随时执行。
+  if (label === "通过") {
+    try {
+      const st = await (await fetch("/api/status")).json();
+      if (st.task_running) return alert("主核查任务正在进行中，暂不允许判定通过，请等任务结束");
+      if (st.recheck_running) return alert("已有补充核查在进行，请稍候再判定通过");
+    } catch {}
+  }
   const rec = reviewingRecord;
   const old = rec.notes || "";
   const note = label === "通过" ? "人工复核通过：综合建筑轮廓/设计语言/物理框架判断"
@@ -598,8 +608,14 @@ async function decideReview(conclusion) {
   if (!resp.ok) return alert((await resp.json()).detail || "保存复核结果失败");
   $("#reviewClose").click();
   loadRecords();
-  // 判定后缺步骤3/4 的记录自动补跑街景对比 + 查重，补全档案
-  if (label !== "待人工" && !(rec.step3 && rec.step4)) {
+  // 只有人工判定“通过”且用户主动选择时，才补跑步骤3/4。
+  // “不通过”直接结束当前房源，不触发后续步骤，也不与主任务冲突。
+  if (label === "通过" && !(rec.step3 && rec.step4) &&
+      confirm("该记录还没有步骤3/4。现在进入步骤3（街景AI）和步骤4（查重）吗？\n\n选择“取消”可稍后再手动进入。")) {
+    const st = await (await fetch("/api/status")).json().catch(() => ({}));
+    if (st.task_running) {
+      return alert("主核查任务正在推进，暂时不能进入步骤3/4。你已判定通过，任务结束后可在记录中再次打开并手动补充核查。");
+    }
     const rr = await fetch(`/api/records/${rec.id}/recheck34`, {method: "POST"});
     if (rr.ok) {
       pollRecheck(rec.id);
@@ -609,11 +625,19 @@ async function decideReview(conclusion) {
     }
   }
 }
+async function startRecheck34(id) {
+  const st = await (await fetch("/api/status")).json().catch(() => ({}));
+  if (st.task_running) return alert("主核查任务正在推进，暂时不能进入步骤3/4");
+  if (!confirm("确认现在进入步骤3（街景AI）和步骤4（查重）吗？")) return;
+  const rr = await fetch(`/api/records/${id}/recheck34`, {method: "POST"});
+  if (rr.ok) pollRecheck(id);
+  else alert((await rr.json().catch(() => ({}))).detail || "补充核查未能开始");
+}
 async function pollRecheck(id) {
   alert("已开始补充核查步骤3（街景AI对比）和步骤4（查重），完成后会弹窗提示，期间请勿开始新任务。");
   const timer = setInterval(async () => {
     let st;
-    try { st = await (await fetch("/api/recheck-status")).json(); } catch { return; }
+    try { st = await (await fetch("/api/status")).json(); } catch { return; }
     if (st.recheck_running) return;
     clearInterval(timer);
     loadRecords();

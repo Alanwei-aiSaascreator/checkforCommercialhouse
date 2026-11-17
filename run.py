@@ -105,6 +105,8 @@ def api_record_update(record_id: int, body: dict):
         raise HTTPException(400, "地址不能为空")
     if not fields:
         raise HTTPException(400, "没有可更新的字段")
+    # “通过”本身只是人工标注；是否进入步骤3/4由前端单独询问，
+    # 因此主任务运行时仍可以先标注通过，但不能启动补充核查。
     # conclusion 手动改为"通过" → 同步写入收录表（与流水线行为一致）；
     # 未传 address 时用记录现有地址
     if conclusion == "通过" and addr:

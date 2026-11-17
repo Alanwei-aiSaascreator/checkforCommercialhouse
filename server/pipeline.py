@@ -590,14 +590,14 @@ class TaskRunner:
                             self.emit(f"  {note}", "warn")
                             continue
                         if not any(s.get("rate") for s in spaces) and sizes:
-                            # 没有报价只能说明证据不足，不能证明超预算；转人工避免误杀。
+                            # 套间完全未报价：不值得进入人工队列，直接淘汰。
                             note = (f"全部 {len(spaces)} 个套间均未报价"
-                                    f"（{sizes[0]:,}–{sizes[-1]:,} SF），无法判定预算，转人工复核")
-                            store.update_record(record_id, conclusion="待人工", notes=note)
+                                    f"（{sizes[0]:,}–{sizes[-1]:,} SF），无报价，直接淘汰")
+                            store.update_record(record_id, conclusion="不通过", notes=note)
                             self.emit(f"  {note}", "warn")
                             continue
-                        note = "套间价格无法换算成月租，无法判定预算，转人工复核"
-                        store.update_record(record_id, conclusion="待人工", notes=note)
+                        note = "套间无有效报价或无法换算成月租，直接淘汰"
+                        store.update_record(record_id, conclusion="不通过", notes=note)
                         self.emit(f"  {note}", "warn")
                         continue
                     cheapest = min(priced, key=lambda s: s["monthly"])
