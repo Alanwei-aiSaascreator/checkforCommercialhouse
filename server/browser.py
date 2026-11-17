@@ -27,7 +27,14 @@ VIEWPORT = {"width": 1440, "height": 900}
 
 
 def _minimize_chrome_window(pid):
-    """强制将 Playwright 启动的 Chrome 窗口最小化到任务栏。"""
+    """强制将 Playwright 启动的 Chrome 窗口移出屏幕并最小化（不抢焦点）。
+
+    关键点：
+    * 先 SetWindowPos 移到屏幕外（SWP_NOACTIVATE），窗口再出现也不会盖住
+      用户正在操作的内容；
+    * 用 SW_SHOWMINNOACTIVE(7) 而不是 SW_MINIMIZE(6)：后者会激活窗口、
+      把键盘焦点抢走，正是"任务跑起来就抢我鼠标键盘"的元凶。
+    """
     if not hasattr(ctypes, "windll"):
         return
     user32 = ctypes.windll.user32
@@ -40,15 +47,24 @@ def _minimize_chrome_window(pid):
         cls = ctypes.create_unicode_buffer(128)
         user32.GetClassNameW(hwnd, cls, 128)
         same_process = pid and found_pid.value == pid
-        # 只最小化本程序启动的 Chrome 进程；禁止"找不到 PID 就最小化所有
+        # 只处理本程序启动的 Chrome 进程；禁止"找不到 PID 就最小化所有
         # Chrome 窗口"的兜底——那会把用户自己开着的浏览器一并压下去。
         if pid and same_process and user32.IsWindowVisible(hwnd):
             hwnds.append(hwnd)
         return True
 
     user32.EnumWindows(callback, 0)
+    SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE = 0x0010, 0x0004, 0x0001
+    HWND_BOTTOM = 1
     for hwnd in hwnds:
-        user32.ShowWindow(hwnd, 6)
+        # 无激活移出屏幕（不改变 Z 序、不抢焦点）
+        try:
+            user32.SetWindowPos(hwnd, HWND_BOTTOM, -32000, -32000, 0, 0,
+                                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE)
+        except Exception:
+            pass
+        # 无激活最小化到任务栏
+        user32.ShowWindow(hwnd, 7)
 
 
 def _kill_stale_profile_chrome(profile_dir: str) -> None:
@@ -77,7 +93,12 @@ def _is_profile_locked_error(e: Exception) -> bool:
 
 
 def _minimize_context(context):
-    """在启动、开页和导航后重复最小化，防止 Chrome 再次抢回前台。"""
+    """在启动、开页和导航后持续压制 Chrome 抢前台。
+
+    Chrome 新开窗口/弹窗时会把自己提到最前并抢走键盘焦点；启动后前 20 秒
+    最容易反复发生（步骤切换、辅助浏览器弹出）。这里用看护线程在窗口出现
+    的第一时间无激活移出屏幕并最小化，全程不碰用户的鼠标和焦点。
+    """
     browser = getattr(context, "browser", None)
     try:
         pid = browser.pid if browser is not None else None
@@ -85,11 +106,23 @@ def _minimize_context(context):
         pid = None
 
     def minimize_later():
-        for delay in (0.2, 0.8, 2.0):
+        # 指数退避看护 ~20s：0.1/0.3/0.6/1/1.5/2/3/4/6/8/10（累计 36.5s 覆盖前段）
+        for delay in (0.1, 0.3, 0.6, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0):
             time.sleep(delay)
-            _minimize_chrome_window(pid)
+            try:
+                _minimize_chrome_window(pid)
+            except Exception:
+                pass
 
     threading.Thread(target=minimize_later, daemon=True).start()
+    # 弹出的新标签/新窗口也立即压住（popup 会开新 OS 窗口并抢前台）。
+    # 每个 context 只注册一次，避免 new_page 反复叠加监听。
+    if not getattr(context, "_popup_hook", False):
+        try:
+            context._popup_hook = True
+            context.on("page", lambda _p: _minimize_chrome_window(pid))
+        except Exception:
+            pass
 
 
 def _state():
