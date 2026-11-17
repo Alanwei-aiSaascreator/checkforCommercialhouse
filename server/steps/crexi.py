@@ -300,6 +300,30 @@ def _spaces_from_rows(rows: list) -> list:
     return spaces
 
 
+# Crexi 平台占位联系方式：免费账号"View phone number"给的是平台统一转接号
+# 888-273-0423，邮箱是平台 support 邮箱——都不是经纪人真实联系方式，
+# 必须过滤（否则跨源交叉查询永远被这个假"命中"短路，LoopNet 真号查不到）
+_PLATFORM_PHONE_DIGITS = {"8882730423"}
+
+
+def _is_real_phone(v) -> bool:
+    """格式合法且不是 Crexi 平台统一转接号。"""
+    s = str(v or "").strip()
+    if not re.match(r"^[\d\s()+.\-]{7,}$", s):
+        return False
+    digits = re.sub(r"\D", "", s)
+    return bool(digits) and digits not in _PLATFORM_PHONE_DIGITS
+
+
+def _is_real_email(v) -> bool:
+    """格式合法且不是 Crexi 平台邮箱（support@/info@crexi.com）。"""
+    s = str(v or "").strip().lower()
+    if "@" not in s or "." not in s:
+        return False
+    return not (s.endswith("@crexi.com") and
+                s.split("@")[0] in ("support", "info", "contact", "hello"))
+
+
 def _detail_candidate(page, url: str) -> dict:
     """已打开的详情页 → 候选（地址/价格/经纪人/面积/套间表）。"""
     try:
@@ -320,11 +344,10 @@ def _detail_candidate(page, url: str) -> dict:
     if not re.search(r"\d", addr):
         addr = ""
     # 登录态下详情页有 tel:/mailto: 链接 → 取真实联系方式；
-    # 未登录打码时列表为空 → 留空（不猜、不伪造），交给跨源交叉查询兜底
-    phones = [p for p in (info.get("phones") or [])
-              if re.match(r"^[\d\s()+.\-]{7,}$", str(p))]
-    emails = [e for e in (info.get("emails") or [])
-              if "@" in str(e) and "." in str(e)]
+    # 未登录打码时列表为空 → 留空（不猜、不伪造），交给跨源交叉查询兜底。
+    # 平台统一转接号/平台邮箱不是经纪人真实联系方式 → 过滤（视为没查到）
+    phones = [p for p in (info.get("phones") or []) if _is_real_phone(p)]
+    emails = [e for e in (info.get("emails") or []) if _is_real_email(e)]
     return {
         "address": addr,
         "price": (info.get("price") or "").strip(),
@@ -600,8 +623,8 @@ def _candidate_from_item(item: dict) -> dict:
         "address": addr,
         "price": price,
         "agent": agent,
-        "phone": api_phone if re.match(r"^[\d\s()+.\-]{7,}$", api_phone) else "",
-        "email": api_email if "@" in api_email and "." in api_email else "",
+        "phone": api_phone if _is_real_phone(api_phone) else "",
+        "email": api_email if _is_real_email(api_email) else "",
         "area": area,
         "undisclosed": not bool(spaces and any(s.get("monthly") for s in spaces)
                                 or total_monthly),
