@@ -424,6 +424,26 @@ function listen(taskId) {
     $("#startBtn").disabled = false; $("#stopBtn").style.display = "none";
     $("#stopBtn").disabled = false; $("#stopBtn").textContent = "终止任务"; };
 }
+
+/* 刷新/重开页面后自动恢复正在运行的任务：
+   服务端 /api/status 会返回当前 task_id，SSE 会先回放历史日志再接续直播。 */
+async function restoreRunningTask() {
+  try {
+    const st = await (await fetch("/api/status")).json();
+    if (!st.task_running || !st.task_id) return;
+    running = true;
+    $("#startBtn").disabled = true;
+    $("#stopBtn").style.display = "";
+    $("#stopBtn").disabled = false; $("#stopBtn").textContent = "终止任务";
+    $("#log").style.display = "block";
+    $("#log").textContent = "";
+    $("#shots").style.display = "flex";
+    if (st.current_step) appendLog(`[恢复] 任务正在后台执行：${st.current_step}`, "warn");
+    appendLog("[恢复] 已重新连接任务日志流（上方为刷新前的进度回放）。", "warn");
+    listen(st.task_id);
+  } catch {}
+}
+restoreRunningTask();
 function appendLog(msg, level) {
   const div = document.createElement("div");
   if (level) div.className = level;

@@ -17,7 +17,7 @@
   GET  /api/export?conclusion=导出核查结果 Excel（默认"通过"，12 列内嵌截图）
 """
 import asyncio
-import queue
+import time
 import uuid
 from pathlib import Path
 
@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from server import store
 from server import excel_export
 from server.steps import smarty
-from server.pipeline import (FEEDS, RUNNERS, start_task, task_running,
+from server.pipeline import (FEEDS, RUNNERS, start_task, task_running, active_task,
                              recheck_status, recheck_steps_34)
 
 BASE = Path(__file__).resolve().parent
@@ -126,9 +126,14 @@ def api_record_delete(record_id: int):
 
 @app.get("/api/status")
 def api_status():
-    """主任务与补充核查的运行状态（前端用它禁止任务进行中的人工判定）。"""
+    """主任务与补充核查的运行状态（前端用它禁止任务进行中的人工判定）。
+
+    附带当前任务 id 与步骤：页面刷新后靠它恢复运行界面、重连 SSE。"""
     st = recheck_status()
-    return {"task_running": task_running(), "recheck_running": st.get("running", False),
+    tid, runner = active_task()
+    return {"task_running": task_running(), "task_id": tid,
+            "current_step": getattr(runner, "current_step", "") or "",
+            "recheck_running": st.get("running", False),
             "recheck_record_id": st.get("record_id")}
 
 
@@ -334,22 +339,25 @@ def api_task_events(task_id: str):
         raise HTTPException(404, "任务不存在")
 
     def gen():
+        # 基于日志历史的游标推送：新连接先回放 history（刷新页面后能看到
+        # 之前的进度），再等新日志；任务完成且日志发完即结束。
+        idx = 0
         while True:
-            try:
-                ev = runner.events.get(timeout=15)
-            except queue.Empty:
-                if runner.done:
+            hist = runner.history
+            while idx < len(hist):
+                ev = hist[idx]
+                idx += 1
+                if ev.get("__done__"):
                     yield "event: done\ndata: {}\n\n"
                     return
-                yield ": ping\n\n"   # 心跳，防代理断连
-                continue
-            if ev.get("__done__"):
+                if "__screenshot__" in ev:
+                    yield "event: screenshot\n" + "data: " + _json(ev["__screenshot__"]) + "\n\n"
+                    continue
+                yield "data: " + _json(ev) + "\n\n"
+            if runner.done and idx >= len(runner.history):
                 yield "event: done\ndata: {}\n\n"
                 return
-            if "__screenshot__" in ev:
-                yield "event: screenshot\n" + "data: " + _json(ev["__screenshot__"]) + "\n\n"
-                continue
-            yield "data: " + _json(ev) + "\n\n"
+            time.sleep(0.4)   # 轮询日志历史，事件流低频足够
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",

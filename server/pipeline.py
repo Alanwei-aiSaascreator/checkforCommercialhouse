@@ -78,11 +78,17 @@ class TaskRunner:
         self.task_id = task_id
         self.params = params
         self.events: queue.Queue = queue.Queue()
+        self.history: list = []      # 全量日志（刷新页面后 SSE 从这里回放）
         self.done = False
         self.stopped = False
         self.current_record = 0      # 正在核查的记录 id（中止时用它兜底改判）
         self.current_step = ""       # 正在执行的步骤名（终止进度提示用）
         self._stop_at = 0.0
+
+    def _push(self, ev: dict) -> None:
+        """日志双写：队列供旧 SSE 消费，history 供刷新后回放。"""
+        self.history.append(ev)
+        self.events.put(ev)
 
     def stop(self) -> None:
         """协作式终止：当前操作完成后立即停止，不再处理后续候选。
@@ -94,8 +100,8 @@ class TaskRunner:
         self.stopped = True
         self._stop_at = time.time()
         step = self.current_step or "收尾"
-        self.events.put({"time": datetime.now().strftime("%H:%M:%S"), "level": "warn",
-                         "message": f"⏹ 已收到终止指令，当前步骤【{step}】正在安全收尾..."})
+        self._push({"time": datetime.now().strftime("%H:%M:%S"), "level": "warn",
+                    "message": f"⏹ 已收到终止指令，当前步骤【{step}】正在安全收尾..."})
 
         def _watch():
             for _ in range(40):            # 最多播报 ~2 分钟，防止异常悬挂时刷屏
@@ -106,14 +112,14 @@ class TaskRunner:
                     return
                 wait = int(time.time() - self._stop_at)
                 cur = self.current_step or "收尾"
-                self.events.put({"time": datetime.now().strftime("%H:%M:%S"), "level": "warn",
-                                 "message": f"⏹ 终止中（已等待 {wait}s）：当前在【{cur}】，"
-                                            f"完成后立即停止，不再处理后续候选..."})
+                self._push({"time": datetime.now().strftime("%H:%M:%S"), "level": "warn",
+                            "message": f"⏹ 终止中（已等待 {wait}s）：当前在【{cur}】，"
+                                       f"完成后立即停止，不再处理后续候选..."})
 
         threading.Thread(target=_watch, daemon=True).start()
 
     def emit(self, msg: str, level: str = "info") -> None:
-        self.events.put(
+        self._push(
             {"time": datetime.now().strftime("%H:%M:%S"), "level": level, "message": msg}
         )
 
@@ -138,9 +144,9 @@ class TaskRunner:
                     pass
             self.done = True
             if self.stopped:
-                self.events.put({"time": datetime.now().strftime("%H:%M:%S"),
-                                 "level": "warn", "message": "—— 任务已手动终止 ——"})
-            self.events.put({"__done__": True})
+                self._push({"time": datetime.now().strftime("%H:%M:%S"),
+                            "level": "warn", "message": "—— 任务已手动终止 ——"})
+            self._push({"__done__": True})
 
     def _run(self) -> None:
         p = self.params
@@ -256,7 +262,7 @@ class TaskRunner:
                     self.emit(f"步骤1结果（第{page_no}页）：{r1['message']}",
                               "pass" if r1["status"] == "pass" else "warn")
                     if visits == 1 and r1["screenshot"]:
-                        self.events.put({"__screenshot__": {"step": "step1", "path": r1["screenshot"]}})
+                        self._push({"__screenshot__": {"step": "step1", "path": r1["screenshot"]}})
                     # 反爬拦截：后面的页同样过不去，继续抽只是空转
                     if r1["status"] == "fail" and "拦截" in r1["message"]:
                         self.emit(f"{src_label} 被反爬拦截，停止自动搜索", "error")
@@ -390,7 +396,7 @@ class TaskRunner:
             r1 = _manual_candidates(manual_urls, source)
             self.emit(f"步骤1结果：{r1['message']}", "pass" if r1["status"] == "pass" else "warn")
             if r1["screenshot"]:
-                self.events.put({"__screenshot__": {"step": "step1", "path": r1["screenshot"]}})
+                self._push({"__screenshot__": {"step": "step1", "path": r1["screenshot"]}})
             if not r1["candidates"]:
                 self.emit("手动链接未解析出候选，任务结束", "warn")
                 return
@@ -946,6 +952,16 @@ _RECHECK: dict = {"running": False, "record_id": None}
 def task_running() -> bool:
     """是否有主核查任务还在跑（含收尾阶段）。"""
     return any(not r.done for r in RUNNERS.values())
+
+
+def active_task() -> tuple:
+    """当前运行中的任务 (task_id, runner)；没有运行任务时返回 ("", None)。
+
+    页面刷新后前端靠它找回 task_id，重新连接 SSE 继续看进度/终止任务。"""
+    for tid, r in RUNNERS.items():
+        if not r.done:
+            return tid, r
+    return "", None
 
 
 def recheck_status() -> dict:
