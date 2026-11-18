@@ -326,10 +326,10 @@ def _throttle() -> None:
         gap = _MIN_GAP * factor + random.uniform(0, _JITTER * factor)
         wait = _last_req["t"] + gap - time.time()
         if wait > 0:
-            time.sleep(wait)
+            browser.interruptible_sleep(wait)
         _last_req["n"] += 1
         if _last_req["n"] % _BURST == 0:
-            time.sleep((_COOL + random.uniform(0, 15)) * factor)
+            browser.interruptible_sleep((_COOL + random.uniform(0, 15)) * factor)
         _last_req["t"] = time.time()
         st["reqs"] = int(st.get("reqs", 0)) + 1
         _save_state(st)
@@ -344,7 +344,7 @@ def _cool_down(sec: float = 180.0) -> None:
         st = _load_state()
         st["blocks"] = int(st.get("blocks", 0)) + 1
         _save_state(st)
-        time.sleep(sec + random.uniform(0, 10))
+        browser.interruptible_sleep(sec + random.uniform(0, 10))
         _last_req["t"] = time.time()
 
 

@@ -112,6 +112,13 @@ class TaskRunner:
             return
         self.stopped = True
         self._stop_at = time.time()
+        # 立即置全局终止信号：让 loopnet 反爬冷却等长 sleep 立刻返回、
+        # goto_retry 立刻抛异常，而不是等 30s 才 force_kill 浏览器（
+        # 纯 time.sleep 根本不吃 force_kill，得靠这个信号打断）
+        try:
+            browser.request_stop()
+        except Exception:
+            pass
         step = self.current_step or "收尾"
         self._push({"time": datetime.now().strftime("%H:%M:%S"), "level": "warn",
                     "message": f"⏹ 已收到终止指令，当前步骤【{step}】正在安全收尾..."})
@@ -177,6 +184,10 @@ class TaskRunner:
             self._push({"__done__": True})
 
     def _run(self) -> None:
+        try:
+            browser.reset_stop()   # 新任务启动：清掉上次任务的终止标记
+        except Exception:
+            pass
         p = self.params
         city, state = p["city"], p["state"]
         price_min, price_max = int(p.get("price_min") or 0), int(p.get("price_max") or 2000)

@@ -647,15 +647,47 @@ def shot(page, tag: str) -> str:
         return ""
 
 
+# 全局任务终止信号：可中断长 sleep、让浏览器操作快速失败。
+# 根因：loopnet 反爬冷却 _cool_down(180) / _throttle(90s) 是纯 Python time.sleep，
+# 杀掉浏览器也打断不了它，终止时会被卡 3 分钟。置位后 interruptible_sleep 立即返回、
+# goto_retry 立即抛异常，工人线程几秒内退出。
+_stop_event = threading.Event()
+
+
+def reset_stop() -> None:
+    """新任务启动时清掉上次的终止标记。"""
+    _stop_event.clear()
+
+
+def request_stop() -> None:
+    """置终止信号：所有 interruptible_sleep 立即返回，goto_retry 快速失败。"""
+    _stop_event.set()
+
+
+def stop_requested() -> bool:
+    return _stop_event.is_set()
+
+
+def interruptible_sleep(seconds: float) -> None:
+    """可被 request_stop() 立即打断的 sleep，代替 time.sleep 做长冷却。"""
+    if seconds and seconds > 0:
+        _stop_event.wait(seconds)
+
+
 def goto_retry(page, url: str, timeout: int = 45000, wait: int = 4000, retries: int = 2):
-    """带重试的导航：反爬/网络抖动时多试几次，成功后静置 wait 毫秒等渲染。"""
+    """带重试的导航：反爬/网络抖动时多试几次，成功后静置 wait 毫秒等渲染。
+    任务终止后立即抛异常，不再把时间耗在无意义的重试上。"""
     last_exc = None
     for _ in range(retries + 1):
+        if stop_requested():
+            raise RuntimeError("任务已终止，导航中止")
         try:
             page.goto(url, timeout=timeout, wait_until="domcontentloaded")
             page.wait_for_timeout(wait)
             return page
         except Exception as e:
             last_exc = e
+            if stop_requested():
+                raise
             time.sleep(2)
     raise last_exc
