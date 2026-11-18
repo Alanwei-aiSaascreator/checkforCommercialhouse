@@ -805,7 +805,11 @@ class TaskRunner:
                                         agent=cand.get("agent", ""),
                                         email=cand.get("email", ""))
                 else:
-                    self.emit("  交叉查询未命中同楼盘挂牌，电话留空", "warn")
+                    if cross_lookup.engines_down():
+                        self.emit("  ⚠ 搜索引擎被限流（验证码熔断中），交叉查询暂停，电话留空"
+                                  "——熔断自动恢复后重跑可补上", "warn")
+                    else:
+                        self.emit("  交叉查询未命中同楼盘挂牌，电话留空", "warn")
 
             # 步骤2 Smarty
             if self.stopped:

@@ -125,15 +125,22 @@ def api_record_delete(record_id: int):
 # ---------- 运行状态 / 补充核查 ----------
 
 @app.get("/api/debug/last_task")
-def api_debug_last_task():
-    """临时调试：返回最近一个任务的完整日志历史（排查工人池用）。"""
-    if not RUNNERS:
-        return {"none": True}
-    tid = list(RUNNERS)[-1]
-    r = RUNNERS[tid]
+def api_debug_last_task(tid: str = "", keyword: str = "交叉"):
+    """临时调试：返回任务日志历史（排查交叉查询/工人池用）。
+
+    tid 空 = 列出全部任务摘要；keyword 为空返回全部日志尾部，否则只返回匹配行。"""
+    if not tid:
+        return {"tasks": [{"task_id": k, "done": v.done,
+                           "history_len": len(v.history)} for k, v in RUNNERS.items()]}
+    r = RUNNERS.get(tid)
+    if r is None:
+        raise HTTPException(404, "task not found")
+    hist = r.history
+    if keyword:
+        hist = [e for e in hist if keyword in e.get("message", "")]
     return {"task_id": tid, "done": r.done, "stopped": r.stopped,
-            "history_len": len(r.history),
-            "tail": r.history[-80:]}
+            "history_len": len(r.history), "matches": len(hist),
+            "tail": hist[:60]}
 
 
 @app.get("/api/status")

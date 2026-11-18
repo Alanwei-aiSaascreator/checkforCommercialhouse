@@ -27,16 +27,23 @@ from urllib.parse import quote, unquote
 from .. import browser
 from . import crexi, loopnet
 
-# 多工人共享节流：所有工人同出口 IP，DDG 查询过密会触发验证码
+# 多工人共享节流：所有工人同出口 IP，DDG/Bing 查询过密会触发验证码。
+# 4 工人任务实测把两家引擎都打到验证码 → 间隔必须足够大（8s/次全队共享，
+# 约合 7.5 次/分钟——引擎限流阈值之下）。
 _ddg_lock = threading.Lock()
 _ddg_last = 0.0
-_DDG_MIN_INTERVAL = 3.0
+_DDG_MIN_INTERVAL = 8.0
 # 引擎熔断：引擎弹验证码后停用一段时间（期间交叉查询直接跳过该引擎，
 # 不再白开浏览器），冷却后自动恢复
 _engine_down = {"ddg": 0.0, "bing": 0.0}
 _ENGINE_COOLDOWN = 1800.0
+# DDG 的验证页文案实测是 "Unfortunately, bots use DuckDuckGo too. Please
+# complete the following challenge..."（选鸭子），与 Bing 的措辞不同——
+# 词表必须两家都覆盖，否则熔断不触发、引擎被持续白打
 _CHALLENGE_MARKS = ("solve the challenge", "unusual traffic",
-                    "are you a robot", "verify you are human")
+                    "are you a robot", "verify you are human",
+                    "bots use duckduckgo", "confirm this search was made",
+                    "select all squares")
 
 
 def _engine_ok(name: str) -> bool:
@@ -248,3 +255,9 @@ def lookup_contact(address: str, exclude_source: str = "", tag: str = "cross") -
         if r.get("phone"):
             return r
     return {}
+
+
+def engines_down() -> bool:
+    """两个搜索引拍是否都处于验证码熔断中（pipeline 用它把'未命中'和
+    '被限流'区分开——前者是正常结果，后者是暂时故障）。"""
+    return not (_engine_ok("ddg") or _engine_ok("bing"))
