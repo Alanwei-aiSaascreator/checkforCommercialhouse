@@ -289,6 +289,9 @@ _MIN_GAP = 12.0       # 相邻两次请求的最小间隔（秒）
 _JITTER = 4.0         # 随机抖动，避免固定间隔本身成为机器特征
 _BURST = 3            # 连续请求达到该次数后插入一次长冷却
 _COOL = 90.0          # 长冷却时长（秒）
+# 详情页熔断阈值：当天详情页被 Akamai 拦满该次数后，后续详情页直接降级秒回，
+# 不再一条条撞额度（额度按"出口 IP + 天"累计，撞了也白撞）。搜索页不受影响。
+_DETAIL_BLOCK_LIMIT = 3
 # 当日请求/被拦次数落盘：Akamai 的额度按「出口 IP + 天」累计，跨任务、跨重启都算，
 # 只放内存的话重启一次就归零，等于反复把已经烧掉的配额再撞一遍。
 _STATE = config.DATA_DIR / "loopnet_state.json"
@@ -594,21 +597,28 @@ def fetch_broker_info(listing_url: str) -> dict:
             "blocked": False}
     if not listing_url:
         return info
+    # 详情页熔断：当天详情页被拦满阈值后，后续详情页直接降级秒回，不再撞额度。
+    # （date 换天时 _load_state 自动归零恢复）
+    if int(_load_state().get("detail_blocks", 0)) >= _DETAIL_BLOCK_LIMIT:
+        info["blocked"] = True
+        return info
     page = browser.new_page_in(_PROFILE)
     try:
         # 固定空等 5s 太贵：DOMContentLoaded 后 3s 足够渲染价格/套间表
         # （提速只压"无意义空等"，不提高请求频率，反爬策略不变）
         _throttle()
+        _warmup(page)   # 首页预热：与搜索页一致先落主页再进详情页，降低"直开深层链接"的 bot 评分
+        _throttle()
         browser.goto_retry(page, listing_url, timeout=45000, wait=3000)
         if _blocked(page):
-            # 详情页同样会被速率拦截：冷却后重试一次，仍失败就标记，
-            # 避免把「被拦」当成「无价格/无面积」直接误判淘汰
-            _cool_down(180)
-            _throttle()
-            browser.goto_retry(page, listing_url, timeout=45000, wait=6000, retries=1)
-            if _blocked(page):
-                info["blocked"] = True
-                return info
+            # 详情页被拦：不再冷却 180s 重试——Akamai 是速率/节奏判定，额度烧完后
+            # 冷却再撞照样被拒，只会把 4 个工人各卡 3 分钟（"补抓详情页一直过不去"
+            # 的根因）。立即降级：套间价走 Crexi 接口兜底，电话走交叉查询补。
+            st = _load_state()
+            st["detail_blocks"] = int(st.get("detail_blocks", 0)) + 1
+            _save_state(st)
+            info["blocked"] = True
+            return info
         text = page.evaluate("() => document.body.innerText.slice(0, 8000)")
         info["price"] = _parse_price(text)
         info["agent"] = _parse_broker(text)
