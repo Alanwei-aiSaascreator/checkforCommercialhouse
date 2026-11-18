@@ -8,8 +8,10 @@ from . import commercialcafe as _cc
 
 _BASE = "https://www.commercialsearch.com"
 DETAIL_IS_PRICE_SOURCE = True
-PAGE_OK_SIGNAL = True              # 复用 commercialcafe 的 page_ok 页码标记
-PAGES_ESTIMATE_UNRELIABLE = True   # 同上：条数估值不可信，需要二分探真实末页
+# 实测（2026-11-18）：commercialsearch.com 完全忽略翻页参数（?Page=5 和
+# &page=5 返回的都是第 1 页的同样房源，大小写都无效）——管线按 SINGLE_PAGE_ONLY
+# 只采第 1 页，否则会拿虚高的条数估值（4868 条 → "163 页"）把同一批房源翻 163 遍
+SINGLE_PAGE_ONLY = True
 
 
 def search_candidates(city: str, state: str, price_min: int, price_max: int,

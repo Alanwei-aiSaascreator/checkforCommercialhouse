@@ -205,6 +205,10 @@ class TaskRunner:
             - 本源被反爬拦截/地区无覆盖时只结束本源，不影响其他源继续跑
             """
             _feed, _label, _domain = feed_of(source_key)
+            # 单页源：站点完全忽略翻页参数（实测 commercialsearch.com 用大小写
+            # Page/page 都返回第 1 页的同样内容），只采第 1 页，绝不空转翻页
+            single_page = bool(getattr(_feed, "SINGLE_PAGE_ONLY", False))
+            no_new_streak = 0          # 连续多少页无全新候选（第 2 页起计）
             # 各源每页条数不同：Crexi 60 / CityFeet 30 / Commercial* 30 / LoopNet 40
             per_page = {"crexi": 60, "cityfeet": 30, "commercialcafe": 30,
                         "commercialsearch": 30}.get(source_key, 40)
@@ -326,7 +330,12 @@ class TaskRunner:
                     # 正常页（非 404）落库为「已检查」，后续任务随机跳页时直接跳过
                     store.page_mark(skey, page_no)
                     seen_pages.add(page_no)
-                    if not total_pages and r1.get("total_pages"):
+                    if single_page:
+                        if total_pages != 1:
+                            total_pages = 1
+                            self.emit(f"  {_label} 站点忽略翻页参数（每页都是第 1 页内容），"
+                                      f"只采集第 1 页", "warn")
+                    elif not total_pages and r1.get("total_pages"):
                         est = int(r1["total_pages"])
                         if (est > 1 and getattr(_feed, "PAGES_ESTIMATE_UNRELIABLE", False)
                                 and getattr(_feed, "PAGE_OK_SIGNAL", False)):
@@ -363,8 +372,16 @@ class TaskRunner:
                     if skip_known or skip_failed:
                         self.emit(f"  第{page_no}页剔除：已收录 {skip_known} 个 / 失败档案 {skip_failed} 个", "warn")
                     if not fresh:
+                        if page_no > 1:
+                            no_new_streak += 1
+                            if no_new_streak >= 5:
+                                self.emit(f"{_label} 连续 {no_new_streak} 页无全新候选"
+                                          f"（站点翻页疑似失效，每页返回同一批房源），"
+                                          f"本源提前停止采集，其余源继续", "warn")
+                                return
                         self.emit(f"第 {page_no} 页无全新候选，继续随机换页...", "warn")
                         continue
+                    no_new_streak = 0
                     # seen_addrs 的登记已移交给外层轮询生成器（yield 时登记）：
                     # 内层这里如果先登记，外层的跨源去重会把整批误判成"已见过"，
                     # 一条候选都出不去（实测 Tacoma 任务 0 记录的根因）

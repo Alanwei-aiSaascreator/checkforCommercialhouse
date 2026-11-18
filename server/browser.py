@@ -140,26 +140,44 @@ def _note_profile(profile_dir) -> None:
             _watchdog_started = True
             threading.Thread(target=_watchdog_loop, daemon=True,
                              name="chrome-focus-watchdog").start()
+            threading.Thread(target=_pid_refresh_loop, daemon=True,
+                             name="chrome-pid-refresher").start()
+
+
+# dir → 该配置目录当前的全部 Chrome 进程号（快循环只读，慢循环写）
+_pid_cache: dict = {}
 
 
 def _watchdog_loop():
-    cache: dict = {}          # dir → (取样时间, pids)
+    """快循环：纯 Win32 压制，0.4s 一轮，**绝不在循环里跑 PowerShell**。
+
+    旧版把 PowerShell 进程号刷新和压制串在一个循环里：6 个浏览器实例时
+    光刷新就要 5~10s，新窗口长时间没人压——实测这正是任务栏图标反复出现、
+    焦点被反复抢走的元凶。现在压制用缓存进程号（毫秒级），进程号由
+    _pid_refresh_loop 每 10s 单独刷新。
+    """
     while True:
-        now = time.time()
-        dirs = list(_profile_registry)
-        # 进程号每 20s 刷新一次（PowerShell 查询较贵），窗口压制每轮都做
-        stale = [d for d in dirs
-                 if d not in cache or now - cache[d][0] > 20]
-        for d in stale:
-            cache[d] = (now, _profile_pids(d))
-        for d in dirs:
-            pids = cache.get(d, (0, set()))[1]
-            if pids:
-                try:
-                    _minimize_chrome_window(pids)
-                except Exception:
-                    pass
-        time.sleep(2)
+        with _watchdog_lock:
+            snapshot = {d: p for d, p in _pid_cache.items() if p}
+        for _d, pids in snapshot.items():
+            try:
+                _minimize_chrome_window(pids)
+            except Exception:
+                pass
+        time.sleep(0.4)
+
+
+def _pid_refresh_loop():
+    """慢循环：每 10s 轮流用 PowerShell 刷新各配置目录的 Chrome 进程号。"""
+    while True:
+        for d in list(_profile_registry):
+            try:
+                pids = _profile_pids(d)
+            except Exception:
+                continue
+            with _watchdog_lock:
+                _pid_cache[d] = pids
+        time.sleep(10)
 
 
 def _minimize_context(context, profile_dir=None):
@@ -249,13 +267,32 @@ def _stop_pw():
 
 def _launch(profile_dir, **extra):
     try:
-        return _state().pw.chromium.launch_persistent_context(str(profile_dir), **extra)
+        ctx = _state().pw.chromium.launch_persistent_context(str(profile_dir), **extra)
+        _harden_context(ctx)
+        return ctx
     except Exception as e:
         if _is_profile_locked_error(e):
             # 上次任务残留的 Chrome 还锁着配置目录 → 精确清理后重试一次
             _kill_stale_profile_chrome(str(profile_dir))
-            return _state().pw.chromium.launch_persistent_context(str(profile_dir), **extra)
+            ctx = _state().pw.chromium.launch_persistent_context(str(profile_dir), **extra)
+            _harden_context(ctx)
+            return ctx
         raise
+
+
+def _harden_context(ctx):
+    """页面级防弹窗：中和 window.open / window.focus。
+
+    商业地产站（CommercialCafe/CommercialSearch/CityFeet 家族）广告弹窗很多，
+    每个 JS 弹窗 = 一个新 OS 窗口 = 抢一次前台 + 任务栏闪烁一次。在页面脚本
+    层直接把 window.open 废掉、window.focus 变空操作——弹窗从源头不再产生，
+    我们的页面全部用 page.goto 导航，不受影响。"""
+    try:
+        ctx.add_init_script(
+            "window.open = function(){return null;};\n"
+            "window.focus = function(){};")
+    except Exception:
+        pass
 
 
 def _alive() -> bool:
@@ -376,6 +413,7 @@ def new_page_in(profile_name: str):
                         str(d), channel="chrome", **_launch_kw(background=True))
                 else:
                     ctx = st.pw.chromium.launch_persistent_context(str(d), **_launch_kw(background=True))
+            _harden_context(ctx)
             page = ctx.new_page()
             extra[profile_name] = ctx
             _minimize_context(ctx, d)
