@@ -73,8 +73,11 @@ def _minimize_chrome_window(pids):
                                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE)
         except Exception:
             pass
-        # 无激活最小化（SW_SHOWMINNOACTIVE）
-        user32.ShowWindow(hwnd, 7)
+        # 彻底隐藏窗口（SW_HIDE=0），而不是 SW_SHOWMINNOACTIVE=7（那是"显示但不
+        # 激活"，窗口仍在屏幕上、仍可能被页面/弹窗重新激活抢焦点）。SW_HIDE 后
+        # 窗口不在屏幕、不在任务栏、不接键盘焦点，配合上面的"禁用后台渲染节流"
+        # 参数，隐藏窗口照常渲染、截图正常。
+        user32.ShowWindow(hwnd, 0)
 
 
 def _kill_stale_profile_chrome(profile_dir: str) -> None:
@@ -281,16 +284,26 @@ def _launch(profile_dir, **extra):
 
 
 def _harden_context(ctx):
-    """页面级防弹窗：中和 window.open / window.focus。
+    """页面级防弹窗 + 防抢焦点：中和一切会新开窗口/弹对话框/抢焦点的 API。
 
     商业地产站（CommercialCafe/CommercialSearch/CityFeet 家族）广告弹窗很多，
-    每个 JS 弹窗 = 一个新 OS 窗口 = 抢一次前台 + 任务栏闪烁一次。在页面脚本
-    层直接把 window.open 废掉、window.focus 变空操作——弹窗从源头不再产生，
+    每个弹窗 = 一个新 OS 窗口 = 抢一次前台 + 任务栏闪烁。在页面脚本层直接：
+    * window.open / window.focus / window.blur 废掉（弹窗不产生、页面不抢焦点）；
+    * alert / confirm / prompt / print 废掉（原生模态对话框一弹就抢键盘焦点、
+      阻塞执行，是"任务一跑就打不了字"的主因之一）；
+    * 兜底：若仍有绕过脚本层的原生 dialog，Playwright 层自动 accept 关掉。
     我们的页面全部用 page.goto 导航，不受影响。"""
     try:
         ctx.add_init_script(
             "window.open = function(){return null;};\n"
-            "window.focus = function(){};")
+            "window.focus = function(){};\n"
+            "window.blur = function(){};\n"
+            "window.alert = function(){};\n"
+            "window.confirm = function(){return true;};\n"
+            "window.prompt = function(){return null;};\n"
+            "window.print = function(){};")
+        ctx.on("dialog", lambda d: (d.accept() if d.type != "beforeunload"
+                                    else d.dismiss()))
     except Exception:
         pass
 
@@ -358,9 +371,16 @@ def _launch_kw(background=False, **extra):
             "--disable-session-crashed-bubble",
             "--disable-crash-reporter"]
     if background:
-        # 保留有头渲染以支持 Google Maps/WebGL；窗口移到屏幕外并最小化，
+        # 保留有头渲染以支持 Google Maps/WebGL；窗口彻底隐藏（SW_HIDE），
         # 不创建无头窗口，避免街景画布在 headless 下出现黑屏。
-        args.extend(["--start-minimized", "--window-position=-32000,-32000"])
+        args.extend(["--start-minimized", "--window-position=-32000,-32000",
+                     # 窗口隐藏/移出屏幕后 Chrome 会判定"被遮挡/后台"而暂停
+                     # 渲染与定时器（街景 WebGL 会停 → 截图黑屏）。禁用这些
+                     # 节流/遮挡检测，让隐藏窗口照常渲染，彻底隐藏也不黑屏。
+                     "--disable-background-timer-throttling",
+                     "--disable-backgrounding-occluded-windows",
+                     "--disable-renderer-backgrounding",
+                     "--disable-features=CalculateNativeWinOcclusion"])
     kw = dict(headless=False, viewport=VIEWPORT, locale="en-US", args=args)
     if config.PROXY_URL:
         kw["proxy"] = {"server": config.PROXY_URL}

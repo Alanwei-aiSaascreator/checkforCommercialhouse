@@ -10,6 +10,16 @@ foreach ($p in $old) {
     Write-Output ("killing old service PID=" + $p.ProcessId)
     Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
 }
+
+# 杀掉本项目残留的 Chrome（命令行里带本项目路径的 user-data-dir）。
+# 旧脚本只杀 python、从不杀 Chrome，导致每次重启旧浏览器窗口都挂着，
+# 几十轮累积出上百个进程（实测一次清理到 146 个）——这就是"一堆窗口"的来源。
+$chromes = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |
+    Where-Object { $_.CommandLine -match [regex]::Escape($proj) }
+foreach ($p in $chromes) {
+    Write-Output ("killing stale chrome PID=" + $p.ProcessId)
+    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+}
 Start-Sleep -Seconds 2
 
 $p = Start-Process -FilePath (Join-Path $proj '.venv\Scripts\python.exe') -ArgumentList 'run.py' `
