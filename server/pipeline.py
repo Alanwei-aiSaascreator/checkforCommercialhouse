@@ -585,9 +585,16 @@ class TaskRunner:
             if self.stopped:
                 return
             if cand.get("listing_url") and need_detail:
-                self.current_step = "补抓详情页"
-                self.emit("补抓详情页（价格/经纪人/面积/套间表）...")
-                info = c_feed.fetch_broker_info(cand.get("listing_url", ""))
+                if getattr(c_feed, "NO_DETAIL_PAGE", False):
+                    # 改架构：该源（LoopNet）只出候选不抓详情页，额度留给搜索页。
+                    # info 置空 → spaces=[] 走 Crexi 接口兜底；电话走交叉查询 Crexi 通道。
+                    self.emit(f"  {c_label} 不抓详情页（额度留给搜索页），"
+                              f"价格/套间走 Crexi 兜底、电话走交叉查询")
+                    info = {}
+                else:
+                    self.current_step = "补抓详情页"
+                    self.emit("补抓详情页（价格/经纪人/面积/套间表）...")
+                    info = c_feed.fetch_broker_info(cand.get("listing_url", ""))
                 if info.get("gone"):
                     # 挂牌已下架：站点重定向到搜索兜底页，上面的数据是别人的房源
                     # （实测 10 栋楼全被安上同一个 "From $150/MO + 69 SF"）。
@@ -831,7 +838,7 @@ class TaskRunner:
             _ph = officespace.OFFICIAL_CONTACT
             if not str(cand.get("phone") or "").strip() or cand.get("phone") == _ph:
                 self.current_step = "跨源交叉查询经纪人电话"
-                self.emit("  本源未提供经纪人电话 → 跨数据源交叉查询（LoopNet/Crexi）...")
+                self.emit("  本源未提供经纪人电话 → 跨数据源交叉查询（Crexi 登录态详情页）...")
                 try:
                     cr = cross_lookup.lookup_contact(addr, exclude_source=c_source)
                 except Exception as e:

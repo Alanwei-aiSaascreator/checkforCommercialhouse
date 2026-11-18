@@ -183,43 +183,13 @@ def _card_matches(card_text: str, num: str, words: list) -> bool:
 
 
 def _via_loopnet(address: str, tag: str) -> dict:
-    """DDG 站内搜索 LoopNet 挂牌 → 地址校验 → 详情页抓电话/邮箱。"""
-    global _ddg_last
-    num, words = _addr_tokens(address)
-    if not num:
-        return {}
-    with _ddg_lock:
-        wait = _ddg_last + _DDG_MIN_INTERVAL - time.time()
-        if wait > 0:
-            time.sleep(wait)
-        try:
-            results = _search_listings(f'site:loopnet.com "{address}"')
-        except Exception:
-            results = []
-        _ddg_last = time.time()
-    hit = ""
-    for r in results:
-        u = str(r.get("u") or "")
-        if "loopnet.com" not in u:
-            continue
-        hay = f"{r.get('t', '')} {r.get('snip', '')} {u}"
-        if _card_matches(hay, num, words):
-            hit = u
-            break
-    if not hit:
-        return {}
-    try:
-        info = loopnet.fetch_broker_info(hit) or {}
-    except Exception:
-        return {}
-    if info.get("blocked"):
-        return {}
-    phone = info.get("phone") or ""
-    # LoopNet 详情页经纪人名偶尔抓成 "Call Yash Patel" → 去掉 Call 前缀
-    agent = re.sub(r"^call\s+", "", info.get("agent") or "", flags=re.I).strip()
-    email = info.get("email") or ""
-    return {"source": "loopnet", "listing_url": hit,
-            "agent": agent, "phone": phone, "email": email}
+    """已停用：改架构后 LoopNet 不再开详情页（Akamai 额度只留给搜索页出候选）。
+
+    原来这里 DDG 搜 LoopNet → loopnet.fetch_broker_info 开详情页抓电话，但详情页
+    停用后拿不到电话；而 DDG 搜索命中 LoopNet 直链后也无法落地。直接返回空，
+    电话/经纪人改由 _via_crexi（Crexi 登录态详情页）补。保留函数签名避免调用方改动。
+    """
+    return {}
 
 
 def _via_crexi(address: str) -> dict:
@@ -240,16 +210,12 @@ def _via_crexi(address: str) -> dict:
 def lookup_contact(address: str, exclude_source: str = "", tag: str = "cross") -> dict:
     """按地址交叉查经纪人联系方式。返回 {} 表示没查到。
 
-    顺序：LoopNet（电话公开、卡片自带）→ Crexi（登录态详情页）。
+    顺序：Crexi（登录态详情页）。LoopNet 详情页通道已停用（额度留给搜索页出候选）。
     exclude_source：跳过与当前记录相同的源（本源自己都拿不到，别再查一遍）。
     """
     addr = (address or "").strip()
     if not addr or not re.search(r"\d", addr):
         return {}
-    if exclude_source != "loopnet" and (_engine_ok("ddg") or _engine_ok("bing")):
-        r = _via_loopnet(addr, tag)
-        if r.get("phone"):
-            return r
     if exclude_source != "crexi":
         r = _via_crexi(addr)
         if r.get("phone"):
