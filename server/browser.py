@@ -57,19 +57,21 @@ def _minimize_chrome_window(pids):
         return True
 
     user32.EnumWindows(callback, 0)
-    SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE, SWP_FRAMECHANGED = \
-        0x0010, 0x0004, 0x0001, 0x0020
+    SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE = 0x0010, 0x0004, 0x0001
+    SWP_FRAMECHANGED, SWP_HIDEWINDOW = 0x0020, 0x0080
     HWND_BOTTOM = 1
     GWL_EXSTYLE = -20
     WS_EX_TOOLWINDOW = 0x00000080    # 工具窗口：不出现在任务栏
+    WS_EX_APPWINDOW = 0x00040000    # 应用窗口：强制显示任务栏按钮
     WS_EX_NOACTIVATE = 0x08000000    # 不接收键盘焦点（点它也不抢）
     for hwnd in hwnds:
         # 设为工具窗口 + 不激活窗口：从任务栏图标里消失，且系统层面
         # 永远不把键盘焦点交给它（用户要求：全程不碰我的鼠标键盘）
         try:
             ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                                  ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+            user32.SetWindowLongW(
+                hwnd, GWL_EXSTYLE,
+                (ex & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
         except Exception:
             pass
         # 无激活移出屏幕（不改变 Z 序、不抢焦点）；SWP_FRAMECHANGED 让上面
@@ -77,7 +79,7 @@ def _minimize_chrome_window(pids):
         try:
             user32.SetWindowPos(hwnd, HWND_BOTTOM, -32000, -32000, 0, 0,
                                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE |
-                                SWP_FRAMECHANGED)
+                                SWP_FRAMECHANGED | SWP_HIDEWINDOW)
         except Exception:
             pass
         # 彻底隐藏窗口（SW_HIDE=0），而不是 SW_SHOWMINNOACTIVE=7（那是"显示但不
@@ -101,7 +103,8 @@ def _kill_stale_profile_chrome(profile_dir: str) -> None:
           "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
     try:
         subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                       capture_output=True, timeout=25)
+                       capture_output=True, timeout=25,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
         time.sleep(1.5)          # 等文件锁释放
     except Exception:
         pass
@@ -126,7 +129,8 @@ def _profile_pids(profile_dir: str) -> set:
           "Select-Object -ExpandProperty ProcessId")
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                             capture_output=True, text=True, timeout=30).stdout
+                             capture_output=True, text=True, timeout=30,
+                             creationflags=subprocess.CREATE_NO_WINDOW).stdout
         return {int(x) for x in out.split() if x.strip().isdigit()}
     except Exception:
         return set()
@@ -146,7 +150,8 @@ def _all_profile_pids() -> dict:
     ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
           "ForEach-Object { $_.ProcessId.ToString() + '|' + $_.CommandLine }")
     out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                         capture_output=True, text=True, timeout=30).stdout
+                         capture_output=True, text=True, timeout=30,
+                         creationflags=subprocess.CREATE_NO_WINDOW).stdout
     mapping: dict = {}
     for line in out.splitlines():
         if "|" not in line:
