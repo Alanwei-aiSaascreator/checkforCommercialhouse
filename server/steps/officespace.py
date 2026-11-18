@@ -341,6 +341,20 @@ def fetch_broker_info(listing_url: str) -> dict:
         if not lines:
             return info
 
+        # 下架/失效挂牌检测：OfficeSpace 把失效详情页重定向到「搜索兜底页」
+        # （页面写 "Alternatively, start a new search below"，内容是别人的
+        # 房源列表）。实测 10 栋不同大楼全解析出同样的 "From $150/MO + 69 SF"
+        # ——全是兜底页上第一条房源的数据。检测到就返回空 info，绝不能把
+        # 兜底页的报价安到这个地址头上。
+        low_all = text.lower()
+        listing_id = (listing_url or "").rstrip("/").rsplit("/", 1)[-1]
+        redirected = bool(listing_id) and listing_id not in (pg.url or "")
+        if (redirected or "start a new search below" in low_all
+                or "no longer available" in low_all
+                or "listing not found" in low_all):
+            info["gone"] = True
+            return info
+
         # 地址：详情页首部的「门牌, 街名, 城市, 州 邮编」
         for ln in lines[:12]:
             if re.fullmatch(r"\d{1,6}.*,\s*[A-Z]{2}\s+\d{5}", ln):

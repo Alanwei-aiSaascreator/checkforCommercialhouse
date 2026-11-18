@@ -122,13 +122,55 @@ def _profile_pids(profile_dir: str) -> set:
         return set()
 
 
+# ---------- 全局常驻看护 ----------
+# 单次 context 只看护 ~20s：Aux 道浏览器可能在任务开始几分钟后才首次启动、
+# Chrome 崩溃后自愈重启、页内弹窗晚出现——这些"晚到的窗口"没人压，实测
+# 仍会抢焦点。改为：登记所有我们用过的配置目录，常驻线程 2s 巡检一次，
+# 窗口出现最多 2 秒内必被压住（工具窗口 + 不激活 + 屏幕外最小化）。
+_profile_registry: set = set()
+_watchdog_lock = threading.Lock()
+_watchdog_started = False
+
+
+def _note_profile(profile_dir) -> None:
+    global _watchdog_started
+    with _watchdog_lock:
+        _profile_registry.add(str(profile_dir))
+        if not _watchdog_started:
+            _watchdog_started = True
+            threading.Thread(target=_watchdog_loop, daemon=True,
+                             name="chrome-focus-watchdog").start()
+
+
+def _watchdog_loop():
+    cache: dict = {}          # dir → (取样时间, pids)
+    while True:
+        now = time.time()
+        dirs = list(_profile_registry)
+        # 进程号每 20s 刷新一次（PowerShell 查询较贵），窗口压制每轮都做
+        stale = [d for d in dirs
+                 if d not in cache or now - cache[d][0] > 20]
+        for d in stale:
+            cache[d] = (now, _profile_pids(d))
+        for d in dirs:
+            pids = cache.get(d, (0, set()))[1]
+            if pids:
+                try:
+                    _minimize_chrome_window(pids)
+                except Exception:
+                    pass
+        time.sleep(2)
+
+
 def _minimize_context(context, profile_dir=None):
     """在启动、开页和导航后持续压制 Chrome 抢前台。
 
     Chrome 新开窗口/弹窗时会把自己提到最前并抢走键盘焦点；启动后前 20 秒
     最容易反复发生（步骤切换、辅助浏览器弹出）。这里用看护线程在窗口出现
     的第一时间无激活移出屏幕并最小化 + 设为工具窗口，全程不碰用户的鼠标、
-    焦点和任务栏。
+    焦点和任务栏。同时把配置目录登记进全局常驻看护（_watchdog_loop），
+    20 秒之外的任何新窗口（Aux 道晚启动、Chrome 崩溃重启、歇了的弹窗）
+    也会被 2 秒一次的巡检压住——实测只靠单次 20s 看护仍会漏抢焦点。
     """
     pids = getattr(context, "_our_pids", None)
     if not pids and profile_dir:
@@ -137,6 +179,8 @@ def _minimize_context(context, profile_dir=None):
             context._our_pids = pids
         except Exception:
             pass
+    if profile_dir:
+        _note_profile(profile_dir)
 
     def minimize_later():
         # 指数退避看护 ~20s：前 1 秒内 0.05/0.15/0.4 三连压（Chrome 首帧和

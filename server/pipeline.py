@@ -545,6 +545,13 @@ class TaskRunner:
                 self.current_step = "补抓详情页"
                 self.emit("补抓详情页（价格/经纪人/面积/套间表）...")
                 info = c_feed.fetch_broker_info(cand.get("listing_url", ""))
+                if info.get("gone"):
+                    # 挂牌已下架：站点重定向到搜索兜底页，上面的数据是别人的房源
+                    # （实测 10 栋楼全被安上同一个 "From $150/MO + 69 SF"）。
+                    # 丢弃详情数据，按卡片价继续（真实报价走 Crexi 套间兜底）。
+                    self.emit("  挂牌已下架（站点跳转搜索兜底页），丢弃详情数据",
+                              "warn")
+                    info = {}
                 if info.get("blocked"):
                     # 详情页被速率拦截：字段缺失是"没抓到"而不是"房源没写"，
                     # 日志里必须区分，否则看结果的人会误以为这套房真没有价格
