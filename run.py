@@ -313,17 +313,21 @@ def api_known_export():
 
 @app.post("/api/tasks")
 def api_task_start(body: dict):
-    source = (body.get("source") or "loopnet").strip().lower()
-    if source not in FEEDS:
-        raise HTTPException(400, "source 只能是 " + " / ".join(FEEDS.keys()))
+    # 数据源支持多选："loopnet" 或 "loopnet,crexi,..."（流水线按页轮询汇流）
+    raw = str(body.get("source") or "loopnet")
+    sel = [s.strip().lower() for s in raw.split(",") if s.strip()] or ["loopnet"]
+    bad = [s for s in sel if s not in FEEDS]
+    if bad:
+        raise HTTPException(400, "未知数据源：" + ",".join(bad)
+                            + "（可选：" + " / ".join(FEEDS.keys()) + "）")
     params = {
         "city": (body.get("city") or "").strip(),
         "state": (body.get("state") or "").strip().upper(),
         "price_min": body.get("price_min") or 0,
         "price_max": body.get("price_max") or 2000,
-        "target": body.get("target") or 3,
+        "target": min(int(body.get("target") or 3), 100),
         "listing_urls": body.get("listing_urls") or "",
-        "source": source,
+        "source": ",".join(sel),
     }
     if not params["city"] or not params["state"]:
         raise HTTPException(400, "城市和州缩写必填")

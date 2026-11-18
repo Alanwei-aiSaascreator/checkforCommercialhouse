@@ -56,14 +56,22 @@ def _minimize_chrome_window(pid):
     user32.EnumWindows(callback, 0)
     SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE = 0x0010, 0x0004, 0x0001
     HWND_BOTTOM = 1
+    GWL_EXSTYLE = -20
+    WS_EX_TOOLWINDOW = 0x00000080    # 工具窗口：不出现在任务栏
     for hwnd in hwnds:
+        # 设为工具窗口：从任务栏图标里消失（用户要求：任务跑起来不要占一排任务栏）
+        try:
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW)
+        except Exception:
+            pass
         # 无激活移出屏幕（不改变 Z 序、不抢焦点）
         try:
             user32.SetWindowPos(hwnd, HWND_BOTTOM, -32000, -32000, 0, 0,
                                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE)
         except Exception:
             pass
-        # 无激活最小化到任务栏
+        # 无激活最小化（SW_SHOWMINNOACTIVE）
         user32.ShowWindow(hwnd, 7)
 
 

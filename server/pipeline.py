@@ -154,29 +154,34 @@ class TaskRunner:
         city, state = p["city"], p["state"]
         price_min, price_max = int(p.get("price_min") or 0), int(p.get("price_max") or 2000)
         target = int(p.get("target") or 3)
-        # 步骤1 数据源：LoopNet（默认）/ Crexi / CityFeet …（见 FEEDS 注册表）
-        source = (p.get("source") or "loopnet").strip().lower()
+        # 步骤1 数据源：支持单源（"loopnet"）或多源（"loopnet,crexi,commercialsearch"，
+        # 前端多选）。多源按页轮询汇入同一条流水线，候选按归一化地址去重。
+        sources = [s.strip().lower() for s in (p.get("source") or "loopnet").split(",") if s.strip()]
+        sources = [s for s in sources if s in FEEDS] or ["loopnet"]
+        source = sources[0]
         feed, src_label, _domain = feed_of(source)
         known_count = store.count_known()
         self.emit(f"开始核查：{city}, {state}，价格 ${price_min}-${price_max}/月，目标 {target} 个地址；"
-                  f"步骤1 数据源：{src_label}；收录表共 {known_count} 条")
+                  f"步骤1 数据源：{' + '.join(feed_of(s)[1] for s in sources)}"
+                  f"（{len(sources)} 个源轮询）；收录表共 {known_count} 条")
 
         manual_urls = [u for u in (p.get("listing_urls") or "").replace("\r", "").split("\n") if u.strip()]
         approved = 0
         seen_addrs: set = set()
 
-        def _auto_candidate_stream():
-            """自动搜索：先探出真实总页数，然后把「所有未检查过的页」打乱顺序全部遍历，
-            每页先把"已收录/失败档案"的地址剔除，只产出全新候选。
+        def _source_stream(source_key: str):
+            """单数据源的候选流：先探出真实总页数，然后把「所有未检查过的页」打乱
+            顺序全部遍历，每页先把"已收录/失败档案"的地址剔除，产出 (源, 批) 元组。
 
             - 不再抽固定数量页：一次排队全部页，顺序随机（用户要求"全查但顺序随机"）
-            - 跨任务记住查过的页，下次从没查过的页里随机排在前面
-            - 一直跑到「达到目标通过数」或「所有页都跑完」为止
+            - 跨任务记住查过的页，下次从没查过的页里随机排在前面（断点续跑的基础）
+            - 本源被反爬拦截/地区无覆盖时只结束本源，不影响其他源继续跑
             """
+            _feed, _label, _domain = feed_of(source_key)
             # 各源每页条数不同：Crexi 60 / CityFeet 30 / Commercial* 30 / LoopNet 40
             per_page = {"crexi": 60, "cityfeet": 30, "commercialcafe": 30,
-                        "commercialsearch": 30}.get(source, 40)
-            skey = store.page_key(city, state, price_min, price_max, source=source)
+                        "commercialsearch": 30}.get(source_key, 40)
+            skey = store.page_key(city, state, price_min, price_max, source=source_key)
             seen_pages = store.page_seen_set(skey)        # 历史任务翻过的页（跨任务记忆）
             used: set = set()
             visits = 0
@@ -192,15 +197,15 @@ class TaskRunner:
                 页面当前页标记」当信号做二分，log2(44)≈6 次请求探出真值。
                 只有「列表页条数估值不可信 + 能上报页码标记」的数据源才做二分；
                 其他源（LoopNet/CityFeet/Crexi 的分页条就是真值）直接沿用估值。"""
-                if not (getattr(feed, "PAGE_OK_SIGNAL", False)
-                        and getattr(feed, "PAGES_ESTIMATE_UNRELIABLE", False)):
+                if not (getattr(_feed, "PAGE_OK_SIGNAL", False)
+                        and getattr(_feed, "PAGES_ESTIMATE_UNRELIABLE", False)):
                     return max(int(upper), 1)
                 lo, hi = 1, max(int(upper), 1)
                 while lo < hi and not self.stopped:
                     mid = (lo + hi + 1) // 2
-                    r = feed.search_candidates(city, state, price_min, price_max,
-                                               limit=per_page, tag=f"task{self.task_id}",
-                                               page=mid)
+                    r = _feed.search_candidates(city, state, price_min, price_max,
+                                                limit=per_page, tag=f"task{self.task_id}",
+                                                page=mid)
                     if r.get("page_ok") is False:       # 明确回落 → 该页不存在
                         hi = mid - 1
                     elif r.get("page_ok"):              # 页码标记匹配 → 该页存在
@@ -212,7 +217,7 @@ class TaskRunner:
                 if not plan:
                     if not total_pages and cached_total:
                         total_pages = cached_total
-                        self.emit(f"  {src_label} 该搜索条件实测末页为第 {total_pages} 页"
+                        self.emit(f"  {_label} 该搜索条件实测末页为第 {total_pages} 页"
                                   f"（沿用上次探测结果，过期自动重探）")
                     if not total_pages:
                         # 总页数未知（数据源没暴露分页条）：必须逐页往下探，
@@ -221,16 +226,16 @@ class TaskRunner:
                         nxt = (max(used) + 1) if used else 1
                         plan = [nxt]
                         if nxt == 1:
-                            self.emit("步骤1：先用第 1 页探测该搜索条件共有多少页...")
+                            self.emit(f"步骤1（{_label}）：先用第 1 页探测该搜索条件共有多少页...")
                         else:
-                            self.emit(f"步骤1：总页数未知，顺序探测第 {nxt} 页"
+                            self.emit(f"步骤1（{_label}）：总页数未知，顺序探测第 {nxt} 页"
                                       f"（遇到空页即认定到末页）...")
                     else:
                         remaining = [p for p in range(1, total_pages + 1)
                                      if p not in used and p not in seen_pages]
                         if not remaining:
                             if reset_done:
-                                self.emit(f"{src_label} 共 {total_pages} 页已全部遍历，"
+                                self.emit(f"{_label} 共 {total_pages} 页已全部遍历，"
                                           f"未再产出全新候选", "warn")
                                 return
                             # 所有页都检查过：清空翻页记忆，再随机重跑一轮（只重置一次）
@@ -243,7 +248,7 @@ class TaskRunner:
                             continue
                         plan = remaining
                         random.shuffle(plan)
-                        self.emit(f"步骤1：{src_label} 全部 {total_pages} 页按随机顺序遍历"
+                        self.emit(f"步骤1：{_label} 全部 {total_pages} 页按随机顺序遍历"
                                   f"（本轮 {len(plan)} 页，已跳过检查过的 {len(seen_pages)} 页）："
                                   + "、".join(f"第{p}页" for p in plan))
                 produced = 0
@@ -254,28 +259,30 @@ class TaskRunner:
                         continue
                     used.add(page_no)
                     visits += 1
-                    self.current_step = f"步骤1 {src_label} 采集第{page_no}页"
-                    self.emit(f"步骤1：{src_label} 采集候选（第 {page_no}/{total_pages or '?'} 页，"
+                    self.current_step = f"步骤1 {_label} 采集第{page_no}页"
+                    self.emit(f"步骤1：{_label} 采集候选（第 {page_no}/{total_pages or '?'} 页，"
                               f"已访问 {visits} 页）...")
-                    r1 = feed.search_candidates(city, state, price_min, price_max,
-                                                limit=per_page, tag=f"task{self.task_id}",
-                                                page=page_no)
+                    r1 = _feed.search_candidates(city, state, price_min, price_max,
+                                                 limit=per_page, tag=f"task{self.task_id}",
+                                                 page=page_no)
                     self.emit(f"步骤1结果（第{page_no}页）：{r1['message']}",
                               "pass" if r1["status"] == "pass" else "warn")
                     if visits == 1 and r1["screenshot"]:
                         self._push({"__screenshot__": {"step": "step1", "path": r1["screenshot"]}})
-                    # 反爬拦截：后面的页同样过不去，继续抽只是空转
+                    # 反爬拦截：本源后续页同样过不去 → 只结束本源，其他源继续跑
                     if r1["status"] == "fail" and "拦截" in r1["message"]:
-                        self.emit(f"{src_label} 被反爬拦截，停止自动搜索", "error")
+                        self.emit(f"{_label} 被反爬拦截，本源停止采集"
+                                  f"（其余数据源继续）", "error")
                         return
-                    # 城市名不存在（站点回落成州级列表）：换页也没意义，直接终止并提示
+                    # 城市名不存在（站点回落成州级列表）：对所有源都成立 → 全局终止
                     if r1.get("bad_city"):
                         self.emit(r1["message"], "error")
+                        self._city_bad = True
                         return
-                    # 第 1 页就 404 = 搜索地区本身无效（如把州名当城市填），
-                    # 再抽 20 页只是重复 404，直接终止并给出可操作提示
+                    # 第 1 页就 404 = 该源对这个地区无覆盖（如把州名当城市填）：
+                    # 只结束本源（其他源可能正常覆盖该城市）
                     if r1.get("not_found") and page_no == 1:
-                        self.emit(r1["message"], "error")
+                        self.emit(r1["message"] + "（本源无该地区覆盖，其余源继续）", "warn")
                         return
                     # 越界页：404，或站点把第 1 页内容静默再发一遍（页码不匹配）
                     if r1.get("not_found"):
@@ -294,23 +301,23 @@ class TaskRunner:
                     seen_pages.add(page_no)
                     if not total_pages and r1.get("total_pages"):
                         est = int(r1["total_pages"])
-                        if (est > 1 and getattr(feed, "PAGES_ESTIMATE_UNRELIABLE", False)
-                                and getattr(feed, "PAGE_OK_SIGNAL", False)):
+                        if (est > 1 and getattr(_feed, "PAGES_ESTIMATE_UNRELIABLE", False)
+                                and getattr(_feed, "PAGE_OK_SIGNAL", False)):
                             self.emit(f"  列表页估值 {est} 页，正在二分探测真实末页"
                                       f"（约 6 次请求，避免在越界页上空转）...")
                         total_pages = _probe_last_page(est) if est > 1 else est
                         if total_pages < 2 <= est and est >= 5:
                             # 每个探测页都"回落成第 1 页"，多半不是真只有 1 页，
                             # 而是整站忽略了页码（重定向/参数被吃）→ 保守按估值遍历
-                            self.emit(f"  {src_label} 末页探测异常（全部回落，结果=1），"
+                            self.emit(f"  {_label} 末页探测异常（全部回落，结果=1），"
                                       f"改按列表估值 {est} 页遍历", "warn")
                             total_pages = est
                         if total_pages < est:
-                            self.emit(f"  {src_label} 列表页写的是 {est} 页（约 {per_page} 条/页），"
+                            self.emit(f"  {_label} 列表页写的是 {est} 页（约 {per_page} 条/页），"
                                       f"但实测末页只有第 {total_pages} 页——越界页码会被站点"
                                       f"静默回落成第 1 页，已按实测值走", "warn")
                         else:
-                            self.emit(f"  {src_label} 该搜索条件下共 {total_pages} 页"
+                            self.emit(f"  {_label} 该搜索条件下共 {total_pages} 页"
                                       f"（约 {per_page} 条/页）")
                         store.page_limit_set(skey, total_pages)
                     fresh, skip_known, skip_failed = [], 0, 0
@@ -324,6 +331,7 @@ class TaskRunner:
                         if hit:
                             skip_failed += 1
                             continue
+                        c["source"] = source_key    # 记录归属哪条线（多源时按候选标记）
                         fresh.append(c)
                     if skip_known or skip_failed:
                         self.emit(f"  第{page_no}页剔除：已收录 {skip_known} 个 / 失败档案 {skip_failed} 个", "warn")
@@ -333,10 +341,39 @@ class TaskRunner:
                     for c in fresh:
                         seen_addrs.add(store.normalize(c["address"]))
                     produced += len(fresh)
-                    yield from fresh
+                    yield fresh
                 plan = []
                 if produced == 0 and not self.stopped and approved < target:
                     self.emit("本轮随机页均无全新候选，重新抽下一批页...", "warn")
+
+        def _auto_candidate_stream():
+            """多源轮询候选流：每个源各自独立翻页，按轮次轮流取一批候选汇入流水线。
+
+            - 候选跨源去重（同一栋楼多处挂牌只处理一次，取先出现的源）
+            - 单源被拦/无覆盖只退出该源，其余源继续（比单源模式抗风险）
+            - 任何源报 bad_city → 全局终止（城市无效对所有源都成立）
+            """
+            self._city_bad = False
+            live = {s: _source_stream(s) for s in sources}
+            round_no = 0
+            while live and not self._city_bad:
+                round_no += 1
+                for s in list(live):
+                    if self.stopped or approved >= target or self._city_bad:
+                        return
+                    try:
+                        batch = next(live[s])
+                    except StopIteration:
+                        self.emit(f"{feed_of(s)[1]} 候选已用尽，退出轮询")
+                        del live[s]
+                        continue
+                    self.emit(f"—— 轮询第 {round_no} 轮：{feed_of(s)[1]} 产出 {len(batch)} 个新候选")
+                    for c in batch:
+                        norm = store.normalize(c["address"])
+                        if norm in seen_addrs:      # 跨源去重：同楼多平台挂牌只跑一次
+                            continue
+                        seen_addrs.add(norm)
+                        yield c
 
         _JUNK_PRICE = re.compile(r"\b(bill|billion|million|hour|considera|redevelop)\b", re.I)
 
@@ -408,6 +445,10 @@ class TaskRunner:
         for cand in candidate_stream:
             if self.stopped:
                 break
+            # 多源模式：每条候选带着自己的源标记，详情页补抓/记录归属/交叉查询
+            # 都要用候选对应的源（而不是任务默认源）
+            c_source = (cand.get("source") or source).strip().lower()
+            c_feed, c_label, _d = feed_of(c_source)
             # 清洗重复片段（"537 Long Point Road Road" / "413 & 415 415 E Remington st"）：
             # 脏地址会把 Google 地理编码带偏到别的城市（实测被编到洛杉矶）
             raw_addr = cand["address"]
@@ -444,7 +485,7 @@ class TaskRunner:
             #     而且 email 从未在卡片上出现过，不能拿它当开页理由
             undisclosed = bool(cand.get("undisclosed"))
             # 该数据源以详情页为唯一价格口径（Crexi）：卡片价不参与淘汰，一律进详情页看套间表
-            detail_prices = bool(getattr(feed, "DETAIL_IS_PRICE_SOURCE", False))
+            detail_prices = bool(getattr(c_feed, "DETAIL_IS_PRICE_SOURCE", False))
             # 搜索接口已直接给出套间级月租（crexi 的 leaseDetails.totalMonthly）→
             # 价格口径就是详情页那套，不必再开页，省 3-8s/条。
             # 但电话缺失时仍要开页：Crexi 登录态下详情页才渲染 tel: 链接（电话硬字段）
@@ -468,10 +509,10 @@ class TaskRunner:
                 "agent": cand.get("agent", ""), "phone": cand.get("phone", ""),
                 "email": cand.get("email", ""), "area": cand.get("area", ""),
                 "listing_url": cand.get("listing_url", ""),
-                "step1": (f"pass：{src_label} 采集（价格 {cand.get('price', '未知')}"
+                "step1": (f"pass：{c_label} 采集（价格 {cand.get('price', '未知')}"
                           + (f"，可容纳 {cand['area_ppl']} PPL" if cand.get("area_ppl") else "")
                           + "）"),
-                "source": source,   # 记录归属哪条线（LoopNet / Crexi），两条线分开查看/导出
+                "source": c_source,   # 记录归属哪条线（多源时按候选实际来源）
                 "screenshots": [],  # SOP：搜索页截图不入档
             })
             self.current_record = record_id
@@ -485,7 +526,7 @@ class TaskRunner:
             if cand.get("listing_url") and need_detail:
                 self.current_step = "补抓详情页"
                 self.emit("补抓详情页（价格/经纪人/面积/套间表）...")
-                info = feed.fetch_broker_info(cand.get("listing_url", ""))
+                info = c_feed.fetch_broker_info(cand.get("listing_url", ""))
                 if info.get("blocked"):
                     # 详情页被速率拦截：字段缺失是"没抓到"而不是"房源没写"，
                     # 日志里必须区分，否则看结果的人会误以为这套房真没有价格
@@ -724,7 +765,7 @@ class TaskRunner:
                 self.current_step = "跨源交叉查询经纪人电话"
                 self.emit("  本源未提供经纪人电话 → 跨数据源交叉查询（LoopNet/Crexi）...")
                 try:
-                    cr = cross_lookup.lookup_contact(addr, exclude_source=source)
+                    cr = cross_lookup.lookup_contact(addr, exclude_source=c_source)
                 except Exception as e:
                     cr = {}
                     self.emit(f"  交叉查询异常（不阻断流程）：{e}", "warn")
@@ -766,7 +807,7 @@ class TaskRunner:
                 hint = _suite_hint_addr(addr, cand.get("suite_no", ""))
                 merged: list = []
                 if hint:
-                    self.emit(f"  {src_label} 详情页已给出套间（{cand.get('suite_name')}），"
+                    self.emit(f"  {c_label} 详情页已给出套间（{cand.get('suite_name')}），"
                               f"先直接验证 {hint}", "pass")
                     merged = [hint]
                 else:

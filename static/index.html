@@ -133,20 +133,21 @@
           <input id="priceMin" type="number" value="0" min="0"></div>
         <div class="field"><label>价格上限（$/月）</label>
           <input id="priceMax" type="number" value="2000" min="0"></div>
-        <div class="field"><label>目标通过地址数</label>
-          <input id="target" type="number" value="3" min="1"></div>
-        <div class="field" style="grid-column:1/-1"><label>步骤1 数据源</label>
-          <select id="source">
-            <option value="loopnet" selected>LoopNet（loopnet.com）</option>
-            <option value="crexi">Crexi（crexi.com）</option>
-            <option value="cityfeet">CityFeet（cityfeet.com）</option>
-            <option value="commercialcafe">CommercialCafe（commercialcafe.com）</option>
-            <option value="commercialsearch">CommercialSearch（commercialsearch.com）</option>
-            <option value="officespace">OfficeSpace（officespace.com）</option>
-            <option value="cbre">CBRE（cbre.com）</option>
-          </select>
+        <div class="field"><label>目标通过地址数（最多 100）</label>
+          <input id="target" type="number" value="3" min="1" max="100">
+          <div style="font-size:12px;color:#9ca3af;margin-top:6px">长任务可分多次跑：翻页进度跨任务记忆，接着上次的位置继续。</div></div>
+        <div class="field" style="grid-column:1/-1"><label>步骤1 数据源（可多选，按页轮询汇入同一流水线）</label>
+          <div id="srcGroup" style="display:flex; gap:14px; flex-wrap:wrap; font-size:14px">
+            <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="srcChk" value="loopnet" checked>LoopNet</label>
+            <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="srcChk" value="crexi" checked>Crexi</label>
+            <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="srcChk" value="cityfeet">CityFeet</label>
+            <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="srcChk" value="commercialcafe">CommercialCafe</label>
+            <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="srcChk" value="commercialsearch">CommercialSearch</label>
+            <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="srcChk" value="officespace">OfficeSpace</label>
+            <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="srcChk" value="cbre">CBRE</label>
+          </div>
           <div style="font-size:12px;color:#9ca3af;margin-top:6px">
-            两者筛选口径与结果字段完全一致（城市/州 + 月租区间）；选哪个就只用哪个，不做双源并行。
+            多源同时工作：按页轮流采集，候选自动去重；单一源被反爬拦截不影响其他源继续。100 个目标预计需连续运行数小时至一天以上（每条约 1.5–3 分钟，通过率 5–10%），任务中断可接着跑。
           </div></div>
       </div>
       <div class="field" style="margin-top:16px">
@@ -379,9 +380,10 @@ $("#startBtn").onclick = async () => {
     city: $("#city").value.trim(), state: $("#state").value.trim(),
     price_min: +$("#priceMin").value || 0, price_max: +$("#priceMax").value || 2000,
     target: +$("#target").value || 3, listing_urls: $("#listingUrls").value.trim(),
-    source: $("#source").value,
+    source: [...document.querySelectorAll(".srcChk:checked")].map(c => c.value).join(","),
   };
   if (!body.city || !body.state) return alert("请选择州和城市 / Please select a state and city");
+  if (!body.source) return alert("请至少勾选一个数据源");
   const r = await fetch("/api/tasks", {method: "POST", headers: {"Content-Type": "application/json"},
                                        body: JSON.stringify(body)});
   if (!r.ok) return alert((await r.json()).detail || "启动失败");
