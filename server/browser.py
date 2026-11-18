@@ -57,11 +57,14 @@ def _minimize_chrome_window(pids):
     HWND_BOTTOM = 1
     GWL_EXSTYLE = -20
     WS_EX_TOOLWINDOW = 0x00000080    # 工具窗口：不出现在任务栏
+    WS_EX_NOACTIVATE = 0x08000000    # 不接收键盘焦点（点它也不抢）
     for hwnd in hwnds:
-        # 设为工具窗口：从任务栏图标里消失（用户要求：任务跑起来不要占一排任务栏）
+        # 设为工具窗口 + 不激活窗口：从任务栏图标里消失，且系统层面
+        # 永远不把键盘焦点交给它（用户要求：全程不碰我的鼠标键盘）
         try:
             ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                  ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
         except Exception:
             pass
         # 无激活移出屏幕（不改变 Z 序、不抢焦点）
@@ -136,8 +139,10 @@ def _minimize_context(context, profile_dir=None):
             pass
 
     def minimize_later():
-        # 指数退避看护 ~20s：0.1/0.3/0.6/1/1.5/2/3/4/6/8/10（累计 36.5s 覆盖前段）
-        for delay in (0.1, 0.3, 0.6, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0):
+        # 指数退避看护 ~20s：前 1 秒内 0.05/0.15/0.4 三连压（Chrome 首帧和
+        # 各类气泡都在这窗口里冒头），再 0.1/0.3/0.6/1/1.5/2/3/4/6/8/10
+        for delay in (0.05, 0.15, 0.4, 0.1, 0.3, 0.6, 1.0, 1.5, 2.0, 3.0,
+                      4.0, 6.0, 8.0, 10.0):
             time.sleep(delay)
             try:
                 _minimize_chrome_window(pids)
@@ -256,11 +261,21 @@ def _launch_kw(background=False, **extra):
     """
     args = ["--disable-blink-features=AutomationControlled",
             "--lang=en-US",
-            "--disable-features=Translate,TranslateUI",
+            # ChromeWhatsNew：关"Chrome 新功能"弹页；Translate* 关自动翻译
+            # （Crexi/CityFeet 被翻译后英文标签/价格正则全部失效）
+            "--disable-features=Translate,TranslateUI,ChromeWhatsNew",
             "--disable-translate",
             "--enable-gpu",
             "--ignore-gpu-blocklist",
-            "--use-angle=d3d11"]
+            "--use-angle=d3d11",
+            # 防焦点窃取：工人池为每个工人/生产者开全新配置目录，Chrome
+            # 首次启动的欢迎页、崩溃恢复气泡、默认浏览器询问都会把自己弹到
+            # 前台抢走键盘焦点——全部关掉（实测抢焦点主因）
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--hide-crash-restore-bubble",
+            "--disable-session-crashed-bubble",
+            "--disable-crash-reporter"]
     if background:
         # 保留有头渲染以支持 Google Maps/WebGL；窗口移到屏幕外并最小化，
         # 不创建无头窗口，避免街景画布在 headless 下出现黑屏。
