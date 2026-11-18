@@ -83,10 +83,50 @@ _UPDATABLE = {
 }
 
 
+# 街道后缀归一表：把缩写统一成全称。
+# 根因（2026-11-18 实测）：同一栋楼因为写法差异被当成多栋楼重复入库——
+# "501 Garasches Ln / 501 Garasches Lane"、"800 N King St / 800 N King Street"、
+# "2700 Silverside Rd" 带不带 ZIP 等，records 里 26 个桶出现同楼多条。
+# 归一必须消除这些写法差异，否则"一楼只要一个"的规则落不了地。
+_SUFFIX_MAP = {
+    "st": "street", "str": "street",
+    "rd": "road",
+    "ave": "avenue", "av": "avenue",
+    "blvd": "boulevard",
+    "ln": "lane",
+    "hwy": "highway",
+    "dr": "drive",
+    "ct": "court",
+    "pl": "place",
+    "pkwy": "parkway",
+    "cir": "circle",
+    "ter": "terrace",
+    "expy": "expressway",
+    "sq": "square",
+    "trl": "trail",
+    "plz": "plaza",
+    "ctr": "center",
+}
+
+
 def normalize(address: str) -> str:
-    """地址归一化（楼栋级）：去房间号（Ste/Suite/Room/Unit/#）、去标点、小写。用于查重比对。"""
-    s = re.sub(r"\b(suite|ste|room|rm|unit|fl|floor|#)\s*[\w-]+", " ", str(address), flags=re.I)
+    """地址归一化（楼栋级）：去房间号/楼层/ZIP + 街道后缀归一 + 去标点小写。
+
+    用于查重比对——同一栋楼的不同写法（St/Street、Ln/Lane、带不带 ZIP+4、
+    带不带楼层）必须归成同一个 key，否则一楼会被当成多楼重复入库。
+    """
+    s = str(address)
+    # 1) 去套间/房间/单元号（"Ste 302A"、"Unit 5"、"#12"）
+    s = re.sub(r"\b(suite|ste|room|rm|unit|apt|#)\s*\.?\s*#?\s*[\w-]+", " ", s, flags=re.I)
+    # 2) 去楼层表达（"10th Floor"、"2nd Fl"、"Floor 3"）
+    s = re.sub(r"\b\d+(?:st|nd|rd|th)?\s*(?:floor|fl)\b", " ", s, flags=re.I)
+    s = re.sub(r"\b(?:floor|fl)\s*\d+", " ", s, flags=re.I)
+    # 3) 去末尾 ZIP / ZIP+4（"19801"、"19801-5524"）——必须在标点清理前做
+    s = re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", " ", s.strip())
+    # 4) 标点 → 空格、小写
     s = re.sub(r"[^a-z0-9]+", " ", s.lower())
+    # 5) 街道后缀归一（St→street、Ln→lane…），消除缩写差异
+    s = " ".join(_SUFFIX_MAP.get(t, t) for t in s.split())
     return " ".join(s.split())
 
 
