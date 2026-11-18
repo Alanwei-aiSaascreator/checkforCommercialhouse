@@ -27,15 +27,11 @@ VIEWPORT = {"width": 1440, "height": 900}
 
 
 def _minimize_chrome_window(pids):
-    """强制将 Playwright 启动的 Chrome 窗口移出屏幕并最小化（不抢焦点）。
+    """按进程号集合压制本程序启动的 Chrome 窗口（任务栏无图标 + 不接焦点）。
 
     pids：属于本程序启动的 Chrome 进程号集合（见 _profile_pids）。
-
-    关键点：
-    * 先 SetWindowPos 移到屏幕外（SWP_NOACTIVATE），窗口再出现也不会盖住
-      用户正在操作的内容；
-    * 用 SW_SHOWMINNOACTIVE(7) 而不是 SW_MINIMIZE(6)：后者会激活窗口、
-      把键盘焦点抢走，正是"任务跑起来就抢我鼠标键盘"的元凶。
+    只按 pid 精确匹配，禁止"找不到 PID 就压所有 Chrome 窗口"的兜底——
+    那会把用户自己开着的浏览器一并压下去。
     """
     if not hasattr(ctypes, "windll") or not pids:
         return
@@ -46,47 +42,104 @@ def _minimize_chrome_window(pids):
     def callback(hwnd, _):
         found_pid = ctypes.c_ulong()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(found_pid))
-        # 只处理本程序启动的 Chrome 进程；禁止"找不到 PID 就最小化所有
-        # Chrome 窗口"的兜底——那会把用户自己开着的浏览器一并压下去。
-        # 不再用 IsWindowVisible 过滤：窗口被 SW_HIDE 后 IsWindowVisible=False，
-        # 若 Chrome 之后把它重新 SHOW 成最小化，过滤会导致它被漏掉、任务栏
-        # 图标残留。这里对匹配 pid 的所有顶层窗口（可见或已隐藏）一律强制
-        # 工具窗口 + 移出屏幕 + SW_HIDE，窗口一旦被拉起、0.4s 内即被再压回。
         if found_pid.value in pids:
             hwnds.append(hwnd)
         return True
 
     user32.EnumWindows(callback, 0)
-    SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE = 0x0010, 0x0004, 0x0001
-    SWP_FRAMECHANGED, SWP_HIDEWINDOW = 0x0020, 0x0080
-    HWND_BOTTOM = 1
-    GWL_EXSTYLE = -20
-    WS_EX_TOOLWINDOW = 0x00000080    # 工具窗口：不出现在任务栏
-    WS_EX_APPWINDOW = 0x00040000    # 应用窗口：强制显示任务栏按钮
-    WS_EX_NOACTIVATE = 0x08000000    # 不接收键盘焦点（点它也不抢）
+    _suppress_windows(hwnds)
+
+
+# ---- 窗口压制常量与底层实现（供 pid 路径和"新进程实时路径"共用）----
+_SWP_NOACTIVATE, _SWP_NOZORDER, _SWP_NOSIZE = 0x0010, 0x0004, 0x0001
+_SWP_FRAMECHANGED, _SWP_HIDEWINDOW = 0x0020, 0x0080
+_HWND_BOTTOM = 1
+_GWL_EXSTYLE = -20
+_WS_EX_TOOLWINDOW = 0x00000080    # 工具窗口：不出现在任务栏
+_WS_EX_APPWINDOW = 0x00040000    # 应用窗口：强制显示任务栏按钮
+_WS_EX_NOACTIVATE = 0x08000000    # 不接收键盘焦点（点它也不抢）
+
+
+def _suppress_windows(hwnds) -> None:
+    """把一组顶层窗口压成「任务栏无图标 + 系统层面不接焦点 + 彻底隐藏」。
+
+    * TOOLWINDOW + 清除 APPWINDOW：任务栏按钮彻底消失（只加 TOOLWINDOW
+      不清 APPWINDOW 时 Chrome 的按钮仍会残留）；
+    * SetWindowPos 带 FRAMECHANGED|HIDEWINDOW：样式立即生效、任务栏立即
+      移除按钮，窗口同时移出屏幕（不改变 Z 序、不抢焦点）；
+    * SW_HIDE 兜底：配合"禁用后台渲染节流"参数，隐藏后街景照常渲染。
+    """
+    if not hasattr(ctypes, "windll"):
+        return
+    user32 = ctypes.windll.user32
     for hwnd in hwnds:
-        # 设为工具窗口 + 不激活窗口：从任务栏图标里消失，且系统层面
-        # 永远不把键盘焦点交给它（用户要求：全程不碰我的鼠标键盘）
         try:
-            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ex = user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
             user32.SetWindowLongW(
-                hwnd, GWL_EXSTYLE,
-                (ex & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+                hwnd, _GWL_EXSTYLE,
+                (ex & ~_WS_EX_APPWINDOW) | _WS_EX_TOOLWINDOW | _WS_EX_NOACTIVATE)
         except Exception:
             pass
-        # 无激活移出屏幕（不改变 Z 序、不抢焦点）；SWP_FRAMECHANGED 让上面
-        # 的 TOOLWINDOW 样式立即重绘生效——否则任务栏按钮会残留、图标成堆。
         try:
-            user32.SetWindowPos(hwnd, HWND_BOTTOM, -32000, -32000, 0, 0,
-                                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE |
-                                SWP_FRAMECHANGED | SWP_HIDEWINDOW)
+            user32.SetWindowPos(hwnd, _HWND_BOTTOM, -32000, -32000, 0, 0,
+                                _SWP_NOACTIVATE | _SWP_NOZORDER | _SWP_NOSIZE |
+                                _SWP_FRAMECHANGED | _SWP_HIDEWINDOW)
         except Exception:
             pass
-        # 彻底隐藏窗口（SW_HIDE=0），而不是 SW_SHOWMINNOACTIVE=7（那是"显示但不
-        # 激活"，窗口仍在屏幕上、仍可能被页面/弹窗重新激活抢焦点）。SW_HIDE 后
-        # 窗口不在屏幕、不在任务栏、不接键盘焦点，配合上面的"禁用后台渲染节流"
-        # 参数，隐藏窗口照常渲染、截图正常。
-        user32.ShowWindow(hwnd, 0)
+        try:
+            user32.ShowWindow(hwnd, 0)
+        except Exception:
+            pass
+
+
+def _chrome_windows() -> list:
+    """枚举所有 Chrome 主窗口（类名 Chrome_WidgetWin_1），纯 Win32、微秒级。"""
+    if not hasattr(ctypes, "windll"):
+        return []
+    user32 = ctypes.windll.user32
+    out = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def cb(hwnd, _):
+        cls = ctypes.create_unicode_buffer(64)
+        try:
+            user32.GetClassNameW(hwnd, cls, 64)
+            if cls.value == "Chrome_WidgetWin_1":
+                out.append(hwnd)
+        except Exception:
+            pass
+        return True
+
+    user32.EnumWindows(cb, 0)
+    return out
+
+
+_kernel32 = getattr(ctypes, "windll", None) and ctypes.windll.kernel32
+_proc_born_cache: dict = {}
+
+
+def _proc_create_time(pid: int) -> float:
+    """进程创建时间（epoch 秒）：Win32 API 直查，微秒级。
+
+    PowerShell 查一条命令行要 ~1s——这正是窗口"空窗期"的长度；用
+    GetProcessTimes 则毫秒级完成，是消除空窗期的关键。
+    """
+    if not _kernel32 or not pid:
+        return 0.0
+    if pid in _proc_born_cache:
+        return _proc_born_cache[pid]
+    h = _kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return 0.0
+    try:
+        ct, et, kt, ut = (ctypes.c_ulonglong() for _ in range(4))
+        ok = _kernel32.GetProcessTimes(h, ctypes.byref(ct), ctypes.byref(et),
+                                       ctypes.byref(kt), ctypes.byref(ut))
+        t = ((ct.value - 116444736000000000) / 10_000_000) if ok else 0.0
+        _proc_born_cache[pid] = t
+        return t
+    finally:
+        _kernel32.CloseHandle(h)
 
 
 def _kill_stale_profile_chrome(profile_dir: str) -> None:
@@ -240,6 +293,43 @@ def _minimize_context(context, profile_dir=None):
     20 秒之外的任何新窗口（Aux 道晚启动、Chrome 崩溃重启、歇了的弹窗）
     也会被 2 秒一次的巡检压住——实测只靠单次 20s 看护仍会漏抢焦点。
     """
+    def burst_suppress():
+        """launch 后 15s 内 50ms 轮询压制「本次新启动 Chrome」的可见窗口。
+
+        PowerShell 查 pid 要 ~1s，这段空窗期窗口可见、任务栏图标成堆闪现
+        （8 个工人同时启动时任务栏全是 Chrome 图标，正是这批）。改用 Win32
+        直查进程创建时间过滤：只压「启动时间晚于本 context 启动前 10s」的
+        chrome 窗口——毫秒级、不误伤用户自己开着的浏览器（那些进程是几天
+        前启动的）。窗口一冒头 50ms 内即被压回，任务栏图标不再成堆。
+        15s 后全局看护（pid 缓存路径）接管，本线程退出。
+        """
+        born = time.time()
+        deadline = born + 15
+        if not hasattr(ctypes, "windll"):
+            return
+        u32 = ctypes.windll.user32
+        while time.time() < deadline:
+            try:
+                fresh = []
+                for h in _chrome_windows():
+                    if not u32.IsWindowVisible(h):
+                        continue
+                    pid = ctypes.c_ulong()
+                    u32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                    t = _proc_create_time(pid.value)
+                    if t and t >= born - 10.0:
+                        fresh.append(h)
+                if fresh:
+                    _suppress_windows(fresh)
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+    # burst 实时压制必须最先启动：它不依赖 pids（纯 Win32 按进程创建时间
+    # 过滤），若放在 _profile_pids 之后，那 ~1s 的 PowerShell 查询就是
+    # 窗口裸奔在任务栏的空窗期（8 个工人同时启动时图标成堆，用户已截图）。
+    threading.Thread(target=burst_suppress, daemon=True).start()
+
     pids = getattr(context, "_our_pids", None)
     if not pids and profile_dir:
         pids = _profile_pids(str(profile_dir))
@@ -328,6 +418,49 @@ def _launch(profile_dir, **extra):
             _harden_context(ctx)
             return ctx
         raise
+
+
+def _launch_hidden(profile_dir, **extra):
+    """launch + 全程实时压制：Chrome 窗口在 launch 阻塞期间一出现即被压。
+
+    launch_persistent_context 阻塞约 1.4s，Chrome 主窗口在 launch 内部就已
+    显示——等 launch 返回再压（旧路径），窗口已在任务栏裸奔约 1s，8 个工人
+    同时启动时图标成堆（用户截图实证）。这里在 launch 前启动预压制线程：
+    50ms 轮询，把「launch 前不存在、且进程创建时间晚于 launch 开始」的可见
+    Chrome 窗口立即压下去（毫秒级，绝不误伤用户自己的浏览器——那些进程是
+    几小时/天前启动的）。launch 返回后停掉预线程，由 _minimize_context 的
+    15s burst 接力处理 Chrome 后续重新拉起的窗口。
+    """
+    born = time.time()
+    before = set(_chrome_windows())
+    stop = threading.Event()
+
+    def pre():
+        if not hasattr(ctypes, "windll"):
+            return
+        u32 = ctypes.windll.user32
+        while not stop.is_set():
+            try:
+                fresh = []
+                for h in _chrome_windows():
+                    if h in before or not u32.IsWindowVisible(h):
+                        continue
+                    pid = ctypes.c_ulong()
+                    u32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                    t = _proc_create_time(pid.value)
+                    if t and t >= born - 2.0:
+                        fresh.append(h)
+                if fresh:
+                    _suppress_windows(fresh)
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+    threading.Thread(target=pre, daemon=True).start()
+    try:
+        return _launch(profile_dir, **extra)
+    finally:
+        stop.set()
 
 
 def _harden_context(ctx):
@@ -473,15 +606,13 @@ def new_page_in(profile_name: str):
             st.pw = sync_playwright().start()
         try:
             try:
-                ctx = st.pw.chromium.launch_persistent_context(
-                    str(d), channel="chrome", **_launch_kw(background=True))
+                ctx = _launch_hidden(d, channel="chrome", **_launch_kw(background=True))
             except Exception as e:
                 if _is_profile_locked_error(e):
                     _kill_stale_profile_chrome(str(d))
-                    ctx = st.pw.chromium.launch_persistent_context(
-                        str(d), channel="chrome", **_launch_kw(background=True))
+                    ctx = _launch_hidden(d, channel="chrome", **_launch_kw(background=True))
                 else:
-                    ctx = st.pw.chromium.launch_persistent_context(str(d), **_launch_kw(background=True))
+                    ctx = _launch_hidden(d, **_launch_kw(background=True))
             _harden_context(ctx)
             page = ctx.new_page()
             extra[profile_name] = ctx
@@ -512,12 +643,12 @@ def _ensure_context():
     try:
         try:
             # 优先系统 Chrome（保留真实指纹特征）
-            st.context = _launch(profile_dir, channel="chrome", **launch_kw)
+            st.context = _launch_hidden(profile_dir, channel="chrome", **launch_kw)
         except Exception:
             # 未装 Chrome 时退回 Playwright 自带 Chromium
             _stop_pw()
             st.pw = sync_playwright().start()
-            st.context = _launch(profile_dir, **launch_kw)
+            st.context = _launch_hidden(profile_dir, **launch_kw)
         _minimize_context(st.context, profile_dir)
     except Exception:
         # 彻底失败：清理驱动，下次任务从干净状态重试
