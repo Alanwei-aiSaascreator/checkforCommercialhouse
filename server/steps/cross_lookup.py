@@ -1,20 +1,142 @@
 """跨数据源交叉查询：按地址在其它平台找同楼盘挂牌，补经纪人电话/邮箱。
 
-背景：Crexi / CommercialCafe 等源未登录或站点结构性原因拿不到电话，而
-LoopNet / CityFeet / CBRE 的经纪人电话是公开的。同一栋楼常在多家平台同时
-挂牌 → 拿标准化地址去别家搜同楼盘，命中就用别家的联系方式。
+背景：Crexi / CommercialCafe 等源未登录或站点结构性原因拿不到电话（Crexi
+免费账号给的是平台统一号 888-273-0423，已按占位语过滤），而 LoopNet 的
+经纪人电话是公开的。同一栋楼常在多家平台同时挂牌 → 拿地址去别家搜同楼盘，
+命中就用别家的联系方式。
+
+LoopNet 通道实现（实测踩坑记录）：
+  * 直接拼 /search/{地址}/for-lease/ 是 404（LoopNet 搜索路径只认城市段）；
+  * 城市搜索页的 ?sk= 关键词参数被静默忽略；
+  * 所以走 DuckDuckGo HTML 端点做 site:loopnet.com 站内搜索（返回真实直链、
+    对自动化友好），命中后用 loopnet.fetch_broker_info 抓详情页电话——
+    实测 "223A 9th St" 一次命中真实号码 (415) 592-4862。
 
 匹配规则（防错杀）：
-  * 结果卡片文本必须同时包含「门牌号」和「街名前两个词」才算同一楼盘；
-  * 命中后优先用卡片上的电话（LoopNet 卡片自带），没有再开详情页补抓。
+  * DDG 结果的标题/摘要/URL 必须同时含「门牌号」和「街名词干」才算同楼盘；
+  * 命中后走详情页解析（LoopNet 详情页电话/邮箱公开，fetch_broker_info 可用）。
 
-代价：每条命中失败约 10-25s（一次搜索页导航），命中后不开详情页几乎无额外
-耗时。由 pipeline 在「电话缺失/占位语」时才调用。
+代价：每条约 8-20s（一次 DDG 搜索 + 一次详情页）。多工人共享一条节流队列。
 """
+import base64
 import re
+import threading
+import time
+from urllib.parse import quote, unquote
 
 from .. import browser
 from . import crexi, loopnet
+
+# 多工人共享节流：所有工人同出口 IP，DDG 查询过密会触发验证码
+_ddg_lock = threading.Lock()
+_ddg_last = 0.0
+_DDG_MIN_INTERVAL = 3.0
+# 引擎熔断：引擎弹验证码后停用一段时间（期间交叉查询直接跳过该引擎，
+# 不再白开浏览器），冷却后自动恢复
+_engine_down = {"ddg": 0.0, "bing": 0.0}
+_ENGINE_COOLDOWN = 1800.0
+_CHALLENGE_MARKS = ("solve the challenge", "unusual traffic",
+                    "are you a robot", "verify you are human")
+
+
+def _engine_ok(name: str) -> bool:
+    return time.time() >= _engine_down.get(name, 0.0)
+
+
+def _page_is_challenge(body: str) -> bool:
+    low = (body or "").lower()
+    return any(k in low for k in _CHALLENGE_MARKS)
+
+
+def _ddg_search(query: str) -> list:
+    """DuckDuckGo HTML 端点搜索，返回 [{t, u, snip}]（u 已还原真实直链）。"""
+    if not _engine_ok("ddg"):
+        return []
+    page = browser.new_page_in(loopnet._PROFILE)
+    try:
+        url = "https://html.duckduckgo.com/html/?q=" + quote(query)
+        browser.goto_retry(page, url, timeout=45000, wait=2500, retries=1)
+        body = page.evaluate("() => document.body.innerText") or ""
+        if _page_is_challenge(body):
+            _engine_down["ddg"] = time.time() + _ENGINE_COOLDOWN
+            return []
+        results = page.evaluate(
+            """() => [...document.querySelectorAll('div.result, div.web-result')]
+                .map(d => {
+                    const a = d.querySelector('a.result__a');
+                    const s = d.querySelector('a.result__snippet');
+                    return {t: (a ? a.innerText : ''), u: (a ? a.href : ''),
+                            snip: (s ? s.innerText : '')};
+                }).slice(0, 8)""") or []
+        out = []
+        for r in results:
+            u = str(r.get("u") or "")
+            if "duckduckgo.com" in u:
+                m = re.search(r"uddg=([^&]+)", u)
+                if m:
+                    u = unquote(m.group(1))
+            out.append({"t": r.get("t") or "", "u": u,
+                        "snip": r.get("snip") or ""})
+        return out
+    finally:
+        browser.safe_close(page)
+
+
+def _decode_bing(u: str) -> str:
+    """Bing 跳转链接 /ck/a?...&u=a1<base64url> → 真实 URL。"""
+    m = re.search(r"[?&]u=a1([^&]+)", u or "")
+    if not m:
+        return ""
+    b = m.group(1)
+    b += "=" * (-len(b) % 4)
+    try:
+        return base64.urlsafe_b64decode(b).decode("utf-8", "ignore")
+    except Exception:
+        return ""
+
+
+def _bing_search(query: str) -> list:
+    """Bing 搜索兜底（DDG 限流时用）：li.b_algo → 跳转链接解码为真实 URL。"""
+    if not _engine_ok("bing"):
+        return []
+    page = browser.new_page_in(loopnet._PROFILE)
+    try:
+        url = "https://www.bing.com/search?q=" + quote(query)
+        browser.goto_retry(page, url, timeout=45000, wait=3000, retries=1)
+        body = page.evaluate("() => document.body.innerText") or ""
+        if _page_is_challenge(body):
+            _engine_down["bing"] = time.time() + _ENGINE_COOLDOWN
+            return []
+        results = page.evaluate(
+            """() => [...document.querySelectorAll('li.b_algo')].map(li => {
+                const a = li.querySelector('h2 a');
+                const s = li.querySelector('p');
+                return {t: (a ? a.innerText : ''), u: (a ? a.href : ''),
+                        snip: (s ? s.innerText : '')};
+            }).slice(0, 8)""") or []
+        out = []
+        for r in results:
+            u = _decode_bing(str(r.get("u") or "")) or str(r.get("u") or "")
+            out.append({"t": r.get("t") or "", "u": u,
+                        "snip": r.get("snip") or ""})
+        return out
+    finally:
+        browser.safe_close(page)
+
+
+def _search_listings(query: str) -> list:
+    """双引擎搜索：DDG 优先，空结果时切 Bing（两家交替被限流时互为备份）。"""
+    results = []
+    try:
+        results = _ddg_search(query)
+    except Exception:
+        results = []
+    if not results:
+        try:
+            results = _bing_search(query)
+        except Exception:
+            results = []
+    return results
 
 
 def _slug(address: str) -> str:
@@ -22,13 +144,17 @@ def _slug(address: str) -> str:
 
 
 def _addr_tokens(address: str) -> tuple:
-    """("14946", ["camden", "avenue"]) —— 门牌号 + 街名词干。"""
+    """("223A", ["9th", "street"]) —— 门牌号（可带单元字母）+ 街名词干。"""
     s = str(address or "").strip()
-    m = re.match(r"\s*(\d{1,6})\s+(.+?)(?:,|$)", s)
+    # "223A 9th Street"：门牌号允许带单元字母（223A/330B），此前 \d{1,6}\s+
+    # 要求号后必须是空格，遇到 "223A" 整个解析失败 → 交叉查询静默查不到
+    m = re.match(r"\s*(\d{1,6}[A-Za-z]?)\s+(.+?)(?:,|$)", s)
     if not m:
         return "", []
     num = m.group(1)
-    words = [w for w in re.split(r"[^a-zA-Z]+", m.group(2)) if w]
+    # 按字母+数字切分：此前按纯字母切分会把 "9th" 拆成 "th"（数字丢失），
+    # "56th"/"3rd" 这类街名全部失配
+    words = [w for w in re.split(r"[^a-zA-Z0-9]+", m.group(2)) if w]
     # 去掉方向词/单元词，降低匹配噪声
     skip = {"n", "s", "e", "w", "north", "south", "east", "west",
             "suite", "ste", "unit", "room"}
@@ -40,48 +166,53 @@ def _card_matches(card_text: str, num: str, words: list) -> bool:
     t = (card_text or "").lower()
     if not num or not t:
         return False
-    if num not in t:
-        return False
+    num_l = num.lower()
+    if num_l not in t:
+        # "223A" 的挂牌常写作 "223"（单元号在标题里省略）→ 退而匹配裸门牌号
+        bare = re.sub(r"[A-Za-z]+$", "", num_l)
+        if not bare or bare not in t:
+            return False
     return all(w[:4] in t for w in words)   # 词干前 4 字符，容忍 Ave/Avenue
 
 
 def _via_loopnet(address: str, tag: str) -> dict:
-    """LoopNet 地址关键词搜索 → 同楼盘卡片/详情页 → 电话邮箱。"""
+    """DDG 站内搜索 LoopNet 挂牌 → 地址校验 → 详情页抓电话/邮箱。"""
+    global _ddg_last
     num, words = _addr_tokens(address)
     if not num:
         return {}
-    url = (f"https://www.loopnet.com/search/{_slug(address)}/for-lease/")
-    page = browser.new_page_in(loopnet._PROFILE)
+    with _ddg_lock:
+        wait = _ddg_last + _DDG_MIN_INTERVAL - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            results = _search_listings(f'site:loopnet.com "{address}"')
+        except Exception:
+            results = []
+        _ddg_last = time.time()
+    hit = ""
+    for r in results:
+        u = str(r.get("u") or "")
+        if "loopnet.com" not in u:
+            continue
+        hay = f"{r.get('t', '')} {r.get('snip', '')} {u}"
+        if _card_matches(hay, num, words):
+            hit = u
+            break
+    if not hit:
+        return {}
     try:
-        browser.goto_retry(page, url, timeout=45000, wait=5000, retries=1)
-        body = (page.evaluate("() => document.body.innerText") or "").lower()
-        if any(k in body for k in ("access denied", "unusual activity",
-                                   "are you a robot")):
-            return {}
-        cards = page.evaluate(loopnet._LIKING_JS) or []
-        hit = None
-        for c in cards:
-            if _card_matches(c.get("text", ""), num, words):
-                hit = c
-                break
-        if hit is None:
-            return {}
-        phone = loopnet._parse_phone(hit.get("text", ""))
-        agent = loopnet._parse_broker(hit.get("text", ""))
-        email = ""
-        listing_url = hit["url"]
-        if not phone:
-            # 卡片没电话 → 开详情页补（LoopNet 详情页电话/邮箱公开）
-            info = loopnet.fetch_broker_info(listing_url)
-            phone = info.get("phone") or ""
-            agent = agent or info.get("agent") or ""
-            email = info.get("email") or ""
-        return {"source": "loopnet", "listing_url": listing_url,
-                "agent": agent, "phone": phone, "email": email}
+        info = loopnet.fetch_broker_info(hit) or {}
     except Exception:
         return {}
-    finally:
-        browser.safe_close(page)
+    if info.get("blocked"):
+        return {}
+    phone = info.get("phone") or ""
+    # LoopNet 详情页经纪人名偶尔抓成 "Call Yash Patel" → 去掉 Call 前缀
+    agent = re.sub(r"^call\s+", "", info.get("agent") or "", flags=re.I).strip()
+    email = info.get("email") or ""
+    return {"source": "loopnet", "listing_url": hit,
+            "agent": agent, "phone": phone, "email": email}
 
 
 def _via_crexi(address: str) -> dict:
@@ -108,7 +239,7 @@ def lookup_contact(address: str, exclude_source: str = "", tag: str = "cross") -
     addr = (address or "").strip()
     if not addr or not re.search(r"\d", addr):
         return {}
-    if exclude_source != "loopnet":
+    if exclude_source != "loopnet" and (_engine_ok("ddg") or _engine_ok("bing")):
         r = _via_loopnet(addr, tag)
         if r.get("phone"):
             return r
