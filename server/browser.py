@@ -21,13 +21,15 @@ from . import config
 #   - 其余线程（如并行的街景）用独立的 _aux 目录。
 _tls = threading.local()
 _lock = threading.Lock()
-_aux = {"thread": None, "queue": None}
+_aux = {"lanes": {}}    # 工人池：每个工人命名空间一条独立辅助线程（lane → (thread, queue)）
 
 VIEWPORT = {"width": 1440, "height": 900}
 
 
-def _minimize_chrome_window(pid):
+def _minimize_chrome_window(pids):
     """强制将 Playwright 启动的 Chrome 窗口移出屏幕并最小化（不抢焦点）。
+
+    pids：属于本程序启动的 Chrome 进程号集合（见 _profile_pids）。
 
     关键点：
     * 先 SetWindowPos 移到屏幕外（SWP_NOACTIVATE），窗口再出现也不会盖住
@@ -35,7 +37,7 @@ def _minimize_chrome_window(pid):
     * 用 SW_SHOWMINNOACTIVE(7) 而不是 SW_MINIMIZE(6)：后者会激活窗口、
       把键盘焦点抢走，正是"任务跑起来就抢我鼠标键盘"的元凶。
     """
-    if not hasattr(ctypes, "windll"):
+    if not hasattr(ctypes, "windll") or not pids:
         return
     user32 = ctypes.windll.user32
     hwnds = []
@@ -44,12 +46,9 @@ def _minimize_chrome_window(pid):
     def callback(hwnd, _):
         found_pid = ctypes.c_ulong()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(found_pid))
-        cls = ctypes.create_unicode_buffer(128)
-        user32.GetClassNameW(hwnd, cls, 128)
-        same_process = pid and found_pid.value == pid
         # 只处理本程序启动的 Chrome 进程；禁止"找不到 PID 就最小化所有
         # Chrome 窗口"的兜底——那会把用户自己开着的浏览器一并压下去。
-        if pid and same_process and user32.IsWindowVisible(hwnd):
+        if found_pid.value in pids and user32.IsWindowVisible(hwnd):
             hwnds.append(hwnd)
         return True
 
@@ -100,25 +99,48 @@ def _is_profile_locked_error(e: Exception) -> bool:
     return "Opening in existing browser session" in s or "user data directory is already in use" in s
 
 
-def _minimize_context(context):
+def _profile_pids(profile_dir: str) -> set:
+    """按命令行里的 --user-data-dir 找出本配置目录的 Chrome 进程号。
+
+    Playwright 的 Browser 对象不暴露 pid（实测 context.browser.pid 直接
+    AttributeError，异常被吞后 pid 恒为 None，看护线程一直在空转）——
+    所以只能从进程命令行反查：Chrome 主进程必带 --user-data-dir 参数。
+    每个 context 只查一次（结果缓存在 context._our_pids 上）。
+    """
+    d = str(profile_dir)
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+          f"Where-Object {{ $_.CommandLine -like '*{d}*' }} | "
+          "Select-Object -ExpandProperty ProcessId")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=30).stdout
+        return {int(x) for x in out.split() if x.strip().isdigit()}
+    except Exception:
+        return set()
+
+
+def _minimize_context(context, profile_dir=None):
     """在启动、开页和导航后持续压制 Chrome 抢前台。
 
     Chrome 新开窗口/弹窗时会把自己提到最前并抢走键盘焦点；启动后前 20 秒
     最容易反复发生（步骤切换、辅助浏览器弹出）。这里用看护线程在窗口出现
-    的第一时间无激活移出屏幕并最小化，全程不碰用户的鼠标和焦点。
+    的第一时间无激活移出屏幕并最小化 + 设为工具窗口，全程不碰用户的鼠标、
+    焦点和任务栏。
     """
-    browser = getattr(context, "browser", None)
-    try:
-        pid = browser.pid if browser is not None else None
-    except Exception:
-        pid = None
+    pids = getattr(context, "_our_pids", None)
+    if not pids and profile_dir:
+        pids = _profile_pids(str(profile_dir))
+        try:
+            context._our_pids = pids
+        except Exception:
+            pass
 
     def minimize_later():
         # 指数退避看护 ~20s：0.1/0.3/0.6/1/1.5/2/3/4/6/8/10（累计 36.5s 覆盖前段）
         for delay in (0.1, 0.3, 0.6, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0):
             time.sleep(delay)
             try:
-                _minimize_chrome_window(pid)
+                _minimize_chrome_window(pids)
             except Exception:
                 pass
 
@@ -128,7 +150,7 @@ def _minimize_context(context):
     if not getattr(context, "_popup_hook", False):
         try:
             context._popup_hook = True
-            context.on("page", lambda _p: _minimize_chrome_window(pid))
+            context.on("page", lambda _p: _minimize_chrome_window(pids))
         except Exception:
             pass
 
@@ -141,14 +163,27 @@ def _state():
 
 
 def _profile_dir():
-    """任务线程用主配置（保留 LoopNet/Crexi 登录态），辅助线程用 _aux。
+    """按线程命名空间取配置目录：主配置保留 LoopNet/Crexi 登录态，
+    辅助线程用 _aux，工人池每个工人再用 _wN 后缀隔离。
 
     同一个 user-data-dir 不允许两个 Chrome 实例同时打开
     （实测报 "Opening in existing browser session"），所以必须分开目录。
     """
+    name = config.CHROME_PROFILE_DIR.name
+    ns = getattr(_tls, "ns", "") or ""
     if getattr(_tls, "role", "main") == "aux":
-        return config.CHROME_PROFILE_DIR.parent / (config.CHROME_PROFILE_DIR.name + "_aux")
-    return config.CHROME_PROFILE_DIR
+        return config.CHROME_PROFILE_DIR.parent / f"{name}{ns}_aux"
+    return config.CHROME_PROFILE_DIR.parent / f"{name}{ns}"
+
+
+def set_worker_ns(ns: str):
+    """为当前线程设置工人命名空间（工人池配置目录隔离用）。
+
+    "" = 工人1（沿用主配置 chrome_profile，带 Crexi 登录态）；
+    "_w2"/"_w3"… = 后续工人，各自用 chrome_profile_wN / chrome_profile_wN_aux
+    等独立目录，绝不允许两个 Chrome 同时打开同一个 user-data-dir。
+    """
+    _tls.ns = ns or ""
 
 
 def _stop_pw():
@@ -265,7 +300,8 @@ def new_page_in(profile_name: str):
             except Exception:
                 pass
     # 走到这里：没有缓存 / 缓存已死 → 重建（驱动也可能已被 _reset 停掉）
-    d = config.CHROME_PROFILE_DIR.parent / profile_name
+    # 工人命名空间：feeds 等配置目录也按工人隔离（_w2 → chrome_profile_feeds_w2）
+    d = config.CHROME_PROFILE_DIR.parent / (profile_name + (getattr(_tls, "ns", "") or ""))
     last = None
     for attempt in range(2):
         if st.pw is None:
@@ -283,7 +319,7 @@ def new_page_in(profile_name: str):
                     ctx = st.pw.chromium.launch_persistent_context(str(d), **_launch_kw(background=True))
             page = ctx.new_page()
             extra[profile_name] = ctx
-            _minimize_context(ctx)
+            _minimize_context(ctx, d)
             block_translate(page)
             return page
         except Exception as e:
@@ -316,7 +352,7 @@ def _ensure_context():
             _stop_pw()
             st.pw = sync_playwright().start()
             st.context = _launch(profile_dir, **launch_kw)
-        _minimize_context(st.context)
+        _minimize_context(st.context, profile_dir)
     except Exception:
         # 彻底失败：清理驱动，下次任务从干净状态重试
         _stop_pw()
@@ -337,9 +373,14 @@ def close_current():
     _reset()
 
 
-def _aux_loop(q):
-    """常驻辅助线程：独占一个 Chrome（_aux 配置目录），专供并行步骤使用。"""
+def _aux_loop(q, lane: str):
+    """常驻辅助线程：独占一个 Chrome（<主配置><lane>_aux 目录），专供并行步骤使用。
+
+    lane 是工人命名空间（"" = 旧全局道，"_w2"… = 工人2…）：同一工人的街景/
+    查重任务永远走同一条道、同一套配置目录，绝不和别的工人撞 user-data-dir。
+    """
     _tls.role = "aux"
+    _tls.ns = lane
     while True:
         job = q.get()
         if job is None:
@@ -353,16 +394,17 @@ def _aux_loop(q):
             ev.set()
 
 
-def _aux_queue():
+def _aux_queue(lane: str = ""):
     with _lock:
-        t = _aux["thread"]
-        if t is None or not t.is_alive():
+        lanes = _aux["lanes"]
+        t = lanes.get(lane)
+        if t is None or not t[0].is_alive():
             q = queue.Queue()
-            t = threading.Thread(target=_aux_loop, args=(q,), daemon=True,
-                                 name="browser-aux")
+            t = threading.Thread(target=_aux_loop, args=(q, lane), daemon=True,
+                                 name=f"browser-aux{lane or '-global'}")
             t.start()
-            _aux["thread"], _aux["queue"] = t, q
-        return _aux["queue"]
+            lanes[lane] = (t, q)
+        return lanes[lane][1]
 
 
 class _Job:
@@ -378,13 +420,16 @@ class _Job:
 
 
 def submit(fn) -> _Job:
-    """把 fn 丢给常驻辅助线程执行（独立 Chrome/配置目录），立即返回 Job。
+    """把 fn 丢给**当前工人命名空间**的常驻辅助线程执行，立即返回 Job。
 
     为什么不用普通 Thread：Playwright Sync API 的对象绑定创建它的线程，
     每开一个新线程就要重启一次 Chrome（数秒），且并发时配置目录容易冲突；
     常驻线程只启动一次，后续复用。
+
+    工人池语义：调用线程带 _tls.ns（"_w2" 等）→ 任务进对应工人的专属道，
+    用 <配置>_w2_aux 目录；主任务线程（无 ns）走旧的全局道。
     """
-    q = _aux_queue()
+    q = _aux_queue(getattr(_tls, "ns", "") or "")
     box, ev = {}, threading.Event()
     q.put((fn, box, ev))
     return _Job(box, ev)

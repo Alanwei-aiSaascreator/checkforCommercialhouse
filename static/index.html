@@ -136,6 +136,9 @@
         <div class="field"><label>目标通过地址数（最多 100）</label>
           <input id="target" type="number" value="3" min="1" max="100">
           <div style="font-size:12px;color:#9ca3af;margin-top:6px">长任务可分多次跑：翻页进度跨任务记忆，接着上次的位置继续。</div></div>
+        <div class="field"><label>并行工人数量（1-6）</label>
+          <input id="workers" type="number" value="4" min="1" max="6">
+          <div style="font-size:12px;color:#9ca3af;margin-top:6px">几个工人就几倍速度并行核查（每个工人独立浏览器）。机器卡/Smarty 额度紧就调小，赶进度就调大。</div></div>
         <div class="field" style="grid-column:1/-1"><label>步骤1 数据源（可多选，按页轮询汇入同一流水线）</label>
           <div id="srcGroup" style="display:flex; gap:14px; flex-wrap:wrap; font-size:14px">
             <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="srcChk" value="loopnet" checked>LoopNet</label>
@@ -379,7 +382,8 @@ $("#startBtn").onclick = async () => {
   const body = {
     city: $("#city").value.trim(), state: $("#state").value.trim(),
     price_min: +$("#priceMin").value || 0, price_max: +$("#priceMax").value || 2000,
-    target: +$("#target").value || 3, listing_urls: $("#listingUrls").value.trim(),
+    target: +$("#target").value || 3, workers: +$("#workers").value || 1,
+    listing_urls: $("#listingUrls").value.trim(),
     source: [...document.querySelectorAll(".srcChk:checked")].map(c => c.value).join(","),
   };
   if (!body.city || !body.state) return alert("请选择州和城市 / Please select a state and city");

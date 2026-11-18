@@ -124,6 +124,18 @@ def api_record_delete(record_id: int):
 
 # ---------- 运行状态 / 补充核查 ----------
 
+@app.get("/api/debug/last_task")
+def api_debug_last_task():
+    """临时调试：返回最近一个任务的完整日志历史（排查工人池用）。"""
+    if not RUNNERS:
+        return {"none": True}
+    tid = list(RUNNERS)[-1]
+    r = RUNNERS[tid]
+    return {"task_id": tid, "done": r.done, "stopped": r.stopped,
+            "history_len": len(r.history),
+            "tail": r.history[-80:]}
+
+
 @app.get("/api/status")
 def api_status():
     """主任务与补充核查的运行状态（前端用它禁止任务进行中的人工判定）。
@@ -326,6 +338,7 @@ def api_task_start(body: dict):
         "price_min": body.get("price_min") or 0,
         "price_max": body.get("price_max") or 2000,
         "target": min(int(body.get("target") or 3), 100),
+        "workers": min(max(int(body.get("workers") or 1), 1), 6),
         "listing_urls": body.get("listing_urls") or "",
         "source": ",".join(sel),
     }

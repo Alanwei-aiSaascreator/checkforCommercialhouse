@@ -316,12 +316,14 @@ def _is_real_phone(v) -> bool:
 
 
 def _is_real_email(v) -> bool:
-    """格式合法且不是 Crexi 平台邮箱（support@/info@crexi.com）。"""
+    """格式合法且不是 Crexi 平台邮箱。
+
+    实测出现过 support@ / press@ / info@crexi.com——平台自己发的一切邮箱
+    都不是经纪人真实联系方式，凡 @crexi.com 一律过滤（经纪人不会用平台域名）。"""
     s = str(v or "").strip().lower()
     if "@" not in s or "." not in s:
         return False
-    return not (s.endswith("@crexi.com") and
-                s.split("@")[0] in ("support", "info", "contact", "hello"))
+    return not s.endswith("@crexi.com")
 
 
 def _detail_candidate(page, url: str) -> dict:

@@ -19,3 +19,4 @@ _probe_*.py
 .idea/
 Thumbs.db
 .DS_Store
+docs/node_modules/ 

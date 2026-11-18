@@ -31,6 +31,12 @@ def feed_of(source: str):
     return FEEDS.get((source or "loopnet").strip().lower()) or FEEDS["loopnet"]
 
 
+# Smarty 官网免费挖号通道按 IP 限速（1.1s/次），工人池并行时必须全队共享
+# 一条队列，否则 4 个工人同时打 smarty.com 会瞬间触发 429。订阅枚举 API 后
+# 此锁可以移除（API 按套餐并发，不吃 IP 限速）。
+_mine_lock = threading.Lock()
+
+
 def _detail_addr_better(cur: str, det: str) -> bool:
     """详情页地址是否比卡片地址更完整可用。
 
@@ -85,9 +91,15 @@ class TaskRunner:
         self.current_record = 0      # 正在核查的记录 id（中止时用它兜底改判）
         self.current_step = ""       # 正在执行的步骤名（终止进度提示用）
         self._stop_at = 0.0
+        self._wid_tls = threading.local()   # 工人编号（emit 前缀用，线程本地）
+        self._city_bad = False              # 任一源报城市无效 → 全局终止
 
     def _push(self, ev: dict) -> None:
         """日志双写：队列供旧 SSE 消费，history 供刷新后回放。"""
+        wid = getattr(self._wid_tls, "wid", None)
+        if wid:
+            ev = dict(ev)
+            ev["message"] = f"[工人{wid}] {ev.get('message', '')}"
         self.history.append(ev)
         self.events.put(ev)
 
@@ -338,8 +350,9 @@ class TaskRunner:
                     if not fresh:
                         self.emit(f"第 {page_no} 页无全新候选，继续随机换页...", "warn")
                         continue
-                    for c in fresh:
-                        seen_addrs.add(store.normalize(c["address"]))
+                    # seen_addrs 的登记已移交给外层轮询生成器（yield 时登记）：
+                    # 内层这里如果先登记，外层的跨源去重会把整批误判成"已见过"，
+                    # 一条候选都出不去（实测 Tacoma 任务 0 记录的根因）
                     produced += len(fresh)
                     yield fresh
                 plan = []
@@ -442,9 +455,13 @@ class TaskRunner:
         else:
             candidate_stream = _auto_candidate_stream()
 
-        for cand in candidate_stream:
-            if self.stopped:
-                break
+        def _process_one(cand, wid: int):
+            """单个候选的全流程核查（工人池里每个工人独立调用）。
+
+            原主循环体平移而来：loop 层的 continue → return（结束本条），
+            break → return（结束工人循环）。所有局部变量都是每条候选独立的。
+            """
+            nonlocal approved
             # 多源模式：每条候选带着自己的源标记，详情页补抓/记录归属/交叉查询
             # 都要用候选对应的源（而不是任务默认源）
             c_source = (cand.get("source") or source).strip().lower()
@@ -462,7 +479,7 @@ class TaskRunner:
             # 查重前置：与收录表比对
             if store.is_known_address(addr):
                 self.emit(f"命中收录表（已收录过），跳过 → {addr}", "warn")
-                continue
+                return
 
             # 失败档案前置：此前失败过的地址快速跳过（不耗 Smarty 额度/流程时间）。
             # 精确级（含 Suite）命中任何候选都跳过；楼栋级只跳过"无房号"候选，
@@ -470,7 +487,7 @@ class TaskRunner:
             failed_hit, f_reason = store.is_failed_address(addr)
             if failed_hit:
                 self.emit(f"命中失败档案（{f_reason[:60]}），快速跳过 → {addr}", "warn")
-                continue
+                return
 
             # 价格粗判：卡片上的面积常是「整栋/整层可租面积」，直接按它折算会把
             # 预算内的小套间误杀（实测 1150 N State：整层 1,440 SF × $30 = $3,600，
@@ -516,13 +533,14 @@ class TaskRunner:
                 "screenshots": [],  # SOP：搜索页截图不入档
             })
             self.current_record = record_id
+            inflight[wid] = record_id
             shots = []
             spaces: list = list(cand.get("spaces") or [])
             info: dict = {}
 
             # SOP：价格/中介姓名/联系方式/面积都是硬性字段——搜索卡片缺哪个就去详情页补抓
             if self.stopped:
-                break
+                return
             if cand.get("listing_url") and need_detail:
                 self.current_step = "补抓详情页"
                 self.emit("补抓详情页（价格/经纪人/面积/套间表）...")
@@ -618,7 +636,7 @@ class TaskRunner:
                     note = "预算内套间缺少有效面积，无法选择套间，直接淘汰"
                     store.update_record(record_id, conclusion="不通过", notes=note)
                     self.emit(f"  {note}", "warn")
-                    continue
+                    return
                 if not fitted:
                     priced = [s for s in spaces if s.get("monthly") is not None]
                     if not priced:
@@ -632,7 +650,7 @@ class TaskRunner:
                                     f"也已超 ${price_max}/月，淘汰")
                             store.update_record(record_id, conclusion="不通过", notes=note)
                             self.emit(f"  {note}", "warn")
-                            continue
+                            return
                         # 区分「数据缺失」和「换算失败」：全部套间都没单价 = 数据源不报价，
                         # 文案要直接说"需询价"，别写成"无法换算"让人以为解析出问题
                         sizes = sorted(int(s["size"]) for s in spaces
@@ -643,24 +661,24 @@ class TaskRunner:
                             # 报价口径异常不是人工视觉核查事项；不写失败档案，后续重跑可再尝试。
                             store.update_record(record_id, conclusion="不通过", notes=note)
                             self.emit(f"  {note}", "warn")
-                            continue
+                            return
                         if not any(s.get("rate") for s in spaces) and sizes:
                             # 套间完全未报价：不值得进入人工队列，直接淘汰。
                             note = (f"全部 {len(spaces)} 个套间均未报价"
                                     f"（{sizes[0]:,}–{sizes[-1]:,} SF），无报价，直接淘汰")
                             store.update_record(record_id, conclusion="不通过", notes=note)
                             self.emit(f"  {note}", "warn")
-                            continue
+                            return
                         note = "套间无有效报价或无法换算成月租，直接淘汰"
                         store.update_record(record_id, conclusion="不通过", notes=note)
                         self.emit(f"  {note}", "warn")
-                        continue
+                        return
                     cheapest = min(priced, key=lambda s: s["monthly"])
                     note = (f"所有套间均超预算：最小 {cheapest['name']} {cheapest['size']} SF "
                             f"≈ ${cheapest['monthly']:,.0f}/月（要求 ≤${price_max}/月）")
                     store.update_record(record_id, conclusion="不通过", notes=note)
                     self.emit(f"  {note} → 淘汰该房源", "warn")
-                    continue
+                    return
                 # 预算内取「面积最大」的那间（同样合规，空间更实用）
                 monthly, sp = max(fitted, key=lambda x: int(x[1]["size"]))
                 # 单价可能未披露（套间只有 Total Monthly Rent）→ 价格字段写总价，避免留空
@@ -685,14 +703,14 @@ class TaskRunner:
                                 f"套间报价未确认，本轮跳过")
                         store.update_record(record_id, conclusion="不通过", notes=note)
                         self.emit(f"  {note}", "warn")
-                        continue
+                        return
                     src_note = ("详情页已核实无套间明细" if need_detail and cand.get("listing_url")
                                 else "未开详情页（卡片即整租价）")
                     note = (f"价格超区间：{cand.get('price') or '未知'} ≈ ${pmonthly:,.0f}/月，"
                             f"要求 ${price_min}-${price_max}/月（{src_note}，按整栋/整层算）")
                     store.update_record(record_id, conclusion="不通过", notes=note)
                     self.emit(f"  {note} → 淘汰该房源", "warn")
-                    continue
+                    return
                 if pstate == "unknown":
                     # 预算无法判定时不放行（否则 $/SF/YR 缺面积会算出错误月租）
                     if undisclosed:
@@ -704,7 +722,7 @@ class TaskRunner:
                                 f"无法判定是否 ≤${price_max}/月，直接淘汰")
                         store.update_record(record_id, conclusion="不通过", notes=note)
                         self.emit(f"  {note}", "warn")
-                        continue
+                        return
                     # 有价格但缺面积/口径算不出月租 → 同样视为无法判定，直接淘汰；
                     # 但详情页被拦截导致字段缺失的不判死（可能详情页有套间表），转待人工
                     if info.get("blocked"):
@@ -712,17 +730,17 @@ class TaskRunner:
                                 f"本轮无法确认报价，跳过")
                         store.update_record(record_id, conclusion="不通过", notes=note)
                         self.emit(f"  {note}", "warn")
-                        continue
+                        return
                     note = (f"价格无法换算成月租：{cand.get('price') or '未抓到价格'}"
                             f"，面积 {cand.get('area') or '未知'} SF，"
                             f"无法判定是否 ≤${price_max}/月，直接淘汰")
                     store.update_record(record_id, conclusion="不通过", notes=note)
                     self.emit(f"  {note}", "warn")
-                    continue
+                    return
 
             # 步骤1.5 办公房源预筛（SOP 补充：明显非办公房源直接不用，360 全景图优先）
             if self.stopped:
-                break
+                return
             photos = []
             if cand.get("listing_url"):
                 # 详情页已经拿到图片 URL → 直接下，不再开一次同样的详情页（省 ~10s/条）
@@ -746,7 +764,7 @@ class TaskRunner:
                             store.update_record(record_id, conclusion="不通过", notes=note)
                             store.add_failed_address(addr, "预筛", note, building=True)
                             self.emit(f"  {note}", "warn")
-                            continue
+                            return
                         self.emit(f"  AI 预筛：{oc}（置信度 {office.get('confidence', '?')}）"
                                   f" {office.get('reason', '')}",
                                   "pass" if oc == "office" else "warn")
@@ -759,7 +777,7 @@ class TaskRunner:
             # 只有表单 / 占位语）→ 拿地址去其它平台交叉查同楼盘的挂牌。
             # 放在价格/预筛都过关之后：只给真正可能通过核查的候选花交叉查询的时间。
             if self.stopped:
-                break
+                return
             _ph = officespace.OFFICIAL_CONTACT
             if not str(cand.get("phone") or "").strip() or cand.get("phone") == _ph:
                 self.current_step = "跨源交叉查询经纪人电话"
@@ -784,7 +802,7 @@ class TaskRunner:
 
             # 步骤2 Smarty
             if self.stopped:
-                break
+                return
             self.current_step = "步骤2 Smarty 验证"
             self.emit("步骤2：Smarty 验证地址有效性...")
             r2 = smarty.verify_address(addr, tag=f"r{record_id}")
@@ -797,7 +815,7 @@ class TaskRunner:
                 store.update_record(record_id, conclusion="不通过", notes="Smarty 额度耗尽，未完成验证")
                 self.emit(r2["message"], "error")
                 self.stopped = True
-                break
+                return
 
             # SOP 常见问题：缺房间号 → 挖号（房源页线索 → Smarty API → Smarty 官网部件）
             msg_low = r2["message"].lower()
@@ -814,12 +832,14 @@ class TaskRunner:
                     self.emit("Smarty 提示缺房间号，在 Smarty 中挖掘该楼房间号...", "warn")
                     # 房间号只从 Smarty 挖（用户要求）：官方 API（订阅后自动生效）
                     # → 官网免费通道（楼层锚点猜 + DPV 判定，不耗我们账号的 lookups）
-                    suites = smarty.api_mine_suites(addr, max_suites=4)
-                    if suites is None:
-                        self.emit("  API 未订阅房间号枚举，改用官网免费通道探测楼层房号...", "warn")
-                        suites = smarty.web_mine_suites(addr, max_suites=4)
-                    elif suites:
-                        self.emit(f"  Smarty API 返回 {len(suites)} 个房间号")
+                    # 多工人共享一把锁：免费通道按 IP 限速，并行会 429
+                    with _mine_lock:
+                        suites = smarty.api_mine_suites(addr, max_suites=4)
+                        if suites is None:
+                            self.emit("  API 未订阅房间号枚举，改用官网免费通道探测楼层房号...", "warn")
+                            suites = smarty.web_mine_suites(addr, max_suites=4)
+                        elif suites:
+                            self.emit(f"  Smarty API 返回 {len(suites)} 个房间号")
                     merged = list(suites or [])[:4]
                     if merged:
                         self.emit(f"  Smarty 挖到 {len(merged)} 个真实房号（DPV=Y），逐一验证："
@@ -831,9 +851,10 @@ class TaskRunner:
                 # 详情页给的套间没过 → 回退挖号再试（不直接淘汰）
                 if not suite_pass and hint and not self.stopped:
                     self.emit("  该套间验证未通过，回退 Smarty 挖号再试...", "warn")
-                    suites = smarty.api_mine_suites(addr, max_suites=4)
-                    if suites is None:
-                        suites = smarty.web_mine_suites(addr, max_suites=4)
+                    with _mine_lock:
+                        suites = smarty.api_mine_suites(addr, max_suites=4)
+                        if suites is None:
+                            suites = smarty.web_mine_suites(addr, max_suites=4)
                     extra = [s for s in (suites or []) if s != hint][:4]
                     if extra:
                         self.emit("  Smarty 挖到 " + "、".join(
@@ -855,7 +876,7 @@ class TaskRunner:
                 else:
                     if self.stopped:
                         store.update_record(record_id, conclusion="不通过", notes="Smarty 额度耗尽，未完成验证")
-                        break
+                        return
                     # 挖号通道被限流（429/401）时其实没查到，但仍按"验证不完整"淘汰：
                     # 不写失败档案，下次重跑还能重新挖（用户要求：不留待人工）
                     mine_reason = getattr(smarty, "_web_mine_last_error", "") or ""
@@ -864,7 +885,7 @@ class TaskRunner:
                         store.update_record(record_id, conclusion="不通过", notes=note,
                                             screenshots=shots)
                         self.emit(f"  {note}", "warn")
-                        continue
+                        return
                     # Smarty 已明确该地址缺有效房间号（missing secondary / dpv_match=D）：
                     # 结论明确，直接淘汰，不转人工（人工也无法补出房间号）
                     note = (f"Smarty 确认该楼缺有效房间号（{r2['message'][:70]}），"
@@ -872,14 +893,14 @@ class TaskRunner:
                     store.update_record(record_id, conclusion="不通过",
                                         notes=note, screenshots=shots)
                     self.emit(f"  {note}", "warn")
-                    continue
+                    return
             elif r2["status"] == "fail":
                 note = f"Smarty 未通过：{r2['message'][:80]}"
                 store.update_record(record_id, conclusion="不通过", notes=note)
                 # 楼栋级登记：空置/后缀变化/无效等属楼栋属性，下次无房号候选直接跳过
                 store.add_failed_address(addr, "Smarty", note, building=True)
                 self.emit("该地址淘汰，处理下一个候选", "warn")
-                continue
+                return
             if r2["status"] == "suspect":
                 # Smarty 未明确通过/失败时，不属于视觉人工核查；本轮直接跳过。
                 # 不写失败地址档案，后续重跑仍可重新验证，避免人工队列被接口故障灌满。
@@ -887,7 +908,7 @@ class TaskRunner:
                 store.update_record(record_id, conclusion="不通过", notes=note,
                                     screenshots=shots)
                 self.emit(f"  {note}（不进入人工队列）", "warn")
-                continue
+                return
 
             # SOP：步骤3/4 使用 Smarty 双绿后的标准化地址
             check_addr = r2.get("standard_address") or addr
@@ -899,7 +920,7 @@ class TaskRunner:
             # （各自一个 Chrome 实例 + 独立配置目录），互不阻塞。
             # 实测单条：街景 ~26s、查重 ~18s，串行 45s → 并行 ~27s。
             if self.stopped:
-                break
+                return
             self.current_step = "步骤3/4 街景AI对比 + 查重（并行）"
             self.emit("步骤3/4 并行：Google Maps 街景+AI 与 OpenCorporates 查重同时进行...")
             # 街景丢给常驻辅助线程（独立 Chrome/配置目录），本线程同时跑查重
@@ -938,7 +959,7 @@ class TaskRunner:
                     # 只有明确建筑矛盾才写入失败档案；临时渲染/证据不足不拉黑。
                     store.add_failed_address(addr, "街景", reason, building=False)
                     self.emit("步骤3明确外观不符，处理下一个候选", "warn")
-                    continue
+                    return
                 # 技术失败不是人工视觉判断：避免 Google/DeepSeek 暂态故障把队列灌满。
                 # 只有 AI 已完成对比但结论为 suspect，才需要人工看图确认。
                 msg = str(r3.get("message") or "")
@@ -949,11 +970,11 @@ class TaskRunner:
                     reason = f"步骤3技术问题，本轮跳过：{msg[:180]}"
                     store.update_record(record_id, conclusion="不通过", notes=reason)
                     self.emit(f"{reason}（不进入人工队列）", "warn")
-                    continue
+                    return
                 reason = "街景AI已完成但证据不足，待人工复核（未发现明确建筑矛盾）"
                 store.update_record(record_id, conclusion="待人工", notes=reason)
                 self.emit("步骤3 AI 证据不足，转待人工", "warn")
-                continue
+                return
 
             # 步骤4 OpenCorporates（结果已在上面与步骤3 并行取得，这里只报状态）
             self.emit("步骤4：OpenCorporates 查重完成（与步骤3 并行）")
@@ -971,17 +992,131 @@ class TaskRunner:
                     note = f"查重本轮未完成，跳过：{r4.get('message', '')[:160]}"
                     store.update_record(record_id, conclusion="不通过", notes=note)
                 self.emit("该地址未完成查重，本轮跳过", "warn")
-                continue
+                return
 
             # 四步全过 → 通过并写入收录表（供后续查重）
             store.update_record(record_id, conclusion="通过")
             store.import_known_addresses([addr], source="auto")
-            approved += 1
+            with approved_lock:
+                approved += 1
             self.emit(f"✓ 地址核查通过并归档：{addr}", "pass")
+            inflight.pop(wid, None)
 
             if approved >= target:
                 self.emit(f"已达成目标：{approved}/{target} 个通过地址", "pass")
-                break
+                return
+
+        # ---------------- 工人池调度 ----------------
+        # 生产者：候选流（多源轮询）→ 队列；消费者：N 个工人并行跑全流程。
+        # 每个工人：独立 Chrome（配置目录 _wN 隔离）+ 独立辅助道（街景/查重）。
+        n_workers = max(1, min(int(self.params.get("workers") or 1), 6))
+        self.emit(f"工人池：{n_workers} 个工人并行处理候选"
+                  + ("" if n_workers == 1 else "（每工人独立浏览器，任务栏无图标）"))
+        # 队列容量必须够大：生产者翻一页要 8~120s，工人几秒就能吃光小队列。
+        # 容量太小 → 工人大部分时间在等生产者翻页（实测队列=4 时工人大量空转）。
+        # 60 条库存足够工人连续吃几分钟，生产者期间继续从容翻页补货。
+        q: queue.Queue = queue.Queue(maxsize=60)
+        producer_done = threading.Event()
+        approved_lock = threading.Lock()
+        inflight: dict = {}          # wid → 正在核查的 record_id（异常兜底改判用）
+
+        def _produce():
+            # 生产者也要独立浏览器命名空间 "_p"：数据源搜索接口的 Chrome 用
+            # chrome_profile_p 目录，绝不与工人1的主配置 chrome_profile 撞车
+            # （同一 user-data-dir 不允许两个 Chrome 实例，否则互相杀进程）。
+            # Crexi 搜索接口不带登录态也能出候选（登录态只在详情页电话上有用，
+            # 那由工人1的主配置负责）。
+            browser.set_worker_ns("_p")
+            try:
+                for cand in candidate_stream:
+                    if self.stopped or self._city_bad:
+                        break
+                    while not self.stopped:
+                        try:
+                            q.put(cand, timeout=2)
+                            break
+                        except queue.Full:
+                            if approved >= target:
+                                return
+                    if approved >= target:
+                        break
+            finally:
+                browser.close_current()
+                producer_done.set()
+
+        def _dbg(msg: str):
+            """临时调试：工人生命周期写文件（排查用，之后删）。"""
+            try:
+                with open(config.DATA_DIR / "_workers_dbg.log", "a", encoding="utf-8") as f:
+                    import datetime as _dt
+                    f.write(f"{_dt.datetime.now():%H:%M:%S} {msg}\n")
+            except Exception:
+                pass
+
+        def _worker(wid: int):
+            self._wid_tls.wid = wid
+            # 工人1 沿用主配置（保留 Crexi 登录态）；工人2+ 用独立配置目录 _wN
+            browser.set_worker_ns(f"_w{wid}" if wid > 1 else "")
+            try:
+                while not self.stopped:
+                    if approved >= target:
+                        return
+                    try:
+                        cand = q.get(timeout=2)
+                    except queue.Empty:
+                        if producer_done.is_set():
+                            return
+                        continue
+                    if cand is None:
+                        return
+                    _dbg(f"worker {wid} got: {cand.get('address', '?')[:50]}")
+                    try:
+                        _process_one(cand, wid)
+                        _dbg(f"worker {wid} done: {cand.get('address', '?')[:50]}")
+                    except Exception:
+                        _dbg(f"worker {wid} EXC: {traceback.format_exc(limit=8)}")
+                        err = traceback.format_exc(limit=6)
+                        self.emit(f"候选处理异常，按淘汰兜底：{err}", "error")
+                        rec = inflight.pop(wid, None)
+                        if rec:
+                            try:
+                                store.update_record(rec, conclusion="不通过",
+                                                    notes=f"处理异常：{err[:120]}")
+                            except Exception:
+                                pass
+                    else:
+                        inflight.pop(wid, None)
+            finally:
+                # 收尾：本工人没跑完的半成品记录改判不通过（不进人工队列）
+                rec = inflight.pop(wid, None)
+                if rec:
+                    try:
+                        store.update_record(rec, conclusion="不通过",
+                                            notes="任务结束，该地址未完成核查")
+                    except Exception:
+                        pass
+                browser.close_current()
+
+        wths = []
+        if n_workers == 1:
+            # 单工人也走同一套队列机制（行为与旧串行版一致，只是日志带 [工人1]）
+            wths.append(threading.Thread(target=_worker, args=(1,), daemon=True,
+                                         name="worker-1"))
+        else:
+            for i in range(1, n_workers + 1):
+                wths.append(threading.Thread(target=_worker, args=(i,), daemon=True,
+                                             name=f"worker-{i}"))
+        threading.Thread(target=_produce, daemon=True, name="producer").start()
+        for t in wths:
+            t.start()
+        for t in wths:
+            t.join()
+
+        # 兜底：任何仍停留在"核查中"的流水线记录（异常中断/进程收尾）改判不通过
+        try:
+            store.flush_running_records()
+        except Exception:
+            pass
 
         if approved >= target:
             self.emit(f"任务完成：通过 {approved}/{target} 个地址", "pass")

@@ -193,6 +193,26 @@ def init_db() -> None:
             con.close()
 
 
+def flush_running_records() -> int:
+    """把仍停留在"核查中"的流水线记录统一改判不通过（工人池任务收尾兜底）。
+
+    正常路径：每个工人在自己的 finally 里处理各自在途的记录；
+    这里兜底的是异常中断/漏网的，保证半成品不进人工队列。"""
+    with _lock:
+        con = _con()
+        try:
+            cur = con.execute(
+                """UPDATE records SET conclusion='不通过',
+                       notes=CASE WHEN IFNULL(notes,'')=''
+                                  THEN '任务结束，该地址未完成核查'
+                                  ELSE notes END
+                   WHERE conclusion='核查中' AND IFNULL(source,'')!=''""")
+            con.commit()
+            return cur.rowcount
+        finally:
+            con.close()
+
+
 def insert_record(d: dict) -> int:
     addr = d.get("address", "")
     # 新记录默认"核查中"：流水线跑到判定步骤才会写终局结论。
