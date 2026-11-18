@@ -48,12 +48,17 @@ def _minimize_chrome_window(pids):
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(found_pid))
         # 只处理本程序启动的 Chrome 进程；禁止"找不到 PID 就最小化所有
         # Chrome 窗口"的兜底——那会把用户自己开着的浏览器一并压下去。
-        if found_pid.value in pids and user32.IsWindowVisible(hwnd):
+        # 不再用 IsWindowVisible 过滤：窗口被 SW_HIDE 后 IsWindowVisible=False，
+        # 若 Chrome 之后把它重新 SHOW 成最小化，过滤会导致它被漏掉、任务栏
+        # 图标残留。这里对匹配 pid 的所有顶层窗口（可见或已隐藏）一律强制
+        # 工具窗口 + 移出屏幕 + SW_HIDE，窗口一旦被拉起、0.4s 内即被再压回。
+        if found_pid.value in pids:
             hwnds.append(hwnd)
         return True
 
     user32.EnumWindows(callback, 0)
-    SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE = 0x0010, 0x0004, 0x0001
+    SWP_NOACTIVATE, SWP_NOZORDER, SWP_NOSIZE, SWP_FRAMECHANGED = \
+        0x0010, 0x0004, 0x0001, 0x0020
     HWND_BOTTOM = 1
     GWL_EXSTYLE = -20
     WS_EX_TOOLWINDOW = 0x00000080    # 工具窗口：不出现在任务栏
@@ -67,10 +72,12 @@ def _minimize_chrome_window(pids):
                                   ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
         except Exception:
             pass
-        # 无激活移出屏幕（不改变 Z 序、不抢焦点）
+        # 无激活移出屏幕（不改变 Z 序、不抢焦点）；SWP_FRAMECHANGED 让上面
+        # 的 TOOLWINDOW 样式立即重绘生效——否则任务栏按钮会残留、图标成堆。
         try:
             user32.SetWindowPos(hwnd, HWND_BOTTOM, -32000, -32000, 0, 0,
-                                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE)
+                                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE |
+                                SWP_FRAMECHANGED)
         except Exception:
             pass
         # 彻底隐藏窗口（SW_HIDE=0），而不是 SW_SHOWMINNOACTIVE=7（那是"显示但不
@@ -125,6 +132,37 @@ def _profile_pids(profile_dir: str) -> set:
         return set()
 
 
+def _all_profile_pids() -> dict:
+    """一条 PowerShell 查出所有 chrome.exe 的 pid+命令行，按配置目录分组。
+
+    旧版 _pid_refresh_loop 每个目录发一条 PowerShell、10s 轮流刷新：目录一多，
+    一轮要十几秒，新开窗口长时间没人压——任务栏图标反复出现、焦点被抢的
+    窗口期就是这么来的。改成一次查全部、按命令行里的 user-data-dir 子串归组，
+    3s 一轮，任何新窗口最多 3s 内被压住。查询失败抛异常、由调用方保留旧缓存。
+    """
+    dirs = [str(d) for d in _profile_registry]
+    if not dirs:
+        return {}
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+          "ForEach-Object { $_.ProcessId.ToString() + '|' + $_.CommandLine }")
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                         capture_output=True, text=True, timeout=30).stdout
+    mapping: dict = {}
+    for line in out.splitlines():
+        if "|" not in line:
+            continue
+        pid_s, cmd = line.split("|", 1)
+        try:
+            pid = int(pid_s.strip())
+        except ValueError:
+            continue
+        for d in dirs:
+            if d in cmd:
+                mapping.setdefault(d, set()).add(pid)
+                break
+    return mapping
+
+
 # ---------- 全局常驻看护 ----------
 # 单次 context 只看护 ~20s：Aux 道浏览器可能在任务开始几分钟后才首次启动、
 # Chrome 崩溃后自愈重启、页内弹窗晚出现——这些"晚到的窗口"没人压，实测
@@ -171,16 +209,20 @@ def _watchdog_loop():
 
 
 def _pid_refresh_loop():
-    """慢循环：每 10s 轮流用 PowerShell 刷新各配置目录的 Chrome 进程号。"""
+    """慢循环：每 3s 用一条 PowerShell 刷新所有配置目录的 Chrome 进程号。
+
+    查询失败（PowerShell 偶发超时/被杀）时保留上一轮缓存，不中断压制——
+    宁可压着旧 pid，也不能让看护空转漏掉新窗口。
+    """
     while True:
-        for d in list(_profile_registry):
-            try:
-                pids = _profile_pids(d)
-            except Exception:
-                continue
+        try:
+            mapping = _all_profile_pids()
             with _watchdog_lock:
-                _pid_cache[d] = pids
-        time.sleep(10)
+                _pid_cache.clear()
+                _pid_cache.update(mapping)
+        except Exception:
+            pass
+        time.sleep(3)
 
 
 def _minimize_context(context, profile_dir=None):
@@ -373,7 +415,9 @@ def _launch_kw(background=False, **extra):
     if background:
         # 保留有头渲染以支持 Google Maps/WebGL；窗口彻底隐藏（SW_HIDE），
         # 不创建无头窗口，避免街景画布在 headless 下出现黑屏。
-        args.extend(["--start-minimized", "--window-position=-32000,-32000",
+        # 不用 --start-minimized：它是"启动即最小化"，窗口以最小化状态挂在
+        # 任务栏（图标成堆的元凶）。彻底隐藏交给看护线程的 SW_HIDE。
+        args.extend(["--window-position=-32000,-32000",
                      # 窗口隐藏/移出屏幕后 Chrome 会判定"被遮挡/后台"而暂停
                      # 渲染与定时器（街景 WebGL 会停 → 截图黑屏）。禁用这些
                      # 节流/遮挡检测，让隐藏窗口照常渲染，彻底隐藏也不黑屏。
