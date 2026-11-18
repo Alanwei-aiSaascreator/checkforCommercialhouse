@@ -419,6 +419,19 @@ def _ensure_context():
     return st.context
 
 
+def force_kill_all():
+    """强制杀掉本程序启动的所有 Chrome（按配置目录反查进程）。
+
+    用途：任务终止时若有 Playwright 调用僵死（页面挂起、同步调用无超时），
+    协作式终止会永远等不到收尾——杀掉浏览器后，卡死的调用立即抛
+    TargetClosedError，工人线程几秒内退出，任务得以收尾。"""
+    for d in list(_profile_registry):
+        try:
+            _kill_stale_profile_chrome(d)
+        except Exception:
+            pass
+
+
 def close_current():
     """关闭当前线程的 context 与驱动（任务结束时调用，避免残留 Chrome 占住配置目录）。"""
     st = _state()

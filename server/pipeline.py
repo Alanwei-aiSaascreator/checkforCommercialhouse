@@ -117,7 +117,8 @@ class TaskRunner:
                     "message": f"⏹ 已收到终止指令，当前步骤【{step}】正在安全收尾..."})
 
         def _watch():
-            for _ in range(40):            # 最多播报 ~2 分钟，防止异常悬挂时刷屏
+            forced = False
+            for _ in range(80):            # 最多播报 ~4 分钟，防止异常悬挂时刷屏
                 if self.done:
                     return
                 time.sleep(3)
@@ -125,6 +126,20 @@ class TaskRunner:
                     return
                 wait = int(time.time() - self._stop_at)
                 cur = self.current_step or "收尾"
+                if wait >= 30 and not forced:
+                    # 协作终止 30s 还没收尾 = 有 Playwright 调用僵死（页面挂起，
+                    # 同步调用没有超时）。强制杀掉所有工人浏览器：卡死的调用
+                    # 立即抛 TargetClosedError，工人几秒内退出，任务得以收尾。
+                    forced = True
+                    self._push({"time": datetime.now().strftime("%H:%M:%S"),
+                                "level": "warn",
+                                "message": f"⏹ 已等待 30s 仍未收尾（【{cur}】疑似卡死），"
+                                           f"强制关闭全部工人浏览器强制终止..."})
+                    try:
+                        browser.force_kill_all()
+                    except Exception:
+                        pass
+                    continue
                 self._push({"time": datetime.now().strftime("%H:%M:%S"), "level": "warn",
                             "message": f"⏹ 终止中（已等待 {wait}s）：当前在【{cur}】，"
                                        f"完成后立即停止，不再处理后续候选..."})
