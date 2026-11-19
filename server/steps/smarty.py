@@ -7,6 +7,7 @@
   standard_address: USPS 标准化地址
 """
 import html
+import random
 import re
 import threading
 import time
@@ -17,13 +18,39 @@ import httpx
 from .. import browser, config, store
 
 
-# Smarty 请求串行锁（勿删）：
-# 4 个工人并发走同一个本地代理端口时，多个 TLS 连接会被代理/上游重置，
-# 日志表现为成批的 "SSL: UNEXPECTED_EOF_WHILE_READING"；而单条请求永远成功
-# （实测：单条 httpx 返回 401 即认证错误，说明 TLS 正常）。串行化后同一时刻
-# 只建立一个到 Smarty 的连接，从根上消除并发重置。Smarty 单次请求很快
-# （通常 <1s），串行对整体吞吐影响很小。
+# Smarty 请求串行锁 + 全局复用连接（勿删）：
+# 4 个工人并发时，浏览器流量会占满本地代理端口的连接，Smarty 每地址都新建
+# TLS 握手很容易被重置（日志成批 "SSL: UNEXPECTED_EOF_WHILE_READING"）。
+# 两个对策叠加：
+#   1) 串行锁：同一时刻只发一个 Smarty 请求，避免自己挤自己；
+#   2) 全局复用同一个 httpx.Client（keep-alive）：TLS 只在首个请求握手一次，
+#      之后所有地址复用同一条隧道——握手次数从“每地址一次”降到“全局一次”，
+#      被代理重置的概率大幅下降；连接一旦损坏就销毁重建。
 _smarty_lock = threading.Lock()
+_smarty_client = None
+
+
+def _smarty_client_get() -> httpx.Client:
+    """取全局单例 client（调用方必须持有 _smarty_lock）。"""
+    global _smarty_client
+    if _smarty_client is None:
+        _smarty_client = httpx.Client(
+            timeout=30,
+            proxy=config.PROXY_URL or None,
+            limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
+        )
+    return _smarty_client
+
+
+def _smarty_client_reset():
+    """丢弃当前 client 及其连接池（复用中的连接可能已被代理断开）。"""
+    global _smarty_client
+    try:
+        if _smarty_client is not None:
+            _smarty_client.close()
+    except Exception:
+        pass
+    _smarty_client = None
 
 
 def _smarty_query(address: str) -> dict:
@@ -37,21 +64,18 @@ def _smarty_query(address: str) -> dict:
         "auth-id": config.SMARTY_AUTH_ID,
         "auth-token": config.SMARTY_AUTH_TOKEN,
     }
-    proxies = config.PROXY_URL or None
     data = None
-    # 429（频率限制）：按 Retry-After 退避重试；网络/TLS 异常（SSL EOF、
-    # 连接重置）也一并重试，最多 3 次——串行锁负责消除并发重置，这里的
-    # 重试再兜住代理的瞬时抖动。HTTP 状态错误（401/402/4xx）直接抛给上层，
-    # 不参与重试。
-    for attempt in range(3):
+    # 4 次尝试：429 按 Retry-After 退避；网络/TLS 异常（SSL EOF、连接重置）
+    # 走指数退避 + 随机抖动，让浏览器流量先过去再试，避开代理拥塞高峰。
+    # HTTP 状态错误（401/402 等）直接抛给上层，不参与重试。
+    for attempt in range(4):
         try:
             with _smarty_lock:
-                with httpx.Client(timeout=25, proxy=proxies) as client:
-                    r = client.get(
-                        "https://us-street.api.smartystreets.com/street-address",
-                        params=params,
-                    )
-            if r.status_code == 429 and attempt < 2:
+                r = _smarty_client_get().get(
+                    "https://us-street.api.smartystreets.com/street-address",
+                    params=params,
+                )
+            if r.status_code == 429 and attempt < 3:
                 try:
                     wait = float(r.headers.get("Retry-After") or 0)
                 except Exception:
@@ -64,10 +88,13 @@ def _smarty_query(address: str) -> dict:
         except httpx.HTTPStatusError:
             raise
         except Exception:
-            # 网络层异常（SSL/连接重置/超时）：重试，最后一次仍失败才抛给上层
-            if attempt >= 2:
+            # 连接可能已被代理断开：销毁连接池，下次重试重新握手
+            with _smarty_lock:
+                _smarty_client_reset()
+            if attempt >= 3:
                 raise
-            time.sleep(1.5 * (attempt + 1))
+            # 2s / 4s / 8s + 抖动，等浏览器流量过去再试
+            time.sleep(min(2.0 * (2 ** attempt) + random.uniform(0, 1.0), 12.0))
     return (data or [{}])[0]
 
 
