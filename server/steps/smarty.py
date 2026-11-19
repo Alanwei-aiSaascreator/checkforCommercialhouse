@@ -7,10 +7,15 @@
   standard_address: USPS 标准化地址
 """
 import html
+import json
+import os
 import random
 import re
+import shutil
+import subprocess
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 import httpx
@@ -18,14 +23,16 @@ import httpx
 from .. import browser, config, store
 
 
-# Smarty 请求串行锁 + 全局复用连接（勿删）：
-# 4 个工人并发时，浏览器流量会占满本地代理端口的连接，Smarty 每地址都新建
-# TLS 握手很容易被重置（日志成批 "SSL: UNEXPECTED_EOF_WHILE_READING"）。
-# 两个对策叠加：
-#   1) 串行锁：同一时刻只发一个 Smarty 请求，避免自己挤自己；
-#   2) 全局复用同一个 httpx.Client（keep-alive）：TLS 只在首个请求握手一次，
-#      之后所有地址复用同一条隧道——握手次数从“每地址一次”降到“全局一次”，
-#      被代理重置的概率大幅下降；连接一旦损坏就销毁重建。
+# Smarty 请求走独立子进程 curl（勿改回主进程 httpx）：
+# 任务主进程里 4 个 Chrome 会把 CPU/GIL 吃满，主进程内的 TLS 握手经常在代理
+# 超时窗口内完不成，被代理断开 → 成批 "SSL: UNEXPECTED_EOF_WHILE_READING"。
+# 实测：任务运行中另开进程单条 httpx 请求恒为 200（状态 200 长度 907），
+# 说明代理、密钥都正常，失败只发生在主进程内。curl 是独立的 C 程序，
+# 每次新建连接、不抢 GIL，握手瞬间完成，与独立测试走完全相同的路径。
+# curl 不可用时才退回主进程 httpx（串行锁 + 复用长连接）。
+_SMARTY_URL = "https://us-street.api.smartystreets.com/street-address"
+_CURL = shutil.which("curl") or shutil.which("curl.exe")
+
 _smarty_lock = threading.Lock()
 _smarty_client = None
 
@@ -53,6 +60,38 @@ def _smarty_client_reset():
     _smarty_client = None
 
 
+def _smarty_query_via_curl(params: dict) -> dict:
+    """独立子进程 curl 通道：绕开主进程的 CPU/GIL 竞争。"""
+    url = f"{_SMARTY_URL}?{urllib.parse.urlencode(params)}"
+    cmd = [_CURL, "-sS", "--max-time", "30"]
+    if config.PROXY_URL:
+        cmd += ["-x", config.PROXY_URL]
+    cmd += ["-w", "\n%{http_code}", url]
+    kw = {}
+    if os.name == "nt":
+        # CREATE_NO_WINDOW：避免每个请求闪一个控制台窗口
+        kw["creationflags"] = 0x08000000
+    proc = subprocess.run(cmd, capture_output=True, timeout=45, **kw)
+    body, _, code_b = (proc.stdout or b"").rpartition(b"\n")
+    code = code_b.decode("ascii", "replace").strip()
+    req = httpx.Request("GET", url)
+    if not code.isdigit() or int(code) == 0:
+        err = (proc.stderr or b"").decode("utf-8", "replace")[:200]
+        raise RuntimeError(f"curl 请求失败(rc={proc.returncode}): {err}")
+    if code != "200":
+        resp = httpx.Response(int(code), request=req, content=body)
+        raise httpx.HTTPStatusError(f"HTTP {code}", request=req, response=resp)
+    return (json.loads(body.decode("utf-8", "replace")) or [{}])[0]
+
+
+def _smarty_query_via_httpx(params: dict) -> dict:
+    """主进程 httpx 通道（curl 不可用时的兜底）：串行锁 + 复用长连接。"""
+    with _smarty_lock:
+        r = _smarty_client_get().get(_SMARTY_URL, params=params)
+    r.raise_for_status()
+    return (r.json() or [{}])[0]
+
+
 def _smarty_query(address: str) -> dict:
     # 注意（401 根因，勿改回）：
     # 1. auth-token 是 website secret key，只能以 query 参数传递，不支持 HTTP Basic 认证；
@@ -64,38 +103,30 @@ def _smarty_query(address: str) -> dict:
         "auth-id": config.SMARTY_AUTH_ID,
         "auth-token": config.SMARTY_AUTH_TOKEN,
     }
-    data = None
-    # 4 次尝试：429 按 Retry-After 退避；网络/TLS 异常（SSL EOF、连接重置）
-    # 走指数退避 + 随机抖动，让浏览器流量先过去再试，避开代理拥塞高峰。
-    # HTTP 状态错误（401/402 等）直接抛给上层，不参与重试。
+    # 4 次尝试：429 按 Retry-After 退避；网络异常走指数退避 + 抖动。
+    # 每次失败都会换新连接（curl 通道天然新建，httpx 通道销毁连接池重建）。
     for attempt in range(4):
         try:
-            with _smarty_lock:
-                r = _smarty_client_get().get(
-                    "https://us-street.api.smartystreets.com/street-address",
-                    params=params,
-                )
-            if r.status_code == 429 and attempt < 3:
+            if _CURL:
+                return _smarty_query_via_curl(params)
+            return _smarty_query_via_httpx(params)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429 and attempt < 3:
                 try:
-                    wait = float(r.headers.get("Retry-After") or 0)
+                    wait = float(e.response.headers.get("Retry-After") or 0)
                 except Exception:
                     wait = 0
                 time.sleep(min(max(wait, 2.0 * (attempt + 1)), 15.0))
                 continue
-            r.raise_for_status()
-            data = r.json()
-            break
-        except httpx.HTTPStatusError:
             raise
         except Exception:
-            # 连接可能已被代理断开：销毁连接池，下次重试重新握手
-            with _smarty_lock:
-                _smarty_client_reset()
+            if not _CURL:
+                with _smarty_lock:
+                    _smarty_client_reset()
             if attempt >= 3:
                 raise
-            # 2s / 4s / 8s + 抖动，等浏览器流量过去再试
             time.sleep(min(2.0 * (2 ** attempt) + random.uniform(0, 1.0), 12.0))
-    return (data or [{}])[0]
+    return {}
 
 
 def _result_card(tag: str, address: str, ok: bool, lines: list) -> str:
