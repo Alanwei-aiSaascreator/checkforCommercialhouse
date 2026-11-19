@@ -17,6 +17,15 @@ import httpx
 from .. import browser, config, store
 
 
+# Smarty 请求串行锁（勿删）：
+# 4 个工人并发走同一个本地代理端口时，多个 TLS 连接会被代理/上游重置，
+# 日志表现为成批的 "SSL: UNEXPECTED_EOF_WHILE_READING"；而单条请求永远成功
+# （实测：单条 httpx 返回 401 即认证错误，说明 TLS 正常）。串行化后同一时刻
+# 只建立一个到 Smarty 的连接，从根上消除并发重置。Smarty 单次请求很快
+# （通常 <1s），串行对整体吞吐影响很小。
+_smarty_lock = threading.Lock()
+
+
 def _smarty_query(address: str) -> dict:
     # 注意（401 根因，勿改回）：
     # 1. auth-token 是 website secret key，只能以 query 参数传递，不支持 HTTP Basic 认证；
@@ -29,23 +38,36 @@ def _smarty_query(address: str) -> dict:
         "auth-token": config.SMARTY_AUTH_TOKEN,
     }
     proxies = config.PROXY_URL or None
-    # 429（频率限制）：按 Retry-After 退避重试，最多 3 次；仍失败抛给上层按"限流"处理
+    data = None
+    # 429（频率限制）：按 Retry-After 退避重试；网络/TLS 异常（SSL EOF、
+    # 连接重置）也一并重试，最多 3 次——串行锁负责消除并发重置，这里的
+    # 重试再兜住代理的瞬时抖动。HTTP 状态错误（401/402/4xx）直接抛给上层，
+    # 不参与重试。
     for attempt in range(3):
-        with httpx.Client(timeout=25, proxy=proxies) as client:
-            r = client.get(
-                "https://us-street.api.smartystreets.com/street-address",
-                params=params,
-            )
-        if r.status_code == 429 and attempt < 2:
-            try:
-                wait = float(r.headers.get("Retry-After") or 0)
-            except Exception:
-                wait = 0
-            time.sleep(min(max(wait, 2.0 * (attempt + 1)), 15.0))
-            continue
-        r.raise_for_status()
-        data = r.json()
-        break
+        try:
+            with _smarty_lock:
+                with httpx.Client(timeout=25, proxy=proxies) as client:
+                    r = client.get(
+                        "https://us-street.api.smartystreets.com/street-address",
+                        params=params,
+                    )
+            if r.status_code == 429 and attempt < 2:
+                try:
+                    wait = float(r.headers.get("Retry-After") or 0)
+                except Exception:
+                    wait = 0
+                time.sleep(min(max(wait, 2.0 * (attempt + 1)), 15.0))
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+        except httpx.HTTPStatusError:
+            raise
+        except Exception:
+            # 网络层异常（SSL/连接重置/超时）：重试，最后一次仍失败才抛给上层
+            if attempt >= 2:
+                raise
+            time.sleep(1.5 * (attempt + 1))
     return (data or [{}])[0]
 
 
