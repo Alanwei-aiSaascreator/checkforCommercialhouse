@@ -5,13 +5,22 @@ OpenAI 兼容 chat 接口，多图输入，要求返回 JSON：
 """
 import base64
 import json
+import os
 import re
+import threading
 import time
 from pathlib import Path
 
 import httpx
 
 from . import config
+
+# 全局并发闸门：同一时刻最多几个 AI 请求在飞。
+# 默认 4 = 当前 4 个工人各一路（预筛/外观对比），不改变现有速度；
+# 作用是把上限钉死——将来若把外观对比挪出工人线程（并发会变 8 路），
+# DeepSeek 按账号限流就会连环 429（每次退避 3-20s，比排队还慢）。
+# 需要调高/调低：环境变量 DEEPSEEK_CONCURRENCY。
+_AI_SEM = threading.Semaphore(max(1, int(os.getenv("DEEPSEEK_CONCURRENCY", "4"))))
 
 _PROMPT = """你是商业地产核查专家。前面几张图是【同一地址】的 Google 街景（多个不同朝向视角，
 可能有树木遮挡、只拍到局部墙面、或拍摄年代不同），之后几张是房源详情页（LoopNet/Crexi）的建筑照片。
@@ -150,7 +159,8 @@ def _post_chat(payload: dict, headers: dict, proxies):
     """POST chat/completions。429（每分钟请求数/token 限额）按 Retry-After 退避重试，
     最多 3 次——不加这个，限流会被上层当成"AI 判定失败"，好地址被误淘汰。"""
     for attempt in range(3):
-        with httpx.Client(timeout=150, proxy=proxies) as client:
+        # 只锁住"发请求 + 收响应"这段；429 的退避等待在锁外，不占名额
+        with _AI_SEM, httpx.Client(timeout=150, proxy=proxies) as client:
             r = client.post(f"{config.DEEPSEEK_BASE_URL}/chat/completions",
                             json=payload, headers=headers)
         if r.status_code == 429 and attempt < 2:

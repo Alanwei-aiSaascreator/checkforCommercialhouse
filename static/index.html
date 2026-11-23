@@ -5,14 +5,30 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>地址核查自动化</title>
 <style>
+  /* 配色令牌：整站颜色都从这里取，换主题只改这一段 */
+  :root {
+    --brand: #4f46e5;          /* 主色：靛蓝 */
+    --brand-dark: #4338ca;
+    --brand-soft: #eef2ff;
+    --ink: #0f172a;            /* 主文字 */
+    --ink-2: #334155;
+    --muted: #64748b;
+    --muted-2: #94a3b8;
+    --bg: #f6f7fb;             /* 页面底色 */
+    --border: #e6e8ef;
+    --border-strong: #cfd4e0;
+    --ok: #0f7a4a;  --ok-soft: #e8f6ee;     /* 通过 */
+    --bad: #c0281d; --bad-soft: #fdecea;    /* 不通过 */
+    --warn: #a35c07; --warn-soft: #fef3c7;  /* 待人工 / 警告 */
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif; background: #f3f4f6; color: #1f2937; }
+  body { font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif; background: var(--bg); color: var(--ink); }
   .wrap { max-width: 1560px; margin: 0 auto; padding: 20px 16px 60px; }
 
   /* 头部 */
   .hero { display: flex; align-items: center; gap: 14px; padding: 18px 22px; border-radius: 14px;
-          background: linear-gradient(100deg, #0e7c5a 0%, #0a5c43 70%, #084d38 100%);
-          color: #fff; box-shadow: 0 6px 18px rgba(10,92,67,.25); }
+         background: linear-gradient(100deg, #4f46e5 0%, #4338ca 65%, #3730a3 100%);
+         color: #fff; box-shadow: 0 6px 18px rgba(79,70,229,.24); }
   .hero .icon { width: 46px; height: 46px; border-radius: 12px; background: rgba(255,255,255,.16);
                 display: flex; align-items: center; justify-content: center; font-size: 26px; }
   .hero h1 { font-size: 22px; letter-spacing: .5px; }
@@ -21,14 +37,17 @@
   /* 标签页 */
   .tabs { display: flex; gap: 10px; margin: 18px 0; flex-wrap: wrap; }
   .tab { border: none; cursor: pointer; padding: 10px 20px; border-radius: 10px; font-size: 14px;
-         background: #e5e7eb; color: #374151; transition: all .15s; }
+         background: var(--border); color: var(--ink-2); transition: all .15s; }
   .tab:hover { background: #d9dde3; }
-  .tab.active { background: #0b6b4f; color: #fff; font-weight: 600; }
+  .tab.active { background: var(--brand); color: #fff; font-weight: 600;
+                box-shadow: 0 2px 8px rgba(79,70,229,.28); }
   .tab .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 5px; border-radius: 9px;
-                font-size: 12px; background: rgba(255,255,255,.25); }
+               font-size: 12px; font-weight: 600; background: var(--brand-soft); color: var(--brand-dark);
+               font-variant-numeric: tabular-nums; }
+  .tab.active .badge { background: rgba(255,255,255,.24); color: #fff; }
 
   /* 卡片 */
-  .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 22px; }
+  .card { background: #fff; border: 1px solid var(--border); border-radius: 14px; padding: 22px; }
   .page { display: none; }
   .page.active { display: block; }
 
@@ -36,59 +55,76 @@
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 20px; }
   .field label { display: block; font-size: 13px; color: #4b5563; margin-bottom: 6px; }
   .field input, .field textarea, .field select { width: 100%; padding: 10px 12px; font-size: 14px;
-       border: 1px solid #d1d5db; border-radius: 8px; outline: none; background: #fff; }
-  .field input:focus, .field select:focus { border-color: #0e7c5a; box-shadow: 0 0 0 3px rgba(14,124,90,.12); }
+       border: 1px solid var(--border-strong); border-radius: 8px; outline: none; background: #fff; }
+  .field input:focus, .field select:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(79,70,229,.14); }
   .btn { border: none; cursor: pointer; padding: 11px 22px; border-radius: 9px; font-size: 14px;
-         background: #0e7c5a; color: #fff; font-weight: 600; transition: background .15s; }
-  .btn:hover { background: #0b6b4f; }
-  .btn:disabled { background: #9ca3af; cursor: not-allowed; }
-  .btn.gray { background: #6b7280; } .btn.gray:hover { background: #4b5563; }
-  .btn.red { background: #b3261e; } .btn.red:hover { background: #8f1e18; }
+         background: var(--brand); color: #fff; font-weight: 600; transition: background .15s; }
+  .btn:hover { background: var(--brand-dark); }
+  .btn:disabled { background: var(--muted-2); cursor: not-allowed; }
+  .btn.gray { background: var(--muted); } .btn.gray:hover { background: #4b5563; }
+  .btn.red { background: var(--bad); } .btn.red:hover { background: #9c2017; }
   .btn.sm { padding: 6px 14px; font-size: 13px; }
-  .note { margin-top: 16px; font-size: 13px; color: #6b7280; line-height: 1.7; }
+  .note { margin-top: 16px; font-size: 13px; color: var(--muted); line-height: 1.7; }
 
   /* 日志 */
-  .log { margin-top: 16px; background: #0f172a; color: #d1fae5; border-radius: 10px; padding: 14px;
+  .log { margin-top: 16px; background: #0b1220; color: #e2e8f0; border-radius: 10px; padding: 14px;
          font-family: Consolas, Menlo, monospace; font-size: 13px; height: 340px; overflow-y: auto;
          line-height: 1.75; white-space: pre-wrap; word-break: break-all; display: none; }
   .log .pass { color: #6ee7b7; } .log .warn { color: #fcd34d; } .log .error { color: #fca5a5; }
   .shots { margin-top: 12px; display: none; flex-wrap: wrap; gap: 10px; }
-  .shots img { width: 180px; border-radius: 8px; border: 1px solid #e5e7eb; cursor: zoom-in; }
+  .shots img { width: 180px; border-radius: 8px; border: 1px solid var(--border); cursor: zoom-in; }
 
   /* 表格 */
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; padding: 9px 10px; background: #f9fafb; color: #6b7280; font-weight: 600;
-       border-bottom: 1px solid #e5e7eb; white-space: nowrap; }
-  td { padding: 9px 10px; border-bottom: 1px solid #f3f4f6; vertical-align: top; }
-  tr:hover td { background: #f9fafb; }
-  .badge-pass { color: #0b6b4f; background: #d1fae5; padding: 2px 10px; border-radius: 9px; font-size: 12px; }
-  .badge-fail { color: #b3261e; background: #fee2e2; padding: 2px 10px; border-radius: 9px; font-size: 12px; }
-  .badge-pending { color: #92400e; background: #fef3c7; padding: 2px 10px; border-radius: 9px; font-size: 12px; }
+  th { text-align: left; padding: 9px 10px; background: #f8fafc; color: var(--muted); font-weight: 600;
+       border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:hover td { background: #f8fafc; }
+  .badge-pass { color: var(--ok); background: var(--ok-soft); padding: 2px 10px; border-radius: 9px; font-size: 12px; }
+  .badge-fail { color: var(--bad); background: var(--bad-soft); padding: 2px 10px; border-radius: 9px; font-size: 12px; }
+  .badge-pending { color: var(--warn); background: var(--warn-soft); padding: 2px 10px; border-radius: 9px; font-size: 12px; }
   /* 数据源小标签：LoopNet / Crexi 两条线一眼分开 */
   .src { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 9px;
-         font-size: 11px; background: #e5e7eb; color: #374151; vertical-align: middle; }
+         font-size: 11px; background: var(--border); color: var(--ink-2); vertical-align: middle; }
   .src.crexi { background: #dbeafe; color: #1e40af; }
   .src.cityfeet { background: #dcfce7; color: #166534; }
   .src.cc { background: #fef3c7; color: #92400e; }
   .src.os { background: #ede9fe; color: #5b21b6; }
   .src.cbre { background: #e0f2fe; color: #075985; }
-  .steps { font-size: 12px; color: #6b7280; line-height: 1.7; }
-  .thumb { width: 74px; height: 48px; object-fit: cover; border-radius: 6px; border: 1px solid #e5e7eb;
+  .steps { font-size: 12px; color: var(--muted); line-height: 1.7; }
+  .thumb { width: 74px; height: 48px; object-fit: cover; border-radius: 6px; border: 1px solid var(--border);
            margin: 2px 4px 2px 0; cursor: zoom-in; }
   .addr { font-weight: 600; }
-  .addr a { color: #0e7c5a; text-decoration: none; }
-  .empty { text-align: center; color: #9ca3af; padding: 40px 0; font-size: 14px; }
+  .addr a { color: var(--brand); text-decoration: none; }
+  .empty { text-align: center; color: var(--muted-2); padding: 40px 0; font-size: 14px; }
+
+  /* 记录页计数条：各结论条数，可直接点着切换筛选 */
+  .rec-stats { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 2px 0 14px; }
+  .rec-stat { display: inline-flex; align-items: center; gap: 7px; padding: 6px 13px; cursor: pointer;
+              border: 1px solid var(--border); border-radius: 999px; background: #fff;
+              font-size: 13px; color: var(--ink-2); transition: all .15s; }
+  .rec-stat:hover { border-color: var(--brand); color: var(--brand-dark); }
+  .rec-stat.on { background: var(--brand-soft); border-color: var(--brand);
+                 color: var(--brand-dark); font-weight: 600; }
+  .rec-stat b { font-size: 14px; font-variant-numeric: tabular-nums; }
+  .rec-stat .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted-2); }
+  .rec-stat.total .dot { background: var(--brand); }
+  .rec-stat.pass .dot { background: var(--ok); }
+  .rec-stat.fail .dot { background: var(--bad); }
+  .rec-stat.pend .dot { background: #d97706; }
+  .rec-stat.run .dot { background: #0284c7; }
+  .rec-count { margin-left: auto; font-size: 12px; color: var(--muted); }
   .shot-missing { display: inline-block; min-width: 74px; padding: 15px 8px; margin: 2px 4px 2px 0;
-                  font-size: 12px; color: #9ca3af; text-align: center;
-                  border: 1px dashed #d1d5db; border-radius: 6px; }
-  h3.sec { font-size: 15px; margin-bottom: 12px; color: #374151; }
+                  font-size: 12px; color: var(--muted-2); text-align: center;
+                  border: 1px dashed var(--border-strong); border-radius: 6px; }
+  h3.sec { font-size: 15px; margin-bottom: 12px; color: var(--ink-2); }
 
   /* 已收录列表 */
   .known-list { margin-top: 14px; max-height: 380px; overflow-y: auto; }
-  .known-item { padding: 8px 12px; border-bottom: 1px solid #f3f4f6; font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }
-  .known-item span.muted { color: #9ca3af; }
-  .kedit, .kdel { margin-left: 4px; padding: 1px 7px; font-size: 12px; border: 1px solid #d1d5db;
-                  border-radius: 4px; background: #fff; cursor: pointer; color: #374151; }
+  .known-item { padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 13px; display: flex; justify-content: space-between; gap: 8px; }
+  .known-item span.muted { color: var(--muted-2); }
+  .kedit, .kdel { margin-left: 4px; padding: 1px 7px; font-size: 12px; border: 1px solid var(--border-strong);
+                  border-radius: 4px; background: #fff; cursor: pointer; color: var(--ink-2); }
   .kedit:hover { background: #eff6ff; border-color: #93c5fd; }
   .kdel { color: #b91c1c; }
   .kdel:hover { background: #fef2f2; border-color: #fca5a5; }
@@ -102,6 +138,43 @@
   .record-details div { margin: 6px 0 8px; white-space: pre-wrap; line-height: 1.45; max-width: 520px; }
   .review-tag { display:inline-block; margin-top:5px; padding:2px 8px; border-radius:10px;
                 background:#fef3c7; color:#92400e; font-size:12px; font-weight:600; }
+
+  /* ---------- 任务进度总览 ---------- */
+  .panel { margin-top: 18px; background: #fff; border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px; }
+  .pg-row { display: grid; grid-template-columns: repeat(5, minmax(104px, 1fr)); gap: 14px; }
+  .pg-label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .pg-val { font-size: 21px; font-weight: 700; color: #111827; font-variant-numeric: tabular-nums; }
+  .pg-val.ok { color: var(--ok); }
+  .pg-bar { margin-top: 16px; height: 10px; border-radius: 6px; background: #eef0f7; overflow: hidden; }
+  .pg-fill { height: 100%; width: 0; border-radius: 6px;
+             background: linear-gradient(90deg, #6366f1, #4f46e5); transition: width .5s; }
+  .pg-foot { margin-top: 10px; font-size: 12px; color: var(--muted-2);
+             display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+
+  /* ---------- 工人分栏 ---------- */
+  .wk-grid { margin-top: 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .wk { background: #fff; border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+        display: flex; flex-direction: column; }
+  .wk-head { display: flex; align-items: center; gap: 8px; padding: 11px 14px;
+             background: #f8fafc; border-bottom: 1px solid #eef2f7; }
+  .wk-name { font-weight: 700; font-size: 14px; }
+  .wk-dot { width: 9px; height: 9px; border-radius: 50%; background: #cbd5e1; flex: none; }
+  .wk-dot.busy { background: #16a34a; box-shadow: 0 0 0 3px rgba(22,163,74,.15); }
+  .wk-dot.stuck { background: #f59e0b; }
+  .wk-dot.idle { background: #cbd5e1; }
+  .wk-state { margin-left: auto; font-size: 12px; color: var(--muted); }
+  .wk-addr { padding: 9px 14px; font-size: 13px; font-weight: 600; color: #111827;
+             border-bottom: 1px solid #f5f7fa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wk-log { height: 186px; overflow-y: auto; background: #0b1220; color: #cbd5e1; padding: 10px 12px;
+            font-family: Consolas, Menlo, monospace; font-size: 12px; line-height: 1.7;
+            white-space: pre-wrap; word-break: break-all; }
+  .wk-log .pass { color: #6ee7b7; } .wk-log .warn { color: #fcd34d; } .wk-log .error { color: #fca5a5; }
+  .wk-foot { display: flex; gap: 16px; padding: 8px 14px; font-size: 12px; color: var(--muted);
+             background: #fbfcfe; border-top: 1px solid #eef2f7; }
+  .wk-foot b { color: #111827; font-variant-numeric: tabular-nums; }
+  .log-head { margin-top: 20px; display: flex; align-items: center; justify-content: space-between;
+              gap: 10px; font-size: 13px; color: #4b5563; font-weight: 600; }
+  .hint { font-size: 12px; color: var(--muted-2); }
 </style>
 </head>
 <body>
@@ -116,7 +189,7 @@
 
   <div class="tabs">
     <button class="tab active" data-page="new">新建核查任务</button>
-    <button class="tab" data-page="records">核查记录</button>
+    <button class="tab" data-page="records">核查记录 <span class="badge" id="recBadge">0</span></button>
     <button class="tab" data-page="review">待人工复核 <span class="badge" id="reviewBadge">0</span></button>
     <button class="tab" data-page="known">收录地址表</button>
   </div>
@@ -135,10 +208,10 @@
           <input id="priceMax" type="number" value="2000" min="0"></div>
         <div class="field"><label>目标通过地址数（最多 100）</label>
           <input id="target" type="number" value="3" min="1" max="100">
-          <div style="font-size:12px;color:#9ca3af;margin-top:6px">长任务可分多次跑：翻页进度跨任务记忆，接着上次的位置继续。</div></div>
+          <div style="font-size:12px;color:var(--muted-2);margin-top:6px">长任务可分多次跑：翻页进度跨任务记忆，接着上次的位置继续。</div></div>
         <div class="field"><label>并行工人数量（1-6）</label>
           <input id="workers" type="number" value="4" min="1" max="6">
-          <div style="font-size:12px;color:#9ca3af;margin-top:6px">几个工人就几倍速度并行核查（每个工人独立浏览器）。机器卡/Smarty 额度紧就调小，赶进度就调大。</div></div>
+          <div style="font-size:12px;color:var(--muted-2);margin-top:6px">几个工人就几倍速度并行核查（每个工人独立浏览器）。机器卡/Smarty 额度紧就调小，赶进度就调大。</div></div>
         <div class="field" style="grid-column:1/-1"><label>步骤1 数据源（可多选，按页轮询汇入同一流水线）</label>
           <div id="srcGroup" style="display:flex; gap:14px; flex-wrap:wrap; font-size:14px">
             <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="srcChk" value="loopnet" checked>LoopNet</label>
@@ -149,7 +222,7 @@
             <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="srcChk" value="officespace">OfficeSpace</label>
             <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="srcChk" value="cbre">CBRE</label>
           </div>
-          <div style="font-size:12px;color:#9ca3af;margin-top:6px">
+          <div style="font-size:12px;color:var(--muted-2);margin-top:6px">
             多源同时工作：按页轮流采集，候选自动去重；单一源被反爬拦截不影响其他源继续。100 个目标预计需连续运行数小时至一天以上（每条约 1.5–3 分钟，通过率 5–10%），任务中断可接着跑。
           </div></div>
       </div>
@@ -157,12 +230,34 @@
         <label>手动房源链接（可选，一行一个；LoopNet / Crexi 详情页链接均可，反爬时兜底）</label>
         <textarea id="listingUrls" rows="3" placeholder="https://www.loopnet.com/Listing/... 或 https://www.crexi.com/lease/properties/..."></textarea>
       </div>
-      <div style="margin-top:16px; display:flex; gap:10px;">
+      <div style="margin-top:16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap">
         <button class="btn" id="startBtn">开始核查</button>
         <button class="btn red" id="stopBtn" style="display:none">终止任务</button>
+        <span class="hint" id="taskMeta"></span>
       </div>
       <p class="note">流程全自动执行：收录表查重 → 步骤1（LoopNet 或 Crexi）→ Smarty 双绿 → 街景AI对比 → OpenCorporates ≤5；不确定项自动保守淘汰，无需人工介入。<br>
         Crexi 未登录时详情页电话/邮箱被打码，这两项会留空（价格/面积/套间/经纪公司照常抓取），需要联系方式时用 LoopNet 跑或人工补。</p>
+
+      <!-- 任务进度总览：时间 + 通过数 + 预计剩余 -->
+      <div class="panel" id="progressCard" style="display:none">
+        <div class="pg-row">
+          <div><div class="pg-label">状态</div><div class="pg-val" id="pgState">—</div></div>
+          <div><div class="pg-label">已用时</div><div class="pg-val" id="pgElapsed">00:00</div></div>
+          <div><div class="pg-label">通过 / 目标</div><div class="pg-val ok" id="pgPass">0 / 0</div></div>
+          <div><div class="pg-label">已处理候选</div><div class="pg-val" id="pgProcessed">0</div></div>
+          <div><div class="pg-label">预计剩余</div><div class="pg-val" id="pgEta">—</div></div>
+        </div>
+        <div class="pg-bar"><div class="pg-fill" id="pgFill"></div></div>
+        <div class="pg-foot"><span id="pgFoot"></span><span id="pgRate"></span></div>
+      </div>
+
+      <!-- 每个工人一块独立面板：当前地址 + 自己的日志 + 计数 -->
+      <div class="wk-grid" id="workerGrid"></div>
+
+      <div class="log-head">
+        <span>总控日志（翻页 / 任务级信息，各工人明细见上方面板）</span>
+        <button class="btn sm gray" id="logToggle">展开</button>
+      </div>
       <div class="log" id="log"></div>
       <div class="shots" id="shots"></div>
     </div>
@@ -174,15 +269,15 @@
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; flex-wrap:wrap; gap:8px">
         <h3 class="sec" style="margin:0">核查记录</h3>
         <div style="display:flex; gap:8px; flex-wrap:wrap">
-          <input id="recKeyword" placeholder="搜索地址/中介/电话/邮箱" style="padding:6px 10px;font-size:13px;border:1px solid #d1d5db;border-radius:8px;width:200px">
-          <select id="recFilter" style="padding:6px 8px;font-size:13px;border:1px solid #d1d5db;border-radius:8px">
+          <input id="recKeyword" placeholder="搜索地址/中介/电话/邮箱" style="padding:6px 10px;font-size:13px;border:1px solid var(--border-strong);border-radius:8px;width:200px">
+          <select id="recFilter" style="padding:6px 8px;font-size:13px;border:1px solid var(--border-strong);border-radius:8px">
             <option value="通过" selected>通过（成功档案）</option>
             <option value="">全部结论</option>
             <option value="不通过">不通过（失败档案）</option>
             <option value="待人工">待人工</option>
             <option value="核查中">核查中（任务正在处理）</option>
           </select>
-          <select id="recSource" style="padding:6px 8px;font-size:13px;border:1px solid #d1d5db;border-radius:8px">
+          <select id="recSource" style="padding:6px 8px;font-size:13px;border:1px solid var(--border-strong);border-radius:8px">
             <option value="">全部数据源</option>
             <option value="loopnet">LoopNet</option>
             <option value="crexi">Crexi</option>
@@ -200,6 +295,7 @@
           <button class="btn sm red" id="clearHistoryBtn">清空历史</button>
         </div>
       </div>
+      <div class="rec-stats" id="recStats"></div>
       <div style="overflow-x:auto">
         <table>
           <thead><tr><th style="width:30px"><input type="checkbox" id="recPickAll" title="全选当前列表"></th><th>时间</th><th>数据源</th><th>地址</th><th>电话</th><th>邮箱</th><th>价格</th><th>面积/人数</th><th>四步结果</th><th>结论</th><th>截图</th><th>操作</th></tr></thead>
@@ -222,11 +318,11 @@
         <div class="field" style="grid-column:1/-1"><label>邮箱</label><input id="mEmail"></div>
         <div class="field" style="grid-column:1/-1"><label>网址（房源链接 LoopNet / Crexi）</label><input id="mUrl"></div>
         <div class="field"><label>结论</label>
-          <select id="mConclusion" style="width:100%;padding:10px 12px;font-size:14px;border:1px solid #d1d5db;border-radius:8px">
+          <select id="mConclusion" style="width:100%;padding:10px 12px;font-size:14px;border:1px solid var(--border-strong);border-radius:8px">
             <option>待人工</option><option>通过</option><option>不通过</option><option>核查中</option>
           </select></div>
         <div class="field"><label>已复核</label>
-          <select id="mReviewed" style="width:100%;padding:10px 12px;font-size:14px;border:1px solid #d1d5db;border-radius:8px">
+          <select id="mReviewed" style="width:100%;padding:10px 12px;font-size:14px;border:1px solid var(--border-strong);border-radius:8px">
             <option value="0">否</option><option value="1">是</option>
           </select></div>
         <div class="field" style="grid-column:1/-1"><label>备注</label><textarea id="mNotes" rows="3"></textarea></div>
@@ -272,7 +368,7 @@
     <div class="card">
       <h3 class="sec">收录地址表（已核查通过，用于后续查重）</h3>
       <div style="display:flex; gap:8px; margin-bottom:12px; align-items:center;">
-        <input id="knownSearch" placeholder="搜索地址..." style="flex:1; padding:7px 10px; border:1px solid #d1d5db; border-radius:6px; font-size:13px;">
+        <input id="knownSearch" placeholder="搜索地址..." style="flex:1; padding:7px 10px; border:1px solid var(--border-strong); border-radius:6px; font-size:13px;">
         <button class="btn sm" id="exportKnownBtn">导出 Excel</button>
       </div>
       <div style="display:flex; gap:8px; margin-bottom:10px; align-items:center; flex-wrap:wrap;">
@@ -378,6 +474,121 @@ document.addEventListener("error", e => {
 
 /* ---------- 新建任务 ---------- */
 let running = false, es = null;
+let startedAt = 0, pollTimer = null, tickTimer = null;
+let stat = {approved: 0, target: 0, processed: 0};
+const wkEls = {};
+
+/* 秒 → 时:分:秒 */
+function fmtDur(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  const p = n => String(n).padStart(2, "0");
+  return (h ? h + ":" + p(m) : p(m)) + ":" + p(s);
+}
+
+/* 建一个工人面板（幂等） */
+function ensureWorker(wid) {
+  if (wkEls[wid]) return wkEls[wid];
+  const el = document.createElement("div");
+  el.className = "wk";
+  el.innerHTML = '<div class="wk-head"><span class="wk-dot idle"></span>' +
+    '<span class="wk-name">工人 ' + wid + '</span>' +
+    '<span class="wk-state">等待开工</span></div>' +
+    '<div class="wk-addr">—</div><div class="wk-log"></div>' +
+    '<div class="wk-foot"><span>通过 <b class="wk-pass">0</b></span>' +
+    '<span>最近活动 <b class="wk-ago">—</b></span></div>';
+  $("#workerGrid").appendChild(el);
+  const o = {root: el, log: el.querySelector(".wk-log"), addr: el.querySelector(".wk-addr"),
+             dot: el.querySelector(".wk-dot"), state: el.querySelector(".wk-state"),
+             pass: el.querySelector(".wk-pass"), ago: el.querySelector(".wk-ago"), ts: 0};
+  wkEls[wid] = o;
+  return o;
+}
+
+function resetWorkerPanel(n) {
+  $("#workerGrid").innerHTML = "";
+  Object.keys(wkEls).forEach(k => delete wkEls[k]);
+  for (let i = 1; i <= Math.max(1, n | 0); i++) ensureWorker(i);
+}
+
+/* 往某个工人的面板里追加一行日志（自动裁掉过老的，避免页面变慢） */
+function appendWorker(wid, msg, level, t) {
+  const w = ensureWorker(wid);
+  const div = document.createElement("div");
+  if (level) div.className = level;
+  div.textContent = (t ? "[" + t + "] " : "") + msg;
+  w.log.appendChild(div);
+  while (w.log.childElementCount > 300) w.log.removeChild(w.log.firstChild);
+  w.log.scrollTop = w.log.scrollHeight;
+  w.ts = Date.now() / 1000;
+  w.dot.className = "wk-dot busy";
+  w.state.textContent = "进行中";
+}
+
+/* 进度总览渲染 */
+function renderProgress(state) {
+  const el = $("#progressCard");
+  if (el) el.style.display = "block";
+  const el2 = (id) => document.getElementById(id);
+  const elapsed = startedAt ? Date.now() / 1000 - startedAt : 0;
+  el2("pgState").textContent = state || "运行中";
+  el2("pgElapsed").textContent = fmtDur(elapsed);
+  el2("pgPass").textContent = stat.approved + " / " + (stat.target || "—");
+  el2("pgProcessed").textContent = stat.processed;
+  const pct = stat.target ? Math.min(100, stat.approved / stat.target * 100) : 0;
+  el2("pgFill").style.width = pct + "%";
+  let eta = "—";
+  if (stat.target && stat.approved >= stat.target) eta = "已达成";
+  else if (stat.approved > 0 && elapsed > 0) eta = fmtDur(elapsed / stat.approved * (stat.target - stat.approved));
+  el2("pgEta").textContent = eta;
+  const perPass = stat.approved > 0 && elapsed > 0 ? elapsed / stat.approved / 60 : 0;
+  el2("pgFoot").textContent = stat.target
+    ? "完成度 " + pct.toFixed(1) + "%（按通过数计）· 目标 " + stat.target + " 条通过"
+    : "";
+  el2("pgRate").textContent = perPass
+    ? "平均 " + perPass.toFixed(1) + " 分钟 / 1 条通过"
+    : "样本不足，暂无法估算剩余时间";
+}
+
+/* 每秒刷新已用时，每 3 秒拉一次服务端计数与工人状态 */
+function startTimers() {
+  stopTimers();
+  tickTimer = setInterval(() => {
+    if (startedAt) document.getElementById("pgElapsed").textContent =
+      fmtDur(Date.now() / 1000 - startedAt);
+  }, 1000);
+  pollTimer = setInterval(refreshRunStatus, 3000);
+  refreshRunStatus();
+}
+function stopTimers() {
+  if (tickTimer) clearInterval(tickTimer);
+  if (pollTimer) clearInterval(pollTimer);
+  tickTimer = pollTimer = null;
+}
+
+async function refreshRunStatus() {
+  try {
+    const st = await (await fetch("/api/status")).json();
+    if (!st.task_running) return;
+    if (st.started_at) startedAt = st.started_at;
+    stat.approved = st.approved || 0; stat.target = st.target || stat.target;
+    stat.processed = st.processed || 0;
+    renderProgress("运行中");
+    const ws = st.workers || {};
+    Object.keys(ws).forEach(k => {
+      const wid = +k, w = ws[k], o = ensureWorker(wid);
+      if (w.addr) o.addr.textContent = w.addr;
+      o.pass.textContent = w.pass || 0;
+      const now = Date.now() / 1000;
+      const ago = w.ts ? Math.max(0, now - w.ts) : -1;
+      o.ago.textContent = ago < 0 ? "—" : (ago < 60 ? Math.round(ago) + " 秒前" : Math.round(ago / 60) + " 分钟前");
+      const stuck = ago > 180;
+      o.dot.className = "wk-dot " + (stuck ? "stuck" : (w.addr ? "busy" : "idle"));
+      if (stuck) o.state.textContent = "无活动 " + Math.round(ago / 60) + " 分钟";
+      else if (w.addr) o.state.textContent = "进行中";
+    });
+  } catch {}
+}
 $("#startBtn").onclick = async () => {
   const body = {
     city: $("#city").value.trim(), state: $("#state").value.trim(),
@@ -394,14 +605,23 @@ $("#startBtn").onclick = async () => {
   const {task_id} = await r.json();
   running = true;
   $("#startBtn").disabled = true; $("#stopBtn").style.display = "";
-  $("#log").style.display = "block"; $("#log").textContent = ""; $("#shots").style.display = "flex"; $("#shots").innerHTML = "";
+  $("#shots").style.display = "flex"; $("#shots").innerHTML = "";
+  $("#log").textContent = ""; setLogOpen(false);
+  startedAt = Date.now() / 1000;
+  stat = {approved: 0, target: body.target || 0, processed: 0};
+  $("#taskMeta").textContent = body.city + ", " + body.state + " · "
+    + (body.price_min || 0) + "-" + (body.price_max || 0) + "$/月 · "
+    + body.workers + " 个工人 · 目标 " + body.target + " 条通过";
+  resetWorkerPanel(body.workers);
+  renderProgress("运行中");
+  startTimers();
   listen(task_id);
 };
 $("#stopBtn").onclick = () => {
   if (!es || !es._taskId) return;
   $("#stopBtn").disabled = true;
   $("#stopBtn").textContent = "终止中…（当前步骤安全收尾）";
-  appendLog("已发送终止指令，等待当前步骤收尾（进度见下方日志）...", "warn");
+  appendLog("已发送终止指令，等待当前步骤收尾（进度见上方面板）...", "warn");
   fetch(`/api/tasks/${es._taskId}/stop`, {method: "POST"});
 };
 
@@ -410,7 +630,13 @@ function listen(taskId) {
   es._taskId = taskId;
   es.onmessage = m => {
     const ev = JSON.parse(m.data);
-    appendLog(`[${ev.time}] ${ev.message}`, ev.level);
+    // 工人日志分栏：新事件带 worker 字段；老日志回放没有该字段时从 [工人N] 前缀兜底解析
+    const hit = ev.worker || (String(ev.message).match(/^\[工人(\d+)\]/) || [])[1];
+    if (hit) {
+      appendWorker(+hit, String(ev.message).replace(/^\[工人\d+\]\s*/, ""), ev.level, ev.time);
+    } else {
+      appendLog(`[${ev.time}] ${ev.message}`, ev.level);
+    }
   };
   es.addEventListener("screenshot", m => {
     const ev = JSON.parse(m.data);
@@ -423,11 +649,18 @@ function listen(taskId) {
   });
   es.addEventListener("done", () => {
     es.close(); running = false;
+    stopTimers();
     $("#startBtn").disabled = false; $("#stopBtn").style.display = "none";
     $("#stopBtn").disabled = false; $("#stopBtn").textContent = "终止任务";
+    renderProgress("已结束");
+    Object.keys(wkEls).forEach(k => {
+      const o = wkEls[k];
+      if (o.dot.className.indexOf("stuck") < 0) o.dot.className = "wk-dot idle";
+      o.state.textContent = "已停止";
+    });
     appendLog("—— 任务结束 ——", "pass");
   });
-  es.onerror = () => { es.close(); running = false;
+  es.onerror = () => { es.close(); running = false; stopTimers();
     $("#startBtn").disabled = false; $("#stopBtn").style.display = "none";
     $("#stopBtn").disabled = false; $("#stopBtn").textContent = "终止任务"; };
 }
@@ -442,20 +675,37 @@ async function restoreRunningTask() {
     $("#startBtn").disabled = true;
     $("#stopBtn").style.display = "";
     $("#stopBtn").disabled = false; $("#stopBtn").textContent = "终止任务";
-    $("#log").style.display = "block";
-    $("#log").textContent = "";
+    $("#log").textContent = ""; setLogOpen(false);
     $("#shots").style.display = "flex";
+    startedAt = st.started_at || Date.now() / 1000;
+    stat = {approved: st.approved || 0, target: st.target || 0, processed: st.processed || 0};
+    resetWorkerPanel(st.workers_n || Object.keys(st.workers || {}).length || 1);
+    renderProgress("运行中");
+    startTimers();
+    $("#taskMeta").textContent = [st.city && (st.city + ", " + st.state),
+      st.price_max && ((st.price_min || 0) + "-" + st.price_max + "$/月"),
+      st.workers_n && (st.workers_n + " 个工人"),
+      st.target && ("目标 " + st.target + " 条通过")].filter(Boolean).join(" · ");
     if (st.current_step) appendLog(`[恢复] 任务正在后台执行：${st.current_step}`, "warn");
-    appendLog("[恢复] 已重新连接任务日志流（上方为刷新前的进度回放）。", "warn");
+    appendLog("[恢复] 已重新连接任务日志流：工人明细在各自面板，总控信息在此栏。", "warn");
     listen(st.task_id);
   } catch {}
 }
 restoreRunningTask();
+
+/* 总控日志展开/收起（默认收起，避免长日志挤占页面） */
+function setLogOpen(open) {
+  $("#log").style.display = open ? "block" : "none";
+  $("#logToggle").textContent = open ? "收起" : "展开";
+}
+$("#logToggle").onclick = () => setLogOpen($("#log").style.display !== "block");
+
 function appendLog(msg, level) {
   const div = document.createElement("div");
   if (level) div.className = level;
   div.textContent = msg;
   $("#log").appendChild(div);
+  if ($("#log").childElementCount > 2000) $("#log").removeChild($("#log").firstChild);
   $("#log").scrollTop = $("#log").scrollHeight;
 }
 
@@ -497,17 +747,64 @@ $("#clearHistoryBtn").onclick = async () => {
   loadRecords();
 };
 
-async function loadRecords() {
+/* 计数条：各结论条数 + 当前列表条数；点某一条即切换筛选 */
+function renderRecStats(s, matched, shown) {
+  const box = $("#recStats");
+  if (!box) return;
+  s = s || {};
+  const cur = $("#recFilter").value;
+  const items = [["", "全部", s.total || 0, "total"],
+                 ["通过", "通过", s["通过"] || 0, "pass"],
+                 ["不通过", "不通过", s["不通过"] || 0, "fail"],
+                 ["待人工", "待人工", s["待人工"] || 0, "pend"],
+                 ["核查中", "核查中", s["核查中"] || 0, "run"]];
+  box.innerHTML = items.map(([v, label, n, cls]) =>
+      `<button class="rec-stat ${cls}${cur === v ? " on" : ""}" data-f="${v}">` +
+      `<span class="dot"></span>${label} <b>${n}</b></button>`).join("")
+    + `<span class="rec-count">当前筛选 ${matched} 条`
+    + (shown < matched ? ` · 已显示 ${shown} 条` : "")
+    + (s.reviewed ? ` · 已人工复核 ${s.reviewed} 条` : "") + "</span>";
+  box.querySelectorAll(".rec-stat").forEach(btn => {
+    btn.onclick = () => { $("#recFilter").value = btn.dataset.f; loadRecords(); };
+  });
+  if ($("#recBadge")) $("#recBadge").textContent = s.total || 0;
+}
+
+/* 没进记录页时也让页签上的总数是准的 */
+async function refreshRecBadge() {
+  try {
+    const s = await (await fetch("/api/records/stats")).json();
+    if ($("#recBadge")) $("#recBadge").textContent = s.total || 0;
+  } catch {}
+}
+refreshRecBadge();
+
+let recShownLimit = 200;   // 单次最多渲染多少行（全部 1900+ 条一口气渲染会卡几秒）
+
+async function loadRecords(reset = true) {
+  if (reset) recShownLimit = 200;
   const kw = $("#recKeyword").value.trim(), cf = $("#recFilter").value;
   const src = $("#recSource").value;
   const qs = new URLSearchParams();
   if (kw) qs.set("keyword", kw);
   if (cf) qs.set("conclusion", cf);
   if (src) qs.set("source", src);
-  const recs = await (await fetch("/api/records?" + qs.toString())).json();
+  // 计数不吃 conclusion（点了「通过」后其它分类的数字仍要真实），只跟关键字/数据源
+  const sqs = new URLSearchParams();
+  if (kw) sqs.set("keyword", kw);
+  if (src) sqs.set("source", src);
+  const [recs, stats] = await Promise.all([
+    fetch("/api/records?" + qs.toString()).then(r => r.json()),
+    fetch("/api/records/stats?" + sqs.toString()).then(r => r.ok ? r.json() : null).catch(() => null),
+  ]);
   const tb = $("#recordsBody");
-  if (!recs.length) { tb.innerHTML = `<tr><td colspan="10" class="empty">暂无记录</td></tr>`; return; }
-  tb.innerHTML = recs.map(r => {
+  if (!recs.length) {
+    renderRecStats(stats, 0, 0);
+    tb.innerHTML = `<tr><td colspan="12" class="empty">暂无记录</td></tr>`; return;
+  }
+  const shown = recs.slice(0, recShownLimit);
+  renderRecStats(stats, recs.length, shown.length);
+  tb.innerHTML = shown.map(r => {
     const badge = r.conclusion === "通过" ? "badge-pass" : r.conclusion === "不通过" ? "badge-fail" : "badge-pending";
     // 只展示三类：双绿验证卡 / LoopNet 房源图 / 查重截图（街景图入档但不在此展示）
     const allShots = r.screenshots || [];
@@ -541,6 +838,13 @@ async function loadRecords() {
       </td></tr>`;
   }).join("");
   $("#recPickAll").checked = false;   // 重新渲染后清掉全选态
+  if (recs.length > shown.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="12" style="text-align:center; padding:14px">` +
+      `<button class="btn sm gray" id="recMore">显示更多（已显示 ${shown.length} / ${recs.length}）</button></td>`;
+    tb.appendChild(tr);
+    $("#recMore").onclick = () => { recShownLimit += 200; loadRecords(false); };
+  }
 }
 
 /* ---------- 记录增删改（弹窗） ---------- */
@@ -720,7 +1024,7 @@ function renderKnown() {
         <label style="display:flex; align-items:center; gap:8px; flex:1; min-width:0;">
           <input type="checkbox" class="ksel" data-id="${k.id}">
           ${knownEdit
-            ? `<input class="kinput" data-id="${k.id}" value="${esc(k.raw)}" style="flex:1; padding:5px 8px; border:1px solid #d1d5db; border-radius:4px; font-size:13px;">`
+            ? `<input class="kinput" data-id="${k.id}" value="${esc(k.raw)}" style="flex:1; padding:5px 8px; border:1px solid var(--border-strong); border-radius:4px; font-size:13px;">`
             : `<span class="kaddr" data-id="${k.id}" title="点击修改该地址" style="cursor:pointer">${esc(k.raw)}</span>`}
         </label>
         <span class="muted" style="white-space:nowrap">

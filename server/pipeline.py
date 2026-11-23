@@ -93,6 +93,19 @@ class TaskRunner:
         self._stop_at = 0.0
         self._wid_tls = threading.local()   # 工人编号（emit 前缀用，线程本地）
         self._city_bad = False              # 任一源报城市无效 → 全局终止
+        # ---- 进度快照（前端进度条 / 工人面板读取，只写不参与判定）----
+        self.started_at = 0.0               # 任务开始时间戳（前端算已用时）
+        self.approved = 0                   # 已通过数（approved 的镜像）
+        self.processed = 0                  # 已开始处理的候选数
+        self.worker_stats: dict = {}        # wid → {addr, last, level, ts, pass}
+        self._stats_lock = threading.Lock()
+
+    def _wstat(self, wid: int) -> dict:
+        """取（必要时创建）某个工人的状态字典，供前端分栏展示。"""
+        with self._stats_lock:
+            return self.worker_stats.setdefault(
+                wid, {"addr": "", "last": "", "level": "", "ts": 0.0,
+                      "pass": 0, "started_at": 0.0})
 
     def _push(self, ev: dict) -> None:
         """日志双写：队列供旧 SSE 消费，history 供刷新后回放。"""
@@ -100,6 +113,7 @@ class TaskRunner:
         if wid:
             ev = dict(ev)
             ev["message"] = f"[工人{wid}] {ev.get('message', '')}"
+            ev["worker"] = wid   # 结构化字段：前端据此把日志分到各工人的独立面板
         self.history.append(ev)
         self.events.put(ev)
 
@@ -154,6 +168,11 @@ class TaskRunner:
         threading.Thread(target=_watch, daemon=True).start()
 
     def emit(self, msg: str, level: str = "info") -> None:
+        wid = getattr(self._wid_tls, "wid", None)
+        if wid:
+            # 顺手记下该工人"最后一条日志"，前端工人面板显示当前在干什么
+            st = self._wstat(wid)
+            st["last"], st["level"], st["ts"] = msg, level, time.time()
         self._push(
             {"time": datetime.now().strftime("%H:%M:%S"), "level": level, "message": msg}
         )
@@ -188,6 +207,7 @@ class TaskRunner:
             browser.reset_stop()   # 新任务启动：清掉上次任务的终止标记
         except Exception:
             pass
+        self.started_at = time.time()   # 前端"已用时"的起点
         p = self.params
         city, state = p["city"], p["state"]
         price_min, price_max = int(p.get("price_min") or 0), int(p.get("price_max") or 2000)
@@ -505,6 +525,12 @@ class TaskRunner:
             break → return（结束工人循环）。所有局部变量都是每条候选独立的。
             """
             nonlocal approved
+            _t0 = time.time()
+
+            def _lap(label: str) -> None:
+                """分段计时：只写日志、不改任何判定，用来定位真实瓶颈。"""
+                self.emit(f"  ⏱ 累计 {time.time() - _t0:5.1f}s ｜ {label}")
+
             # 多源模式：每条候选带着自己的源标记，详情页补抓/记录归属/交叉查询
             # 都要用候选对应的源（而不是任务默认源）
             c_source = (cand.get("source") or source).strip().lower()
@@ -518,6 +544,12 @@ class TaskRunner:
                 cand["address"] = addr
             else:
                 self.emit(f"—— 候选地址：{addr}")
+
+            # 前端工人面板：这个工人当前在核查哪条地址 + 已开工条数
+            self._wstat(wid)["addr"] = addr
+            self._wstat(wid)["started_at"] = time.time()
+            with self._stats_lock:
+                self.processed += 1
 
             # 查重前置：与收录表比对
             if store.is_known_address(addr):
@@ -829,6 +861,7 @@ class TaskRunner:
                         self.emit(f"  AI 预筛调用失败（不阻断流程，稍后街景对比兜底）：{e}", "warn")
                 else:
                     self.emit("  未抓到房源照片，跳过预筛（街景步骤将跳过外观比对）", "warn")
+            _lap("步骤1 详情页 + 照片下载 + AI 预筛")
 
             # SOP：电话是硬字段。本源没给电话（Crexi 未登录打码 / CommercialCafe
             # 只有表单 / 占位语）→ 拿地址去其它平台交叉查同楼盘的挂牌。
@@ -971,6 +1004,8 @@ class TaskRunner:
                 self.emit(f"  {note}（不进入人工队列）", "warn")
                 return
 
+            _lap("电话交叉查询 + 步骤2 Smarty")
+
             # SOP：步骤3/4 使用 Smarty 双绿后的标准化地址
             check_addr = r2.get("standard_address") or addr
             if check_addr != addr:
@@ -1008,6 +1043,8 @@ class TaskRunner:
             if not isinstance(r3, dict) or "status" not in r3:
                 r3 = {"status": "suspect", "screenshot": "", "extra_shots": [],
                       "message": "街景步骤无有效返回"}
+
+            _lap("步骤3 街景AI对比 + 步骤4 查重（并行）")
 
             shots.append(r3.get("screenshot", ""))
             shots.extend(r3.get("extra_shots") or [])
@@ -1060,6 +1097,11 @@ class TaskRunner:
             store.import_known_addresses([addr], source="auto")
             with approved_lock:
                 approved += 1
+            with self._stats_lock:
+                self.approved = approved
+                self.worker_stats.setdefault(
+                    wid, {"addr": addr, "last": "", "level": "", "ts": 0.0, "pass": 0,
+                          "started_at": 0.0})["pass"] += 1
             self.emit(f"✓ 地址核查通过并归档：{addr}", "pass")
             inflight.pop(wid, None)
 

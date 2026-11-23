@@ -313,6 +313,38 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return d
 
 
+def records_stats(keyword: str = "", source: str = "") -> dict:
+    """记录计数（给页面顶部的统计条用）。
+
+    故意不吃 conclusion 过滤：点了「通过」之后其它数字仍要显示真实值，
+    否则每点一次筛选，别的分类全变 0，看不出总量。keyword/source 跟着变。
+    """
+    conds, args = [], []
+    if source:
+        conds.append("source=?")
+        args.append(source.strip().lower())
+    if keyword:
+        like = f"%{keyword}%"
+        conds.append("(address LIKE ? OR agent LIKE ? OR phone LIKE ? OR email LIKE ?"
+                     " OR listing_url LIKE ? OR notes LIKE ?)")
+        args += [like] * 6
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+    con = _con()
+    try:
+        out = {"通过": 0, "不通过": 0, "待人工": 0, "核查中": 0}
+        for k, n in con.execute(
+                "SELECT conclusion, COUNT(*) FROM records" + where + " GROUP BY conclusion",
+                args).fetchall():
+            out[k or "其他"] = n
+        out["total"] = sum(out.values())
+        out["reviewed"] = con.execute(
+            "SELECT COUNT(*) FROM records" + where
+            + (" AND " if where else " WHERE ") + "reviewed=1", args).fetchone()[0]
+        return out
+    finally:
+        con.close()
+
+
 def list_records(conclusion: str = "", keyword: str = "",
                  source: str = "") -> list[dict]:
     """核查记录列表（倒序）。conclusion 精确过滤；keyword 模糊匹配地址/中介/电话/邮箱/网址；

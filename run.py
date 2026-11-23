@@ -58,6 +58,12 @@ def api_records(conclusion: str = "", keyword: str = "", source: str = ""):
                               source=source.strip().lower())
 
 
+@app.get("/api/records/stats")
+def api_records_stats(keyword: str = "", source: str = ""):
+    """记录计数：各结论条数 + 总数 + 已人工复核数（不受结论筛选影响）。"""
+    return store.records_stats(keyword=keyword.strip(), source=source.strip().lower())
+
+
 @app.post("/api/records")
 def api_record_create(body: dict):
     addr = (body.get("address") or "").strip()
@@ -150,8 +156,18 @@ def api_status():
     附带当前任务 id 与步骤：页面刷新后靠它恢复运行界面、重连 SSE。"""
     st = recheck_status()
     tid, runner = active_task()
+    p = (getattr(runner, "params", None) or {}) if runner else {}
     return {"task_running": task_running(), "task_id": tid,
             "current_step": getattr(runner, "current_step", "") or "",
+            # ---- 进度面板用：时间 + 计数 + 每个工人的实时状态 ----
+            "started_at": getattr(runner, "started_at", 0.0) or 0.0,
+            "approved": getattr(runner, "approved", 0) or 0,
+            "processed": getattr(runner, "processed", 0) or 0,
+            "target": int(p.get("target") or 0),
+            "workers_n": int(p.get("workers") or 0),
+            "city": p.get("city") or "", "state": p.get("state") or "",
+            "price_min": p.get("price_min") or 0, "price_max": p.get("price_max") or 0,
+            "workers": {str(k): v for k, v in (getattr(runner, "worker_stats", {}) or {}).items()},
             "recheck_running": st.get("running", False),
             "recheck_record_id": st.get("record_id")}
 
