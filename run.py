@@ -64,6 +64,41 @@ def api_records_stats(keyword: str = "", source: str = ""):
     return store.records_stats(keyword=keyword.strip(), source=source.strip().lower())
 
 
+@app.post("/api/email-enrich")
+def api_email_enrich(body: dict):
+    """邮箱旁路反查（手动触发，独立于主线流水线，不占浏览器/Akamai）。
+
+    body: {"limit": 50, "min_conf": 50, "dry_run": false}
+    """
+    if not store.config.APOLLO_API_KEY and not store.config.HUNTER_API_KEY:
+        return {"ok": False, "error": "未配置邮箱反查 key（data/config.json 的 apollo_api_key 或 hunter_api_key）"}
+    from server.email_enrich import find_email, is_missing
+
+    limit = int(body.get("limit") or 50)
+    min_conf = int(body.get("min_conf") or store.config.EMAIL_ENRICH_MIN_CONF)
+    dry_run = bool(body.get("dry_run"))
+
+    recs = store.list_records(conclusion="通过")
+    todo = [r for r in recs if is_missing(r.get("email")) and (r.get("agent") or "").strip()]
+    todo.sort(key=lambda r: r.get("id") or 0)
+
+    hit = miss = skip = 0
+    done = []
+    for r in todo[:limit]:
+        email, score, status = find_email(r.get("agent"))
+        if status == "hit" and score >= min_conf:
+            hit += 1
+            if not dry_run:
+                store.update_record(r["id"], email=email)
+            done.append({"id": r["id"], "agent": r.get("agent"), "email": email, "score": score})
+        elif status == "miss":
+            miss += 1
+        else:
+            skip += 1
+    return {"ok": True, "pending": len(todo), "hit": hit, "miss": miss,
+            "skip": skip, "dry_run": dry_run, "done": done}
+
+
 @app.post("/api/records")
 def api_record_create(body: dict):
     addr = (body.get("address") or "").strip()

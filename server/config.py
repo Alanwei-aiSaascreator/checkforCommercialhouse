@@ -34,6 +34,16 @@ DEEPSEEK_VISION_MODEL = os.environ.get("DEEPSEEK_VISION_MODEL", "deepseek-flash"
 # OpenCorporates 查重阈值：同址注册公司数 ≤ 5 视为通过
 OPENCORPORATES_LIMIT = int(os.environ.get("OPENCORPORATES_LIMIT", "5"))
 
+# 邮箱旁路反查：不碰浏览器，用 姓名+公司 → 反查邮箱，写回 records.email。
+# 两个数据源二选一（都配了则优先 Apollo，一步到位不需要先查域名）：
+#   - Apollo.io：people/match，按 姓名+公司名 直接匹配，认证用 X-Api-Key 头。
+#   - Hunter.io：两步（公司名→域名 → 域名+姓名→邮箱），认证用 query 参数。
+# 留空=禁用；EMAIL_ENRICH_MIN_CONF 为置信度阈值，低于该分的邮箱不采纳。
+HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "")
+APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "")
+EMAIL_ENRICH_ENABLED = os.environ.get("EMAIL_ENRICH_ENABLED", "1") not in ("0", "false", "False")
+EMAIL_ENRICH_MIN_CONF = int(os.environ.get("EMAIL_ENRICH_MIN_CONF", "50"))
+
 # LoopNet 翻页策略：不再限制页数——先探出该搜索条件的真实总页数，
 # 再把「所有未检查过的页」打乱顺序全部遍历（跨任务记住已查页码）。
 # （旧的 LOOPNET_PAGE_POOL / LOOPNET_MAX_PAGES 已废弃）
@@ -49,11 +59,13 @@ def _load_config_json() -> None:
         cfg = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return
-    global SMARTY_AUTH_ID, SMARTY_AUTH_TOKEN, DEEPSEEK_API_KEY, PROXY_URL
+    global SMARTY_AUTH_ID, SMARTY_AUTH_TOKEN, DEEPSEEK_API_KEY, PROXY_URL, HUNTER_API_KEY, APOLLO_API_KEY
     SMARTY_AUTH_ID = SMARTY_AUTH_ID or str(cfg.get("smarty_auth_id") or "")
     SMARTY_AUTH_TOKEN = SMARTY_AUTH_TOKEN or str(cfg.get("smarty_auth_token") or "")
     DEEPSEEK_API_KEY = DEEPSEEK_API_KEY or str(cfg.get("deepseek_api_key") or "")
     PROXY_URL = PROXY_URL or str(cfg.get("proxy_url") or "")
+    HUNTER_API_KEY = HUNTER_API_KEY or str(cfg.get("hunter_api_key") or "")
+    APOLLO_API_KEY = APOLLO_API_KEY or str(cfg.get("apollo_api_key") or "")
 
 
 _load_config_json()
