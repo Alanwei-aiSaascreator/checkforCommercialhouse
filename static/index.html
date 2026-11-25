@@ -92,6 +92,11 @@
   .src.os { background: #ede9fe; color: #5b21b6; }
   .src.cbre { background: #e0f2fe; color: #075985; }
   .steps { font-size: 12px; color: var(--muted); line-height: 1.7; }
+  /* 长文本列：限宽 + 自动换行，避免超长邮箱/多号码电话把表格撑破 */
+  td.wrap { white-space: normal; word-break: break-word; overflow-wrap: anywhere; line-height: 1.5; }
+  td.w-phone { min-width: 120px; max-width: 150px; }
+  td.w-mail  { min-width: 190px; max-width: 230px; }
+  td.w-price { min-width: 110px; max-width: 160px; }
   .thumb { width: 74px; height: 48px; object-fit: cover; border-radius: 6px; border: 1px solid var(--border);
            margin: 2px 4px 2px 0; cursor: zoom-in; }
   .addr { font-weight: 600; }
@@ -822,9 +827,9 @@ async function loadRecords(reset = true) {
       <td style="white-space:nowrap">${srcChip(r.source) || "—"}</td>
       <td class="addr"><a href="${esc(r.listing_url)}" target="_blank" rel="noopener">${esc(r.address)}</a>
         ${r.agent ? `<div class="steps">${esc(r.agent)}</div>` : ""}</td>
-      <td style="white-space:nowrap">${esc(r.phone || "—")}</td>
-      <td style="white-space:nowrap">${esc(r.email || "—")}</td>
-      <td style="white-space:nowrap">${esc(r.price || "—")}</td>
+      <td class="wrap w-phone">${esc(r.phone || "—").replace(/ \/ /g, "<br>")}</td>
+      <td class="wrap w-mail">${esc(r.email || "—").replace(/ \/ /g, "<br>")}</td>
+      <td class="wrap w-price">${esc(r.price || "—")}</td>
       <td style="white-space:nowrap">${esc(r.area || "—")}</td>
       <td class="steps record-details">
         ${[["步骤1",r.step1],["步骤2",r.step2],["步骤3",r.step3],["步骤4",r.step4]].filter(x => x[1]).map(x => `<details><summary>${x[0]}</summary><div>${esc(x[1])}</div></details>`).join("")}
