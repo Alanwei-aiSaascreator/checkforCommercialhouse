@@ -203,6 +203,21 @@
   <div class="page active" id="page-new">
     <div class="card">
       <div class="grid">
+        <div class="field" style="grid-column:1/-1">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600">
+            <input type="checkbox" id="stateScope" style="width:16px;height:16px">
+            超级轮次：跑完整个州（城市自动发现，逐个城市跑完再切下一个）
+          </label>
+          <div id="scopeRow" style="display:none; margin-top:10px; gap:18px; align-items:center; flex-wrap:wrap">
+            <span>最多跑 <input id="maxCities" type="number" value="50" min="1" max="300" style="width:78px"> 个城市</span>
+            <span>最长 <input id="maxHours" type="number" value="24" min="1" max="240" style="width:78px"> 小时</span>
+            <span style="font-size:12px;color:var(--muted-2)">到点自动收尾，已翻的页会记住，下次接着跑</span>
+          </div>
+          <div style="font-size:12px;color:var(--muted-2);margin-top:6px">
+            城市清单从 CommercialCafe 州 sitemap 自动抓取（加州约 278 个），大城市优先；
+            全州累计通过数达到下方「目标通过地址数」即自动结束。
+          </div>
+        </div>
         <div class="field"><label>城市 / City</label>
           <select id="city" disabled><option value="">请先选择州 / Select a state first</option></select></div>
         <div class="field"><label>州 / State</label>
@@ -249,6 +264,7 @@
           <div><div class="pg-label">状态</div><div class="pg-val" id="pgState">—</div></div>
           <div><div class="pg-label">已用时</div><div class="pg-val" id="pgElapsed">00:00</div></div>
           <div><div class="pg-label">通过 / 目标</div><div class="pg-val ok" id="pgPass">0 / 0</div></div>
+          <div id="pgCityBox" style="display:none"><div class="pg-label">城市进度</div><div class="pg-val" id="pgCity" style="font-size:13px">—</div></div>
           <div><div class="pg-label">已处理候选</div><div class="pg-val" id="pgProcessed">0</div></div>
           <div><div class="pg-label">预计剩余</div><div class="pg-val" id="pgEta">—</div></div>
         </div>
@@ -434,7 +450,20 @@ Object.entries(STATE_NAMES).forEach(([code, name]) => $("#state").add(new Option
 $("#state").onchange = () => {
   const cities = STATE_CITIES[$("#state").value] || [];
   $("#city").innerHTML = '<option value="">请选择城市 / Select a city</option>' + cities.map(c => `<option>${c}</option>`).join("");
-  $("#city").disabled = !cities.length;
+  $("#city").disabled = !cities.length || $("#stateScope").checked;
+};
+/* 超级轮次（全州模式）：城市清单由后端自动发现，前端只需选州 */
+$("#stateScope").onchange = () => {
+  const on = $("#stateScope").checked;
+  $("#scopeRow").style.display = on ? "flex" : "none";
+  if (on) {
+    $("#city").value = "";
+    $("#city").disabled = true;
+  } else {
+    $("#city").disabled = !($("#city").options.length > 1);
+  }
+  // 全州模式默认目标调大些，否则第一两个城市就跑完了
+  $("#target").value = on ? Math.max(+$("#target").value || 3, 30) : 3;
 };
 
 /* ---------- 标签页 ---------- */
@@ -553,6 +582,14 @@ function renderProgress(state) {
   el2("pgRate").textContent = perPass
     ? "平均 " + perPass.toFixed(1) + " 分钟 / 1 条通过"
     : "样本不足，暂无法估算剩余时间";
+  // 全州模式才显示城市进度
+  const box = el2("pgCityBox");
+  if (box) {
+    const on = (stat.cityTotal || 0) > 0;
+    box.style.display = on ? "" : "none";
+    if (on) el2("pgCity").textContent =
+      stat.cityIndex + "/" + stat.cityTotal + " " + (stat.cityName || "");
+  }
 }
 
 /* 每秒刷新已用时，每 3 秒拉一次服务端计数与工人状态 */
@@ -578,6 +615,9 @@ async function refreshRunStatus() {
     if (st.started_at) startedAt = st.started_at;
     stat.approved = st.approved || 0; stat.target = st.target || stat.target;
     stat.processed = st.processed || 0;
+    stat.cityIndex = st.city_index || 0;
+    stat.cityTotal = st.city_total || 0;
+    stat.cityName = st.city_name || "";
     renderProgress("运行中");
     const ws = st.workers || {};
     Object.keys(ws).forEach(k => {
@@ -595,14 +635,19 @@ async function refreshRunStatus() {
   } catch {}
 }
 $("#startBtn").onclick = async () => {
+  const stateScope = $("#stateScope").checked;
   const body = {
-    city: $("#city").value.trim(), state: $("#state").value.trim(),
+    city: stateScope ? "" : $("#city").value.trim(), state: $("#state").value.trim(),
     price_min: +$("#priceMin").value || 0, price_max: +$("#priceMax").value || 2000,
     target: +$("#target").value || 3, workers: +$("#workers").value || 1,
     listing_urls: $("#listingUrls").value.trim(),
     source: [...document.querySelectorAll(".srcChk:checked")].map(c => c.value).join(","),
+    scope: stateScope ? "state" : "city",
+    max_cities: +$("#maxCities").value || 50,
+    max_hours: +$("#maxHours").value || 24,
   };
-  if (!body.city || !body.state) return alert("请选择州和城市 / Please select a state and city");
+  if (!body.state) return alert("请选择州 / Please select a state");
+  if (!stateScope && !body.city) return alert("请选择城市，或勾选「超级轮次」跑全州");
   if (!body.source) return alert("请至少勾选一个数据源");
   const r = await fetch("/api/tasks", {method: "POST", headers: {"Content-Type": "application/json"},
                                        body: JSON.stringify(body)});
@@ -613,9 +658,11 @@ $("#startBtn").onclick = async () => {
   $("#shots").style.display = "flex"; $("#shots").innerHTML = "";
   $("#log").textContent = ""; setLogOpen(false);
   startedAt = Date.now() / 1000;
-  stat = {approved: 0, target: body.target || 0, processed: 0};
-  $("#taskMeta").textContent = body.city + ", " + body.state + " · "
-    + (body.price_min || 0) + "-" + (body.price_max || 0) + "$/月 · "
+  stat = {approved: 0, target: body.target || 0, processed: 0, cityIndex: 0, cityTotal: 0, cityName: ""};
+  $("#taskMeta").textContent = (stateScope
+      ? body.state + " 全州（最多 " + body.max_cities + " 城 / " + body.max_hours + " 小时）"
+      : body.city + ", " + body.state)
+    + " · " + (body.price_min || 0) + "-" + (body.price_max || 0) + "$/月 · "
     + body.workers + " 个工人 · 目标 " + body.target + " 条通过";
   resetWorkerPanel(body.workers);
   renderProgress("运行中");

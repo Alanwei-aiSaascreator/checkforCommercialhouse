@@ -202,6 +202,11 @@ def api_status():
             "workers_n": int(p.get("workers") or 0),
             "city": p.get("city") or "", "state": p.get("state") or "",
             "price_min": p.get("price_min") or 0, "price_max": p.get("price_max") or 0,
+            # 全州模式（超级轮次）：城市维度进度
+            "scope": p.get("scope") or "city",
+            "city_index": int(getattr(runner, "city_index", 0) or 0),
+            "city_total": int(getattr(runner, "city_total", 0) or 0),
+            "city_name": getattr(runner, "city_name", "") or "",
             "workers": {str(k): v for k, v in (getattr(runner, "worker_stats", {}) or {}).items()},
             "recheck_running": st.get("running", False),
             "recheck_record_id": st.get("record_id")}
@@ -390,6 +395,10 @@ def api_task_start(body: dict):
     if bad:
         raise HTTPException(400, "未知数据源：" + ",".join(bad)
                             + "（可选：" + " / ".join(FEEDS.keys()) + "）")
+    # 全州模式（超级轮次）：只给州，城市由站点 sitemap 自动发现后逐个跑
+    scope = str(body.get("scope") or "city").strip().lower()
+    if scope not in ("city", "state"):
+        raise HTTPException(400, "scope 只能是 city 或 state")
     params = {
         "city": (body.get("city") or "").strip(),
         "state": (body.get("state") or "").strip().upper(),
@@ -399,8 +408,15 @@ def api_task_start(body: dict):
         "workers": min(max(int(body.get("workers") or 1), 1), 6),
         "listing_urls": body.get("listing_urls") or "",
         "source": ",".join(sel),
+        "scope": scope,
+        "max_cities": min(max(int(body.get("max_cities") or 50), 1), 300),
+        "max_hours": min(max(float(body.get("max_hours") or 24), 0.5), 240),
     }
-    if not params["city"] or not params["state"]:
+    if scope == "state":
+        if not params["state"]:
+            raise HTTPException(400, "全州模式请选择州")
+        params["city"] = ""      # 城市清单由 sitemap 自动发现
+    elif not params["city"] or not params["state"]:
         raise HTTPException(400, "城市和州缩写必填")
     task_id = uuid.uuid4().hex[:8]
     start_task(task_id, params)

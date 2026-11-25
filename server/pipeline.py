@@ -7,7 +7,7 @@ import time
 import traceback
 from datetime import datetime
 
-from . import browser, config, deepseek_client, store
+from . import browser, config, deepseek_client, state_cities, store
 from .addrutil import clean_address
 from .steps import (cbre, commercialcafe, commercialsearch, crexi, cityfeet, loopnet,
                     officespace, smarty, streetview, opencorporates)
@@ -99,6 +99,13 @@ class TaskRunner:
         self.processed = 0                  # 已开始处理的候选数
         self.worker_stats: dict = {}        # wid → {addr, last, level, ts, pass}
         self._stats_lock = threading.Lock()
+        # ---- 全州模式（超级轮次）----
+        # 一次任务遍历整州多个城市：当前城市在清单里的位置 / 总数 / 名字，
+        # 已完成城市的累计通过数（每个城市内部计数从 0 开始，对外显示累计值）。
+        self.city_index = 0
+        self.city_total = 0
+        self.city_name = ""
+        self._base_approved = 0
 
     def _wstat(self, wid: int) -> dict:
         """取（必要时创建）某个工人的状态字典，供前端分栏展示。"""
@@ -203,15 +210,94 @@ class TaskRunner:
             self._push({"__done__": True})
 
     def _run(self) -> None:
+        """任务入口：普通模式跑单个城市；全州模式（scope=state）先发现州内城市，
+        再逐个调用 _run_city，通过数在全州范围内累计。"""
+        p = self.params
+        if str(p.get("scope") or "").strip().lower() != "state":
+            self._run_city(p["city"], p["state"], int(p.get("target") or 3))
+            return
+        self._run_state()
+
+    def _run_state(self) -> None:
+        """超级轮次：跑完整个州。
+
+        城市清单由站点 sitemap 自动发现（见 state_cities），按「热门大城市优先」
+        排序后逐个城市跑；全州累计通过数达到 target 即结束。
+        双重保险：跑满 max_cities 个城市、或到 max_hours 小时，自动收尾。
+        """
+        p = self.params
+        state = p["state"]
+        target = int(p.get("target") or 3)
+        max_cities = int(p.get("max_cities") or 50)
+        max_hours = float(p.get("max_hours") or 24)
+        self.emit(f"全州模式启动：{state}，全州累计目标 {target} 个通过地址，"
+                  f"最多跑 {max_cities} 个城市 / {max_hours:g} 小时")
+        self.emit("正在从站点抓取该州城市清单（首次约 10~40 秒，之后走缓存）...")
+        cities = state_cities.discover(state)
+        if not cities:
+            self.emit(f"未能发现 {state} 的城市清单（站点结构变更或被拦截），任务结束", "error")
+            return
+        total_found = len(cities)
+        if max_cities and total_found > max_cities:
+            cities = cities[:max_cities]
+        self.city_total = len(cities)
+        self.emit(f"城市清单：共发现 {total_found} 个有房源的城市，本次按热门优先跑前 "
+                  f"{len(cities)} 个：" + "、".join(cities[:12])
+                  + ("…" if len(cities) > 12 else ""))
+        deadline = time.time() + max_hours * 3600
+        approved_total = 0
+        for i, city in enumerate(cities, 1):
+            if self.stopped or approved_total >= target:
+                break
+            if time.time() > deadline:
+                self.emit(f"已达最长运行时限 {max_hours:g} 小时，停止继续切换城市", "warn")
+                break
+            self.city_index, self.city_name = i, city
+            self.emit(f"===== 全州 {i}/{len(cities)}：{city}, {state}"
+                      f"（全州已通过 {approved_total}/{target}）=====")
+            try:
+                got = self._run_city(city, state, max(1, target - approved_total))
+            except Exception as e:
+                self.emit(f"{city} 执行异常，跳过该城市继续下一个：{e}", "error")
+                got = 0
+            approved_total += int(got or 0)
+            self._base_approved = approved_total
+            self._city_bad = False      # 单城市无效不影响后续城市
+            with self._stats_lock:
+                self.approved = approved_total
+            # 城市之间彻底释放浏览器，避免下一个城市撞上配置目录锁
+            try:
+                browser.close_current()
+            except Exception:
+                pass
+        self._report_state_result(approved_total, target)
+
+    def _report_state_result(self, approved_total: int, target: int) -> None:
+        done = self.city_index
+        if self.stopped:
+            self.emit(f"全州任务已终止：跑了 {done}/{self.city_total} 个城市，"
+                      f"累计通过 {approved_total}/{target}", "warn")
+        elif approved_total >= target:
+            self.emit(f"全州目标达成：跑了 {done}/{self.city_total} 个城市，"
+                      f"累计通过 {approved_total}/{target}", "pass")
+        else:
+            self.emit(f"全州任务完成：{done}/{self.city_total} 个城市已遍历，"
+                      f"累计通过 {approved_total}/{target}。可提高城市上限或过几天再跑"
+                      f"（已翻过的页会被跳过，接着上次的进度继续）", "warn")
+
+    def _run_city(self, city: str, state: str, target: int) -> int:
+        """单城市流水线：步骤1 采集 → 步骤2/3/4 核查；返回本城市通过数。
+
+        全州模式对每个城市各调一次，target 传「剩余配额」。
+        """
         try:
             browser.reset_stop()   # 新任务启动：清掉上次任务的终止标记
         except Exception:
             pass
-        self.started_at = time.time()   # 前端"已用时"的起点
+        if not self.started_at:
+            self.started_at = time.time()   # 前端"已用时"的起点（全州模式只记首次）
         p = self.params
-        city, state = p["city"], p["state"]
         price_min, price_max = int(p.get("price_min") or 0), int(p.get("price_max") or 2000)
-        target = int(p.get("target") or 3)
         # 步骤1 数据源：支持单源（"loopnet"）或多源（"loopnet,crexi,commercialsearch"，
         # 前端多选）。多源按页轮询汇入同一条流水线，候选按归一化地址去重。
         sources = [s.strip().lower() for s in (p.get("source") or "loopnet").split(",") if s.strip()]
@@ -1098,7 +1184,8 @@ class TaskRunner:
             with approved_lock:
                 approved += 1
             with self._stats_lock:
-                self.approved = approved
+                # 全州模式下 approved 是"本城市内"的计数，对外显示需加上已完成城市
+                self.approved = self._base_approved + approved
                 self.worker_stats.setdefault(
                     wid, {"addr": addr, "last": "", "level": "", "ts": 0.0, "pass": 0,
                           "started_at": 0.0})["pass"] += 1
@@ -1221,13 +1308,20 @@ class TaskRunner:
         except Exception:
             pass
 
+        scope_state = str(self.params.get("scope") or "").lower() == "state"
+        city_tag = f"{city} " if scope_state else ""
         if approved >= target:
-            self.emit(f"任务完成：通过 {approved}/{target} 个地址", "pass")
+            self.emit(f"{city_tag}任务完成：通过 {approved}/{target} 个地址", "pass")
         elif self.stopped:
-            self.emit(f"任务已终止：通过 {approved}/{target} 个地址", "warn")
+            self.emit(f"{city_tag}任务已终止：通过 {approved}/{target} 个地址", "warn")
+        elif scope_state:
+            # 全州模式：单城市没跑满很正常，交给外层切下一个城市
+            self.emit(f"{city_tag}本城市候选已用尽，通过 {approved}/{target}，"
+                      f"切换到下一个城市", "warn")
         else:
             self.emit(f"任务完成：候选已用尽，本轮通过 {approved}/{target} 个地址。"
                       f"可换城市/放宽价格区间再跑，或直接粘房源链接补搜", "warn")
+        return approved
 
 
 # 全局任务注册表（单机单用户足够）
