@@ -34,6 +34,14 @@ DEEPSEEK_VISION_MODEL = os.environ.get("DEEPSEEK_VISION_MODEL", "deepseek-flash"
 # OpenCorporates 查重阈值：同址注册公司数 ≤ 5 视为通过
 OPENCORPORATES_LIMIT = int(os.environ.get("OPENCORPORATES_LIMIT", "5"))
 
+# 步骤4 节流：多个工人（4~6 个）同时打 OpenCorporates 会被 Cloudflare 拦成
+# 「结果页永远不出现公司数」（实测超级轮次跑全州时成片失败）。
+# 这里全局串行化，并保证两次查询之间至少间隔这么多秒；设 0 关闭串行。
+OC_MIN_GAP = float(os.environ.get("OC_MIN_GAP", "3"))
+
+# 单次查重等待结果页出数的最长秒数（遇到 Cloudflare 校验页会继续等它放行）
+OC_READ_TIMEOUT = float(os.environ.get("OC_READ_TIMEOUT", "60"))
+
 # 邮箱旁路反查：不碰浏览器，用 姓名+公司 → 反查邮箱，写回 records.email。
 # 两个数据源二选一（都配了则优先 Apollo，一步到位不需要先查域名）：
 #   - Apollo.io：people/match，按 姓名+公司名 直接匹配，认证用 X-Api-Key 头。
