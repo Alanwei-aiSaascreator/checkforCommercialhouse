@@ -219,31 +219,35 @@ class TaskRunner:
         self._run_state()
 
     def _run_state(self) -> None:
-        """超级轮次：跑完整个州。
+        """多城市轮次：逐个跑用户勾选的城市，累计通过数达到 target 即结束。
 
-        城市清单由站点 sitemap 自动发现（见 state_cities），按「热门大城市优先」
-        排序后逐个城市跑；全州累计通过数达到 target 即结束。
-        双重保险：跑满 max_cities 个城市、或到 max_hours 小时，自动收尾。
+        城市清单来自前端多选（params["cities"]）；留空时兼容旧行为，
+        自动发现州内全部城市（state_cities）。max_hours 只作兜底保险。
         """
         p = self.params
         state = p["state"]
         target = int(p.get("target") or 3)
-        max_cities = int(p.get("max_cities") or 50)
-        max_hours = float(p.get("max_hours") or 24)
-        self.emit(f"全州模式启动：{state}，全州累计目标 {target} 个通过地址，"
-                  f"最多跑 {max_cities} 个城市 / {max_hours:g} 小时")
-        self.emit("正在从站点抓取该州城市清单（首次约 10~40 秒，之后走缓存）...")
-        cities = state_cities.discover(state)
-        if not cities:
-            self.emit(f"未能发现 {state} 的城市清单（站点结构变更或被拦截），任务结束", "error")
-            return
-        total_found = len(cities)
-        if max_cities and total_found > max_cities:
-            cities = cities[:max_cities]
+        max_hours = float(p.get("max_hours") or 240)
+        picked = []
+        seen = set()
+        for c in (p.get("cities") or []):
+            c = str(c).strip()
+            if c and c.lower() not in seen:
+                seen.add(c.lower())
+                picked.append(c)
+        if picked:
+            self.emit(f"多城市轮次启动：{state}，共 {len(picked)} 个城市"
+                      f"（{'、'.join(picked)}），累计目标 {target} 个通过地址")
+            cities = picked
+        else:
+            self.emit("未指定城市清单，回退为自动发现全州城市（首次约 10~40 秒，之后走缓存）...")
+            cities = state_cities.discover(state)
+            if not cities:
+                self.emit(f"未能发现 {state} 的城市清单（站点结构变更或被拦截），任务结束", "error")
+                return
+            self.emit(f"城市清单：共 {len(cities)} 个："
+                      + "、".join(cities[:12]) + ("…" if len(cities) > 12 else ""))
         self.city_total = len(cities)
-        self.emit(f"城市清单：共发现 {total_found} 个有房源的城市，本次按热门优先跑前 "
-                  f"{len(cities)} 个：" + "、".join(cities[:12])
-                  + ("…" if len(cities) > 12 else ""))
         deadline = time.time() + max_hours * 3600
         approved_total = 0
         for i, city in enumerate(cities, 1):
@@ -253,8 +257,8 @@ class TaskRunner:
                 self.emit(f"已达最长运行时限 {max_hours:g} 小时，停止继续切换城市", "warn")
                 break
             self.city_index, self.city_name = i, city
-            self.emit(f"===== 全州 {i}/{len(cities)}：{city}, {state}"
-                      f"（全州已通过 {approved_total}/{target}）=====")
+            self.emit(f"===== 轮次 {i}/{len(cities)}：{city}, {state}"
+                      f"（累计已通过 {approved_total}/{target}）=====")
             try:
                 got = self._run_city(city, state, max(1, target - approved_total))
             except Exception as e:
@@ -275,15 +279,15 @@ class TaskRunner:
     def _report_state_result(self, approved_total: int, target: int) -> None:
         done = self.city_index
         if self.stopped:
-            self.emit(f"全州任务已终止：跑了 {done}/{self.city_total} 个城市，"
+            self.emit(f"轮次任务已终止：跑了 {done}/{self.city_total} 个城市，"
                       f"累计通过 {approved_total}/{target}", "warn")
         elif approved_total >= target:
-            self.emit(f"全州目标达成：跑了 {done}/{self.city_total} 个城市，"
+            self.emit(f"轮次目标达成：跑了 {done}/{self.city_total} 个城市，"
                       f"累计通过 {approved_total}/{target}", "pass")
         else:
-            self.emit(f"全州任务完成：{done}/{self.city_total} 个城市已遍历，"
-                      f"累计通过 {approved_total}/{target}。可提高城市上限或过几天再跑"
-                      f"（已翻过的页会被跳过，接着上次的进度继续）", "warn")
+            self.emit(f"轮次任务完成：{done}/{self.city_total} 个城市已遍历，"
+                      f"累计通过 {approved_total}/{target}。"
+                      f"可过几天再跑（已翻过的页会被跳过，接着上次的进度继续）", "warn")
 
     def _run_city(self, city: str, state: str, target: int) -> int:
         """单城市流水线：步骤1 采集 → 步骤2/3/4 核查；返回本城市通过数。

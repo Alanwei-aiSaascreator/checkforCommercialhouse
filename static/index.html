@@ -206,20 +206,19 @@
         <div class="field" style="grid-column:1/-1">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600">
             <input type="checkbox" id="stateScope" style="width:16px;height:16px">
-            超级轮次：跑完整个州（城市自动发现，逐个城市跑完再切下一个）
+            超级轮次：勾选多个城市，逐个城市跑（累计通过达标即自动结束）
           </label>
           <div id="scopeRow" style="display:none; margin-top:10px; gap:18px; align-items:center; flex-wrap:wrap">
-            <span>最多跑 <input id="maxCities" type="number" value="50" min="1" max="300" style="width:78px"> 个城市</span>
-            <span>最长 <input id="maxHours" type="number" value="24" min="1" max="240" style="width:78px"> 小时</span>
-            <span style="font-size:12px;color:var(--muted-2)">到点自动收尾，已翻的页会记住，下次接着跑</span>
+            <span>最长 <input id="maxHours" type="number" value="24" min="1" max="240" style="width:78px"> 小时（兜底保护）</span>
+            <span style="font-size:12px;color:var(--muted-2)">到点自动收尾；已翻的页会记住，下次接着跑</span>
           </div>
           <div style="font-size:12px;color:var(--muted-2);margin-top:6px">
-            城市清单从 CommercialCafe 州 sitemap 自动抓取（加州约 278 个），大城市优先；
-            全州累计通过数达到下方「目标通过地址数」即自动结束。
+            勾选后城市列表变为多选（按住 Ctrl 点选多个）；所有勾选城市的累计通过数
+            达到下方「目标通过地址数」即自动结束。一个都不选则自动跑全州城市。
           </div>
         </div>
-        <div class="field"><label>城市 / City</label>
-          <select id="city" disabled><option value="">请先选择州 / Select a state first</option></select></div>
+        <div class="field"><label>城市 / City <span id="cityPickHint" style="display:none;color:var(--accent);font-weight:600"></span></label>
+          <select id="city" disabled multiple size="8"><option value="">请先选择州 / Select a state first</option></select></div>
         <div class="field"><label>州 / State</label>
           <select id="state"><option value="">请选择州 / Select a state</option></select></div>
         <div class="field"><label>价格下限（$/月）</label>
@@ -453,21 +452,39 @@ Object.entries(STATE_NAMES).forEach(([code, name]) => $("#state").add(new Option
 $("#state").onchange = () => {
   const cities = STATE_CITIES[$("#state").value] || [];
   $("#city").innerHTML = '<option value="">请选择城市 / Select a city</option>' + cities.map(c => `<option>${c}</option>`).join("");
-  $("#city").disabled = !cities.length || $("#stateScope").checked;
+  const multi = $("#stateScope").checked;
+  $("#city").multiple = multi;
+  $("#city").size = multi ? 8 : 1;
+  $("#city").disabled = !cities.length;
+  updateCityPickHint();
 };
-/* 超级轮次（全州模式）：城市清单由后端自动发现，前端只需选州 */
+/* 超级轮次：城市列表变为多选，选几个跑几个；一个不选则后端自动跑全州 */
 $("#stateScope").onchange = () => {
   const on = $("#stateScope").checked;
   $("#scopeRow").style.display = on ? "flex" : "none";
+  const sel = $("#city");
   if (on) {
-    $("#city").value = "";
-    $("#city").disabled = true;
+    sel.multiple = true;
+    sel.size = 8;
   } else {
-    $("#city").disabled = !($("#city").options.length > 1);
+    sel.multiple = false;
+    sel.size = 1;
+    sel.value = "";
   }
-  // 全州模式默认目标调大些，否则第一两个城市就跑完了
+  sel.disabled = !(STATE_CITIES[$("#state").value] || []).length;
+  updateCityPickHint();
+  // 轮次模式默认目标调大些，否则第一两个城市就跑完了
   $("#target").value = on ? Math.max(+$("#target").value || 3, 30) : 3;
 };
+function updateCityPickHint() {
+  const hint = $("#cityPickHint");
+  if (!hint) return;
+  const on = $("#stateScope").checked;
+  const n = on ? [...$("#city").selectedOptions].filter(o => o.value).length : 0;
+  hint.style.display = on ? "inline" : "none";
+  hint.textContent = on ? "已选 " + n + " 个" : "";
+}
+$("#city").onchange = updateCityPickHint;
 
 /* ---------- 标签页 ---------- */
 document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
@@ -651,6 +668,8 @@ async function refreshRunStatus() {
 }
 $("#startBtn").onclick = async () => {
   const stateScope = $("#stateScope").checked;
+  const pickedCities = stateScope
+    ? [...$("#city").selectedOptions].map(o => o.value).filter(Boolean) : [];
   const body = {
     city: stateScope ? "" : $("#city").value.trim(), state: $("#state").value.trim(),
     price_min: +$("#priceMin").value || 0, price_max: +$("#priceMax").value || 2000,
@@ -658,11 +677,11 @@ $("#startBtn").onclick = async () => {
     listing_urls: $("#listingUrls").value.trim(),
     source: [...document.querySelectorAll(".srcChk:checked")].map(c => c.value).join(","),
     scope: stateScope ? "state" : "city",
-    max_cities: +$("#maxCities").value || 50,
+    cities: pickedCities,
     max_hours: +$("#maxHours").value || 24,
   };
   if (!body.state) return alert("请选择州 / Please select a state");
-  if (!stateScope && !body.city) return alert("请选择城市，或勾选「超级轮次」跑全州");
+  if (!stateScope && !body.city) return alert("请选择城市，或勾选「超级轮次」多选城市");
   if (!body.source) return alert("请至少勾选一个数据源");
   const r = await fetch("/api/tasks", {method: "POST", headers: {"Content-Type": "application/json"},
                                        body: JSON.stringify(body)});
@@ -675,7 +694,10 @@ $("#startBtn").onclick = async () => {
   startedAt = Date.now() / 1000;
   stat = {approved: 0, target: body.target || 0, processed: 0, cityIndex: 0, cityTotal: 0, cityName: ""};
   $("#taskMeta").textContent = (stateScope
-      ? body.state + " 全州（最多 " + body.max_cities + " 城 / " + body.max_hours + " 小时）"
+      ? (pickedCities.length
+          ? body.state + " · " + pickedCities.length + " 个城市（" + pickedCities.slice(0, 3).join("、")
+            + (pickedCities.length > 3 ? " 等" : "") + "）"
+          : body.state + " 全州（自动发现城市）")
       : body.city + ", " + body.state)
     + " · " + (body.price_min || 0) + "-" + (body.price_max || 0) + "$/月 · "
     + body.workers + " 个工人 · 目标 " + body.target + " 条通过";
@@ -749,7 +771,10 @@ async function restoreRunningTask() {
     resetWorkerPanel(st.workers_n || Object.keys(st.workers || {}).length || 1);
     renderProgress("运行中");
     startTimers();
-    $("#taskMeta").textContent = [st.city && (st.city + ", " + st.state),
+    $("#taskMeta").textContent = [st.scope === "state"
+        ? (st.city_total ? "轮次 " + (st.city_index || 0) + "/" + st.city_total + " 城 · " + st.state
+                          : st.state + " 轮次")
+        : (st.city && (st.city + ", " + st.state)),
       st.price_max && ((st.price_min || 0) + "-" + st.price_max + "$/月"),
       st.workers_n && (st.workers_n + " 个工人"),
       st.target && ("目标 " + st.target + " 条通过")].filter(Boolean).join(" · ");

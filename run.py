@@ -398,10 +398,15 @@ def api_task_start(body: dict):
     if bad:
         raise HTTPException(400, "未知数据源：" + ",".join(bad)
                             + "（可选：" + " / ".join(FEEDS.keys()) + "）")
-    # 全州模式（超级轮次）：只给州，城市由站点 sitemap 自动发现后逐个跑
+    # 多城市轮次（scope=state）：城市由前端多选勾选，选几个跑几个；
+    # 一个都不选时后端回退为自动发现全州城市。
     scope = str(body.get("scope") or "city").strip().lower()
     if scope not in ("city", "state"):
         raise HTTPException(400, "scope 只能是 city 或 state")
+    cities_in = body.get("cities") or []
+    if not isinstance(cities_in, list):
+        cities_in = [c.strip() for c in str(cities_in).split(",") if c.strip()]
+    cities_in = [str(c).strip() for c in cities_in if str(c).strip()][:100]
     params = {
         "city": (body.get("city") or "").strip(),
         "state": (body.get("state") or "").strip().upper(),
@@ -412,13 +417,13 @@ def api_task_start(body: dict):
         "listing_urls": body.get("listing_urls") or "",
         "source": ",".join(sel),
         "scope": scope,
-        "max_cities": min(max(int(body.get("max_cities") or 50), 1), 300),
+        "cities": cities_in,
         "max_hours": min(max(float(body.get("max_hours") or 24), 0.5), 240),
     }
     if scope == "state":
         if not params["state"]:
-            raise HTTPException(400, "全州模式请选择州")
-        params["city"] = ""      # 城市清单由 sitemap 自动发现
+            raise HTTPException(400, "多城市轮次请选择州")
+        params["city"] = ""      # 城市 = cities 清单（或自动发现兜底）
     elif not params["city"] or not params["state"]:
         raise HTTPException(400, "城市和州缩写必填")
     task_id = uuid.uuid4().hex[:8]
