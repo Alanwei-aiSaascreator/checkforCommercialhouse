@@ -447,7 +447,7 @@ def api_task_start(body: dict):
         "state": (body.get("state") or "").strip().upper(),
         "price_min": body.get("price_min") or 0,
         "price_max": body.get("price_max") or 2000,
-        "target": min(int(body.get("target") or 3), 100),
+        "target": min(int(body.get("target") or 3), 500),
         "workers": min(max(int(body.get("workers") or 1), 1), 6),
         "listing_urls": body.get("listing_urls") or "",
         "source": ",".join(sel),
