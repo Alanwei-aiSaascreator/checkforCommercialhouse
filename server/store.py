@@ -313,16 +313,19 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return d
 
 
-def records_stats(keyword: str = "", source: str = "") -> dict:
+def records_stats(keyword: str = "", source: str = "", date: str = "") -> dict:
     """记录计数（给页面顶部的统计条用）。
 
     故意不吃 conclusion 过滤：点了「通过」之后其它数字仍要显示真实值，
-    否则每点一次筛选，别的分类全变 0，看不出总量。keyword/source 跟着变。
+    否则每点一次筛选，别的分类全变 0，看不出总量。keyword/source/date 跟着变。
     """
     conds, args = [], []
     if source:
         conds.append("source=?")
         args.append(source.strip().lower())
+    if date:
+        conds.append("substr(created_at,1,10)=?")
+        args.append(date)
     if keyword:
         like = f"%{keyword}%"
         conds.append("(address LIKE ? OR agent LIKE ? OR phone LIKE ? OR email LIKE ?"
@@ -346,9 +349,10 @@ def records_stats(keyword: str = "", source: str = "") -> dict:
 
 
 def list_records(conclusion: str = "", keyword: str = "",
-                 source: str = "") -> list[dict]:
+                 source: str = "", date: str = "") -> list[dict]:
     """核查记录列表（倒序）。conclusion 精确过滤；keyword 模糊匹配地址/中介/电话/邮箱/网址；
-    source 按步骤1 数据源过滤（loopnet / crexi，两条线分开查看）。"""
+    source 按步骤1 数据源过滤（loopnet / crexi，两条线分开查看）；
+    date 为 YYYY-MM-DD，只返回当天创建的记录（按日期导出用）。"""
     sql, args = "SELECT * FROM records", []
     conds = []
     if conclusion:
@@ -357,6 +361,9 @@ def list_records(conclusion: str = "", keyword: str = "",
     if source:
         conds.append("source=?")
         args.append(source.strip().lower())
+    if date:
+        conds.append("substr(created_at,1,10)=?")
+        args.append(date)
     if keyword:
         like = f"%{keyword}%"
         conds.append("(address LIKE ? OR agent LIKE ? OR phone LIKE ? OR email LIKE ?"
@@ -368,6 +375,28 @@ def list_records(conclusion: str = "", keyword: str = "",
     try:
         rows = con.execute(sql + " ORDER BY id DESC", args).fetchall()
         return [_row_to_dict(r) for r in rows]
+    finally:
+        con.close()
+
+
+def record_dates(source: str = "", keyword: str = "") -> list[dict]:
+    """有记录的日期清单（倒序）+ 每天条数，给记录页的日期筛选下拉。"""
+    conds, args = [], []
+    if source:
+        conds.append("source=?")
+        args.append(source.strip().lower())
+    if keyword:
+        like = f"%{keyword}%"
+        conds.append("(address LIKE ? OR agent LIKE ? OR phone LIKE ? OR email LIKE ?"
+                     " OR listing_url LIKE ? OR notes LIKE ?)")
+        args += [like] * 6
+    where = " WHERE " + " AND ".join(conds) if conds else ""
+    con = _con()
+    try:
+        rows = con.execute(
+            "SELECT substr(created_at,1,10) AS date, COUNT(*) AS n"
+            " FROM records" + where + " GROUP BY date ORDER BY date DESC", args).fetchall()
+        return [dict(r) for r in rows]
     finally:
         con.close()
 
@@ -388,6 +417,22 @@ def delete_record(record_id: int) -> bool:
             cur = con.execute("DELETE FROM records WHERE id=?", (record_id,))
             con.commit()
             return cur.rowcount > 0
+        finally:
+            con.close()
+
+
+def delete_records(ids: list) -> int:
+    """按 id 批量删除核查记录（记录页「删除选中」用）。返回实际删除条数。"""
+    ids = [int(i) for i in (ids or []) if str(i).strip().lstrip("-").isdigit()]
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    with _lock:
+        con = _con()
+        try:
+            cur = con.execute(f"DELETE FROM records WHERE id IN ({marks})", ids)
+            con.commit()
+            return cur.rowcount
         finally:
             con.close()
 

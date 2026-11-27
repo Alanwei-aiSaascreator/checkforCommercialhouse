@@ -321,10 +321,15 @@
             <option value="officespace">OfficeSpace</option>
             <option value="cbre">CBRE</option>
           </select>
+          <select id="recDate" style="padding:6px 8px;font-size:13px;border:1px solid var(--border-strong);border-radius:8px;max-width:170px">
+            <option value="">全部日期</option>
+          </select>
           <button class="btn sm gray" id="recSearch">搜索</button>
           <button class="btn sm gray" id="recReset">重置</button>
           <button class="btn sm" id="addRecBtn">新增记录</button>
+          <button class="btn sm" id="pickTodayBtn">选中今日</button>
           <button class="btn sm" id="exportPickedBtn">导出选中</button>
+          <button class="btn sm red" id="deletePickedBtn">删除选中</button>
           <button class="btn sm" id="exportBtn">导出Excel（通过记录）</button>
           <button class="btn sm red" id="clearHistoryBtn">清空历史</button>
         </div>
@@ -835,10 +840,11 @@ function appendLog(msg, level) {
 
 /* ---------- 核查记录 ---------- */
 $("#exportBtn").onclick = () => {
-  // 导出跟随当前数据源筛选：选了 Crexi 就只导 Crexi 那条线的通过记录
-  const src = $("#recSource").value;
+  // 导出跟随当前筛选（数据源 + 日期）：选了哪天就只导那天的通过记录
+  const src = $("#recSource").value, date = $("#recDate").value;
   window.open("/api/export?conclusion=" + encodeURIComponent("通过")
-              + (src ? "&source=" + encodeURIComponent(src) : ""), "_blank");
+              + (src ? "&source=" + encodeURIComponent(src) : "")
+              + (date ? "&date=" + encodeURIComponent(date) : ""), "_blank");
 };
 /* 单条导出：只把这一条记录导成 Excel */
 function exportOne(id) { window.open("/api/export?ids=" + id, "_blank"); }
@@ -848,15 +854,44 @@ $("#exportPickedBtn").onclick = () => {
   if (!ids.length) return alert("先在列表左侧勾选要导出的记录（可多选）");
   window.open("/api/export?ids=" + ids.join(","), "_blank");
 };
+/* 批量删除勾选的记录（每条都会先弹确认） */
+$("#deletePickedBtn").onclick = async () => {
+  const ids = [...document.querySelectorAll(".recPick:checked")].map(c => +c.value);
+  if (!ids.length) return alert("先在列表左侧勾选要删除的记录（可多选）");
+  if (!confirm(`确认删除选中的 ${ids.length} 条记录？此操作不可撤销。`)) return;
+  const r = await fetch("/api/records/delete-batch", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({ids})});
+  if (!r.ok) return alert((await r.json().catch(() => ({}))).detail || "删除失败");
+  const d = await r.json();
+  alert(`已删除 ${d.deleted} 条记录`);
+  loadRecords();
+  refreshRecBadge();
+};
+/* 一键勾选今日的记录（配合「导出选中」= 导出今天） */
+$("#pickTodayBtn").onclick = () => {
+  const today = new Date().toLocaleDateString("sv-SE");   // YYYY-MM-DD（本地时区）
+  let n = 0;
+  document.querySelectorAll(".recPick").forEach(c => {
+    const row = c.closest("tr");
+    const d = row && row.dataset.date;
+    c.checked = d === today;
+    if (c.checked) n++;
+  });
+  if (!n) return alert("当前列表里没有今天的记录（可先把结论筛选切到「全部结论」或检查日期筛选）");
+  $("#recPickAll").indeterminate = true;
+};
 $("#recPickAll").onchange = e => {
   document.querySelectorAll(".recPick").forEach(c => c.checked = e.target.checked);
+  e.target.indeterminate = false;
 };
 $("#recSearch").onclick = () => loadRecords();
 $("#recKeyword").onkeydown = e => { if (e.key === "Enter") loadRecords(); };
 $("#recFilter").onchange = () => loadRecords();
 $("#recSource").onchange = () => loadRecords();
+$("#recDate").onchange = () => loadRecords();
 $("#recReset").onclick = () => {
   $("#recKeyword").value = ""; $("#recFilter").value = ""; $("#recSource").value = "";
+  $("#recDate").value = "";
   loadRecords();
 };
 $("#clearHistoryBtn").onclick = async () => {
@@ -908,19 +943,32 @@ let recShownLimit = 200;   // 单次最多渲染多少行（全部 1900+ 条一�
 async function loadRecords(reset = true) {
   if (reset) recShownLimit = 200;
   const kw = $("#recKeyword").value.trim(), cf = $("#recFilter").value;
-  const src = $("#recSource").value;
+  const src = $("#recSource").value, date = $("#recDate").value;
   const qs = new URLSearchParams();
   if (kw) qs.set("keyword", kw);
   if (cf) qs.set("conclusion", cf);
   if (src) qs.set("source", src);
-  // 计数不吃 conclusion（点了「通过」后其它分类的数字仍要真实），只跟关键字/数据源
+  if (date) qs.set("date", date);
+  // 计数不吃 conclusion（点了「通过」后其它分类的数字仍要真实），只跟关键字/数据源/日期
   const sqs = new URLSearchParams();
   if (kw) sqs.set("keyword", kw);
   if (src) sqs.set("source", src);
-  const [recs, stats] = await Promise.all([
+  if (date) sqs.set("date", date);
+  // 日期下拉清单跟关键字/数据源走（不受结论筛选影响）
+  const dqs = new URLSearchParams();
+  if (kw) dqs.set("keyword", kw);
+  if (src) dqs.set("source", src);
+  const [recs, stats, dates] = await Promise.all([
     fetch("/api/records?" + qs.toString()).then(r => r.json()),
     fetch("/api/records/stats?" + sqs.toString()).then(r => r.ok ? r.json() : null).catch(() => null),
+    fetch("/api/records/dates?" + dqs.toString()).then(r => r.ok ? r.json() : []).catch(() => []),
   ]);
+  // 重建日期下拉（保留当前选择）
+  const sel = $("#recDate");
+  const keep = sel.value;
+  sel.innerHTML = '<option value="">全部日期</option>'
+    + (dates || []).map(d => `<option value="${d.date}">${d.date}（${d.n} 条）</option>`).join("");
+  sel.value = dates && dates.some(d => d.date === keep) ? keep : (keep === "" ? "" : "");
   const tb = $("#recordsBody");
   if (!recs.length) {
     renderRecStats(stats, 0, 0);
@@ -928,7 +976,15 @@ async function loadRecords(reset = true) {
   }
   const shown = recs.slice(0, recShownLimit);
   renderRecStats(stats, recs.length, shown.length);
-  tb.innerHTML = shown.map(r => {
+  const today = new Date().toLocaleDateString("sv-SE");
+  let html = "", lastDate = "";
+  shown.forEach(r => {
+    const rdate = (r.created_at || "").slice(0, 10);
+    if (rdate !== lastDate) {          // 日期分组行：换天就插一条
+      lastDate = rdate;
+      html += `<tr style="background:#eef2ff"><td colspan="12" style="padding:7px 12px;font-weight:700;font-size:13px;color:#3730a3">
+        📅 ${rdate}${rdate === today ? "（今天）" : ""} · ${esc(String((recs.filter(x => (x.created_at || "").slice(0, 10) === rdate)).length))} 条</td></tr>`;
+    }
     const badge = r.conclusion === "通过" ? "badge-pass" : r.conclusion === "不通过" ? "badge-fail" : "badge-pending";
     // 只展示三类：双绿验证卡 / LoopNet 房源图 / 查重截图（街景图入档但不在此展示）
     const allShots = r.screenshots || [];
@@ -940,7 +996,7 @@ async function loadRecords(reset = true) {
                   .filter(Boolean)
                   .map(p => `<img class="thumb" src="${shotUrl(p)}" data-full="${shotUrl(p)}" loading="lazy">`)
                   .join("");
-    return `<tr>
+    html += `<tr data-date="${rdate}">
       <td><input type="checkbox" class="recPick" value="${r.id}"></td>
       <td style="white-space:nowrap">${esc((r.created_at || "").replace("T", " "))}</td>
       <td style="white-space:nowrap">${srcChip(r.source) || "—"}</td>
@@ -960,8 +1016,11 @@ async function loadRecords(reset = true) {
         <button class="btn sm gray" style="margin-top:4px" onclick="openRecModal(${r.id})">编辑</button>
         <button class="btn sm red" style="margin-top:4px" onclick="deleteRecord(${r.id}, ${JSON.stringify(r.address).replace(/"/g, "&quot;")})">删除</button>
       </td></tr>`;
-  }).join("");
+    return html;
+  });
+  tb.innerHTML = html;
   $("#recPickAll").checked = false;   // 重新渲染后清掉全选态
+  $("#recPickAll").indeterminate = false;
   if (recs.length > shown.length) {
     const tr = document.createElement("tr");
     tr.innerHTML = `<td colspan="12" style="text-align:center; padding:14px">` +

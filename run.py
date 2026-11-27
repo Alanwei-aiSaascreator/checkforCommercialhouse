@@ -54,15 +54,32 @@ _CONCLUSIONS = ("通过", "不通过", "待人工", "核查中")
 
 
 @app.get("/api/records")
-def api_records(conclusion: str = "", keyword: str = "", source: str = ""):
+def api_records(conclusion: str = "", keyword: str = "", source: str = "",
+                date: str = ""):
     return store.list_records(conclusion=conclusion.strip(), keyword=keyword.strip(),
-                              source=source.strip().lower())
+                              source=source.strip().lower(), date=date.strip())
+
+
+@app.get("/api/records/dates")
+def api_record_dates(keyword: str = "", source: str = ""):
+    """有记录的日期清单（倒序）+ 每天条数（记录页日期筛选下拉用）。"""
+    return store.record_dates(keyword=keyword.strip(), source=source.strip().lower())
 
 
 @app.get("/api/records/stats")
-def api_records_stats(keyword: str = "", source: str = ""):
+def api_records_stats(keyword: str = "", source: str = "", date: str = ""):
     """记录计数：各结论条数 + 总数 + 已人工复核数（不受结论筛选影响）。"""
-    return store.records_stats(keyword=keyword.strip(), source=source.strip().lower())
+    return store.records_stats(keyword=keyword.strip(), source=source.strip().lower(),
+                               date=date.strip())
+
+
+@app.post("/api/records/delete-batch")
+def api_records_delete_batch(body: dict):
+    """批量删除勾选的核查记录（{ids:[...]}）。"""
+    n = store.delete_records(body.get("ids") or [])
+    if not n:
+        raise HTTPException(400, "没有可删除的记录（请先勾选）")
+    return {"ok": True, "deleted": n}
 
 
 @app.post("/api/email-enrich")
@@ -503,13 +520,15 @@ def api_screenshot(path: str):
 # ---------- Excel 导出（SOP 输出物） ----------
 
 @app.get("/api/export")
-def api_export(conclusion: str = "通过", sheet: str = "", source: str = "", ids: str = ""):
+def api_export(conclusion: str = "通过", sheet: str = "", source: str = "",
+               ids: str = "", date: str = ""):
     """导出核查结果 Excel（12 列 + 数据源列 + 内嵌 smarty/街景/查重截图）。
 
     ids 可选：指定要导出的记录 id（逗号分隔，如 "178,180"）——此时忽略 conclusion
     与 source，按给定顺序导出（记录页「导出」按钮/勾选批量导出走这条）；
     sheet 可选：自定义 Sheet 名（如 "加洲 2000一个月"）；
-    source 可选：只导出某条线（loopnet / crexi）。
+    source 可选：只导出某条线（loopnet / crexi）；
+    date 可选：YYYY-MM-DD，只导该天创建的记录（按日期导出）。
     """
     picked = []
     for x in (ids or "").replace(" ", "").split(","):
@@ -523,12 +542,16 @@ def api_export(conclusion: str = "通过", sheet: str = "", source: str = "", id
         default_sheet = "核查记录" if len(recs) > 1 else "核查记录1条"
     else:
         src = source.strip().lower()
-        recs = [r for r in store.list_records(source=src) if r.get("conclusion") == conclusion]
+        d = date.strip()
+        recs = [r for r in store.list_records(source=src, date=d)
+                if r.get("conclusion") == conclusion]
         if not recs:
             who = {"crexi": "（Crexi 线）", "loopnet": "（LoopNet 线）"}.get(src, "")
-            raise HTTPException(404, f"没有结论为「{conclusion}」的核查记录{who}")
+            raise HTTPException(404, f"没有结论为「{conclusion}」的核查记录{who}"
+                                     f"（{d}）" if d else
+                                     f"没有结论为「{conclusion}」的核查记录{who}")
         recs.reverse()  # list_records 为倒序，导出按时间正序
-        default_sheet = f"核查{conclusion}记录"
+        default_sheet = f"核查{conclusion}记录" + (f" {d}" if d else "")
     path = excel_export.export_records(recs, sheet_name=sheet or default_sheet)
     return FileResponse(path, filename=Path(path).name,
                         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
