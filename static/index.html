@@ -218,7 +218,12 @@
           </div>
         </div>
         <div class="field" id="cityCheckField" style="display:none; grid-column:1/-1">
-          <label>城市勾选（点方框多选） <span id="cityPickHint" style="color:var(--accent);font-weight:600"></span></label>
+          <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap">
+            <label>城市勾选（点方框多选） <span id="cityPickHint" style="color:var(--accent);font-weight:600"></span></label>
+            <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
+              <input type="checkbox" id="cityAll" style="width:15px;height:15px;cursor:pointer">全选
+            </label>
+          </div>
           <div id="cityChecks" style="display:flex; flex-wrap:wrap; gap:6px 14px; max-height:180px;
                overflow-y:auto; border:1px solid var(--border); border-radius:8px; padding:10px 12px"></div>
         </div>
@@ -498,10 +503,20 @@ function buildCityChecks() {
   }).catch(() => {});
 }
 function updateCityPickHint() {
+  const all = $("#cityAll");
+  if (all) {                                     // 全选框跟随子项状态
+    const boxes = [...document.querySelectorAll(".cityChk")];
+    all.checked = boxes.length > 0 && boxes.every(b => b.checked);
+    all.indeterminate = !all.checked && boxes.some(b => b.checked);
+  }
   const n = [...document.querySelectorAll(".cityChk:checked")].length;
   const hint = $("#cityPickHint");
   if (hint) hint.textContent = n ? "已选 " + n + " 个" : "";
 }
+$("#cityAll") && ($("#cityAll").onchange = () => {
+  document.querySelectorAll(".cityChk").forEach(b => b.checked = $("#cityAll").checked);
+  updateCityPickHint();
+});
 
 /* ---------- 标签页 ---------- */
 document.querySelectorAll(".tab").forEach(t => t.onclick = () => {

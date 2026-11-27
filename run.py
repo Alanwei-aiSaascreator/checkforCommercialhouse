@@ -424,7 +424,7 @@ def api_task_start(body: dict):
     cities_in = body.get("cities") or []
     if not isinstance(cities_in, list):
         cities_in = [c.strip() for c in str(cities_in).split(",") if c.strip()]
-    cities_in = [str(c).strip() for c in cities_in if str(c).strip()][:100]
+    cities_in = [str(c).strip() for c in cities_in if str(c).strip()][:400]
     params = {
         "city": (body.get("city") or "").strip(),
         "state": (body.get("state") or "").strip().upper(),
