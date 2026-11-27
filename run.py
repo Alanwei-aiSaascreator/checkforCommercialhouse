@@ -185,6 +185,24 @@ def api_debug_last_task(tid: str = "", keyword: str = "交叉"):
             "tail": hist[:60]}
 
 
+@app.get("/api/state-cities/{state}")
+def api_state_cities(state: str):
+    """某州的全量城市清单（state_cities 缓存优先；缓存为空时前端已用内置短清单）。
+
+    超级轮次的勾选框用它展示全部可跑城市，而不只是内置的几个大城市。"""
+    from server import state_cities
+    code = (state or "").strip().upper()
+    if len(code) != 2 or not code.isalpha():
+        raise HTTPException(400, "州缩写不合法")
+    try:
+        cities = state_cities.discover(code)
+    except Exception:
+        cities = []
+    if not cities:
+        raise HTTPException(503, "该州城市清单尚未缓存且现场发现失败，稍后再试")
+    return {"state": code, "cities": cities}
+
+
 @app.get("/api/status")
 def api_status():
     """主任务与补充核查的运行状态（前端用它禁止任务进行中的人工判定）。
