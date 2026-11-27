@@ -269,6 +269,9 @@
           <div><div class="pg-label">预计剩余</div><div class="pg-val" id="pgEta">—</div></div>
         </div>
         <div class="pg-bar"><div class="pg-fill" id="pgFill"></div></div>
+        <div id="ocBreakerBar" style="display:none; margin-top:8px; padding:7px 12px;
+             border-radius:8px; background:#fff7e6; border:1px solid #f5c66b;
+             font-size:12px; color:#8a5b00"></div>
         <div class="pg-foot"><span id="pgFoot"></span><span id="pgRate"></span></div>
       </div>
 
@@ -592,6 +595,17 @@ function renderProgress(state) {
   }
 }
 
+/* OpenCorporates 熔断提示条（/api/status 每 3 秒带回最新状态） */
+function renderBreaker(bk) {
+  const bar = document.getElementById("ocBreakerBar");
+  if (!bar) return;
+  const on = bk && bk.cooling;
+  bar.style.display = on ? "block" : "none";
+  if (on) bar.textContent = "查重熔断中：OpenCorporates 连续失败 " + bk.consecutive_fails
+    + " 次，暂停查重 " + Math.ceil(bk.cooldown_left / 60) + " 分钟（候选仍会跑，"
+    + "只是这轮的查重先跳过），到期自动恢复。";
+}
+
 /* 每秒刷新已用时，每 3 秒拉一次服务端计数与工人状态 */
 function startTimers() {
   stopTimers();
@@ -619,6 +633,7 @@ async function refreshRunStatus() {
     stat.cityTotal = st.city_total || 0;
     stat.cityName = st.city_name || "";
     renderProgress("运行中");
+    renderBreaker(st.oc_breaker);
     const ws = st.workers || {};
     Object.keys(ws).forEach(k => {
       const wid = +k, w = ws[k], o = ensureWorker(wid);

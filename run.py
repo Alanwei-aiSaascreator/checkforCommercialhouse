@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from server import store
 from server import excel_export
 from server.steps import smarty
+from server.steps import opencorporates
 from server.pipeline import (FEEDS, RUNNERS, start_task, task_running, active_task,
                              recheck_status, recheck_steps_34)
 
@@ -209,7 +210,9 @@ def api_status():
             "city_name": getattr(runner, "city_name", "") or "",
             "workers": {str(k): v for k, v in (getattr(runner, "worker_stats", {}) or {}).items()},
             "recheck_running": st.get("running", False),
-            "recheck_record_id": st.get("record_id")}
+            "recheck_record_id": st.get("record_id"),
+            # 步骤4 OpenCorporates 熔断状态（冷却中前端可显示提示条）
+            "oc_breaker": opencorporates.breaker_status()}
 
 
 @app.post("/api/records/{record_id}/recheck34")

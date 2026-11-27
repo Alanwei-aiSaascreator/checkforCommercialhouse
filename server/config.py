@@ -24,12 +24,14 @@ SMARTY_DAILY_LIMIT = int(os.environ.get("SMARTY_DAILY_LIMIT", "1000000"))
 SMARTY_DEMO_KEY = os.environ.get("SMARTY_DEMO_KEY", "21102174564513388")
 SMARTY_DEMO_MINE = os.environ.get("SMARTY_DEMO_MINE", "1") not in ("0", "false", "False")
 
-# DeepSeek 视觉模型（OpenAI 兼容接口）
+# DeepSeek 视觉模型（OpenAI 兼容接口）。优先级：环境变量 > data/config.json > 内置默认。
 # 注意：实测 deepseek-v4-pro 不支持图像（返回 [Unsupported Image]），
 # deepseek-flash 支持图像输入；"deepseek-vision" 模型名不存在（会 400）。
+_DEEPSEEK_BASE_DEFAULT = "https://api.deepseek.com/v1"
+_DEEPSEEK_MODEL_DEFAULT = "deepseek-flash"
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-DEEPSEEK_VISION_MODEL = os.environ.get("DEEPSEEK_VISION_MODEL", "deepseek-flash")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "")
+DEEPSEEK_VISION_MODEL = os.environ.get("DEEPSEEK_VISION_MODEL", "")
 
 # OpenCorporates 查重阈值：同址注册公司数 ≤ 5 视为通过
 OPENCORPORATES_LIMIT = int(os.environ.get("OPENCORPORATES_LIMIT", "5"))
@@ -41,6 +43,13 @@ OC_MIN_GAP = float(os.environ.get("OC_MIN_GAP", "3"))
 
 # 单次查重等待结果页出数的最长秒数（遇到 Cloudflare 校验页会继续等它放行）
 OC_READ_TIMEOUT = float(os.environ.get("OC_READ_TIMEOUT", "60"))
+
+# 步骤4 熔断：OpenCorporates 彻底不可用（IP 被封/站点宕机）时，与其让超级轮次
+# 一条接一条地白跑失败（每条还烧 Smarty 额度），不如自动冷却再恢复。
+# 连续失败 OC_BREAKER_FAILS 次 → 暂停 OC_BREAKER_COOLDOWN 秒；期间查重直接返回
+# suspect（不上人工队列、不写失败档案），冷却到期自动恢复，成功 1 次即清零计数。
+OC_BREAKER_FAILS = int(os.environ.get("OC_BREAKER_FAILS", "8"))
+OC_BREAKER_COOLDOWN = float(os.environ.get("OC_BREAKER_COOLDOWN", "900"))
 
 # 邮箱旁路反查：不碰浏览器，用 姓名+公司 → 反查邮箱，写回 records.email。
 # 两个数据源二选一（都配了则优先 Apollo，一步到位不需要先查域名）：
@@ -68,9 +77,15 @@ def _load_config_json() -> None:
     except Exception:
         return
     global SMARTY_AUTH_ID, SMARTY_AUTH_TOKEN, DEEPSEEK_API_KEY, PROXY_URL, HUNTER_API_KEY, APOLLO_API_KEY
+    global DEEPSEEK_BASE_URL, DEEPSEEK_VISION_MODEL
     SMARTY_AUTH_ID = SMARTY_AUTH_ID or str(cfg.get("smarty_auth_id") or "")
     SMARTY_AUTH_TOKEN = SMARTY_AUTH_TOKEN or str(cfg.get("smarty_auth_token") or "")
     DEEPSEEK_API_KEY = DEEPSEEK_API_KEY or str(cfg.get("deepseek_api_key") or "")
+    # base_url / model：环境变量 > config.json > 内置默认（api.deepseek.com / deepseek-flash）
+    DEEPSEEK_BASE_URL = (DEEPSEEK_BASE_URL or str(cfg.get("deepseek_base_url") or "")
+                         or _DEEPSEEK_BASE_DEFAULT)
+    DEEPSEEK_VISION_MODEL = (DEEPSEEK_VISION_MODEL or str(cfg.get("deepseek_model") or "")
+                             or _DEEPSEEK_MODEL_DEFAULT)
     PROXY_URL = PROXY_URL or str(cfg.get("proxy_url") or "")
     HUNTER_API_KEY = HUNTER_API_KEY or str(cfg.get("hunter_api_key") or "")
     APOLLO_API_KEY = APOLLO_API_KEY or str(cfg.get("apollo_api_key") or "")

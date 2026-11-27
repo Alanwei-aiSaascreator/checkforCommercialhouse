@@ -71,6 +71,77 @@ _VERIFY_HINTS = ("couldn't confirm your browser", "hasn't been verified yet",
 _OC_RUN_LOCK = threading.Lock()
 _OC_LAST = [0.0]
 
+# 熔断（详见 config.OC_BREAKER_*）：站点/IP 被彻底封掉时，连续失败 N 次就进入
+# 冷却期，期间查重直接返回 suspect，不再白跑；冷却到期自动恢复。
+# 字典用 list 包一层以便无锁读快照；_breaker_lock 保护计数与状态翻转。
+_breaker_lock = threading.Lock()
+_breaker = {"fails": 0, "until": 0.0, "opened_at": 0.0, "cooldown_s": 0.0}
+
+
+def breaker_status() -> dict:
+    """给前端 /api/status 展示：是否冷却中、还剩几秒、已连续失败几次。"""
+    if not int(getattr(config, "OC_BREAKER_FAILS", 8) or 0):
+        return {"cooling": False, "cooldown_left": 0, "cooldown_s": 0,
+                "consecutive_fails": 0, "threshold": 0}
+    with _breaker_lock:
+        b = dict(_breaker)
+    remain = b["until"] - time.time()
+    return {"cooling": remain > 0, "cooldown_left": max(0, int(remain)),
+            "cooldown_s": int(b.get("cooldown_s") or 0),
+            "consecutive_fails": b["fails"],
+            "threshold": int(getattr(config, "OC_BREAKER_FAILS", 8) or 8)}
+
+
+def _breaker_check() -> str:
+    """进入 check_duplicates 时先看：冷却中返回提示文案，正常返回空串。
+
+    注意这里**不持 _OC_RUN_LOCK**——冷却判断不能排队等前一个查询跑完，
+    否则 6 个工人会把熔断空转拖成串行长队。
+    """
+    if not int(getattr(config, "OC_BREAKER_FAILS", 8) or 0):
+        return ""
+    with _breaker_lock:
+        b = dict(_breaker)
+    remain = b["until"] - time.time()
+    if remain <= 0:
+        return ""
+    return (f"OpenCorporates 连续失败 {b['fails']} 次已熔断，"
+            f"冷却中还剩 {int(remain)} 秒（到期自动恢复）")
+
+
+def _breaker_on_success() -> None:
+    """成功拿到公司数：网络/站点是好的，清零连续失败计数。"""
+    if not int(getattr(config, "OC_BREAKER_FAILS", 8) or 0):
+        return
+    with _breaker_lock:
+        _breaker["fails"] = 0
+
+
+def _breaker_on_fail(msg: str = "") -> None:
+    """本次查重彻底失败（重试过仍拿不到数）：累计；达到阈值触发熔断冷却。
+
+    只告警一次（熔断刚打开的那一刻），之后冷却期内的失败不再刷屏。
+    冷却到期后首个请求会真的去探路，成功则清零，失败则立即重新熔断。
+    """
+    threshold = int(getattr(config, "OC_BREAKER_FAILS", 8) or 0)
+    if threshold <= 0:
+        return
+    cooldown = float(getattr(config, "OC_BREAKER_COOLDOWN", 900) or 900)
+    with _breaker_lock:
+        prev = dict(_breaker)
+        if prev["until"] - time.time() > 0:
+            _breaker["fails"] = prev["fails"] + 1   # 冷却期内只涨计数（供观测）
+            return
+        fails = prev["fails"] + 1
+        if fails < threshold:
+            _breaker["fails"] = fails
+            return
+        _breaker.update({"fails": fails, "opened_at": time.time(),
+                         "until": time.time() + cooldown,
+                         "cooldown_s": cooldown})
+    print(f"[OC熔断] 连续失败 {fails} 次（{msg[:60]}），暂停查重 {int(cooldown)} 秒后自动恢复",
+          flush=True)
+
 
 def _throttle() -> None:
     """两次查重之间至少间隔 OC_MIN_GAP 秒（必须在持 _OC_RUN_LOCK 时调用）。"""
@@ -381,6 +452,11 @@ def check_duplicates(address: str, tag: str = "oc") -> dict:
         return {"status": "fail", "screenshot": "",
                 "message": f"Found {hit} companies > {limit}，同址注册公司过多（同址缓存）"}
 
+    # 熔断冷却中：不再真的去打站点（也省下 Smarty 等上游步骤的无效消耗）
+    cooling = _breaker_check()
+    if cooling:
+        return {"status": "suspect", "screenshot": "", "message": cooling}
+
     n, shot, msg = None, "", ""
     # 全局串行（见文件头：多工人并发会被 Cloudflare 打成"结果页不出数"）
     with _OC_RUN_LOCK:
@@ -394,9 +470,11 @@ def check_duplicates(address: str, tag: str = "oc") -> dict:
                 time.sleep(random.uniform(2.0, 4.0))
 
     if n is None:
+        _breaker_on_fail(msg)
         return {"status": "suspect", "screenshot": shot or "",
                 "message": msg or "OpenCorporates 结果页未解析到注册公司数"}
 
+    _breaker_on_success()
     _cache_put(key, n)
     if n <= limit:
         return {"status": "pass", "screenshot": shot or "",
