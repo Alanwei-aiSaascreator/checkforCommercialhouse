@@ -820,7 +820,8 @@ def smarty_cache_put(address_norm: str, status: str, standard: str = "") -> None
 def backfill_standard_addresses() -> dict:
     """把 Smarty 绿卡里已保存的 USPS 标准地址回填到 records.address。
 
-    只取 smarty_cache.status='pass' 且 standard 非空的记录，按 address_norm 对应；
+    只处理最终结论为「通过」的核查记录，且只取 smarty_cache.status='pass'
+    且 standard 非空的记录，按 address_norm 对应；
     故意不改 address_norm —— 它是楼栋级去重和 Smarty 缓存 key，必须继续指向原始挂牌地址。
     可重复执行：已经一致的行会跳过。
     """
@@ -831,7 +832,8 @@ def backfill_standard_addresses() -> dict:
                 """SELECT r.id, r.address, c.standard
                      FROM records r
                      JOIN smarty_cache c ON c.address_norm = r.address_norm
-                    WHERE c.status='pass' AND IFNULL(c.standard,'') != ''
+                    WHERE r.conclusion='通过'
+                      AND c.status='pass' AND IFNULL(c.standard,'') != ''
                       AND IFNULL(r.address,'') != c.standard"""
             ).fetchall()
             for row in rows:

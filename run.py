@@ -290,7 +290,7 @@ def api_history_clear(body: dict):
 
 @app.post("/api/history/backfill-standard-addresses")
 def api_history_backfill_standard_addresses():
-    """把 Smarty 绿卡里已保存的 USPS 标准地址回填到记录地址（幂等，可重复执行）。"""
+    """把 Smarty 绿卡里已保存的 USPS 标准地址回填到「通过」记录（幂等，可重复执行）。"""
     return {"ok": True, **store.backfill_standard_addresses()}
 
 
@@ -311,13 +311,14 @@ def _addr_correct_snapshot() -> dict:
 
 
 def _addr_correct_worker() -> None:
-    """逐条调用 Smarty 拿 USPS 标准地址并写回 records.address。
+    """逐条调用 Smarty 拿 USPS 标准地址并写回「通过」记录的 address。
 
-    保留 address_norm 原值，楼栋去重/缓存 key 不受影响；遇到 402/额度耗尽立即停，
-    避免几百条记录继续白跑。
+    只处理核查成功记录；保留 address_norm 原值，楼栋去重/缓存 key 不受影响；
+    遇到 402/额度耗尽立即停，避免几百条记录继续白跑。
     """
     try:
-        recs = store.list_records()
+        # 只纠正最终核查成功的记录（结论「通过」），不碰淘汰/未完成记录
+        recs = store.list_records(conclusion="通过")
         with _addr_correct_lock:
             _addr_correct_job["total"] = len(recs)
         for rec in recs:
@@ -357,7 +358,7 @@ def _addr_correct_worker() -> None:
 
 @app.post("/api/history/correct-addresses")
 def api_history_correct_addresses():
-    """启动一键纠正全部核查记录地址（后台任务，立即返回进度句柄）。"""
+    """启动一键纠正核查成功（通过）记录地址（后台任务，立即返回进度句柄）。"""
     with _addr_correct_lock:
         if _addr_correct_job["running"]:
             raise HTTPException(409, "地址纠正任务正在运行")
