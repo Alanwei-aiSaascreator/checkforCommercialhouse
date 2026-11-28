@@ -287,6 +287,12 @@ def api_history_clear(body: dict):
     return {"ok": True, **out}
 
 
+@app.post("/api/history/backfill-standard-addresses")
+def api_history_backfill_standard_addresses():
+    """把 Smarty 绿卡里已保存的 USPS 标准地址回填到记录地址（幂等，可重复执行）。"""
+    return {"ok": True, **store.backfill_standard_addresses()}
+
+
 # ---------- 调试 ----------
 
 @app.post("/api/debug/mine-suites")

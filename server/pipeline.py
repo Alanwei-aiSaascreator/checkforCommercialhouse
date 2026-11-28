@@ -994,6 +994,14 @@ class TaskRunner:
             self.emit(f"步骤2结果：{r2['message']}", "pass" if r2["status"] == "pass" else ("error" if r2["status"] == "fail" else "warn"))
             store.update_record(record_id, step2=f"{r2['status']}：{r2['message']}", screenshots=[s for s in shots if s])
 
+            # 列表/Excel 一律显示 Smarty 绿卡里的 USPS 标准地址；
+            # address_norm 保持原始挂牌地址的楼栋归一键，避免重复查 Smarty / 破坏去重。
+            std_addr = r2.get("standard_address") or ""
+            if std_addr and std_addr != addr:
+                addr = std_addr
+                store.set_record_display_address(record_id, addr)
+                self.emit(f"采用 Smarty 标准化地址：{addr}")
+
             # 额度耗尽：停止任务而不是逐个淘汰
             if r2["status"] == "quota":
                 store.update_record(record_id, conclusion="不通过", notes="Smarty 额度耗尽，未完成验证")
@@ -1054,8 +1062,9 @@ class TaskRunner:
                     # 避免"结论通过但截图显示未通过"的困惑；房源照片保留
                     smarty_card = [s for s in shots if "smarty" in s.lower()][-1:]
                     shots = smarty_card + [p for p in photos[:3] if p]
-                    store.update_record(record_id, address=addr,
+                    store.update_record(record_id,
                                         step2="pass：Suite 级地址双绿通过", screenshots=shots)
+                    store.set_record_display_address(record_id, addr)
                     r2 = {"status": "pass", "message": "Suite 地址双绿", "standard_address": ""}
                 else:
                     if self.stopped:

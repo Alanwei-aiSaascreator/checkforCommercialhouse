@@ -356,6 +356,23 @@ def update_record(record_id: int, **fields) -> None:
             con.close()
 
 
+def set_record_display_address(record_id: int, address: str) -> None:
+    """只改 records.address（列表/导出显示的 USPS 标准地址），不动 address_norm。
+
+    address_norm 是楼栋级去重和 Smarty 缓存的 key，必须继续指向原始挂牌地址，
+    否则换成标准地址后会再次调用 Smarty、也会破坏既有去重结果。
+    """
+    if not address:
+        return
+    with _lock:
+        con = _con()
+        try:
+            con.execute("UPDATE records SET address=? WHERE id=?", (address, record_id))
+            con.commit()
+        finally:
+            con.close()
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict:
     d = dict(row)
     try:
@@ -796,6 +813,36 @@ def smarty_cache_put(address_norm: str, status: str, standard: str = "") -> None
                 " VALUES (?,?,?,?)",
                 (address_norm, status, standard, datetime.now().isoformat(timespec="seconds")))
             con.commit()
+        finally:
+            con.close()
+
+
+def backfill_standard_addresses() -> dict:
+    """把 Smarty 绿卡里已保存的 USPS 标准地址回填到 records.address。
+
+    只取 smarty_cache.status='pass' 且 standard 非空的记录，按 address_norm 对应；
+    故意不改 address_norm —— 它是楼栋级去重和 Smarty 缓存 key，必须继续指向原始挂牌地址。
+    可重复执行：已经一致的行会跳过。
+    """
+    with _lock:
+        con = _con()
+        try:
+            rows = con.execute(
+                """SELECT r.id, r.address, c.standard
+                     FROM records r
+                     JOIN smarty_cache c ON c.address_norm = r.address_norm
+                    WHERE c.status='pass' AND IFNULL(c.standard,'') != ''
+                      AND IFNULL(r.address,'') != c.standard"""
+            ).fetchall()
+            for row in rows:
+                con.execute("UPDATE records SET address=? WHERE id=?",
+                            (row["standard"], row["id"]))
+            con.commit()
+            return {
+                "updated": len(rows),
+                "samples": [{"id": r["id"], "from": r["address"], "to": r["standard"]}
+                            for r in rows[:5]],
+            }
         finally:
             con.close()
 
