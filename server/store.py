@@ -12,6 +12,58 @@ from . import config
 
 _lock = threading.Lock()
 
+# ID 表达式最多展开多少个 ID，避免误输入超大范围拖垮页面/导出。
+_ID_EXPR_LIMIT = 100000
+
+
+def parse_id_expression(expr: str) -> list[int]:
+    """解析记录 ID 表达式：逗号/空格分隔，支持 "1-100"、"1,3,5-8"。
+
+    范围两端可倒写（100-1 会按 1-100 处理）；重复 ID 去重并保持出现顺序。
+    非法片段直接抛 ValueError，交给接口层转 400，避免静默漏选。
+    """
+    out: list[int] = []
+    seen: set[int] = set()
+    for part in re.split(r"[,，\s]+", str(expr or "").strip()):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)\s*[-~—至]\s*(\d+)", part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a > b:
+                a, b = b, a
+            if b - a + 1 > _ID_EXPR_LIMIT:
+                raise ValueError(f"ID 范围 {part} 超过 {_ID_EXPR_LIMIT} 条上限")
+            values = range(a, b + 1)
+        elif part.isdigit():
+            values = (int(part),)
+        else:
+            raise ValueError(f"无法识别的 ID：{part}（示例：1-100 或 1,3,5-8）")
+        for v in values:
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+    if len(out) > _ID_EXPR_LIMIT:
+        raise ValueError(f"ID 数量超过 {_ID_EXPR_LIMIT} 条上限")
+    return out
+
+
+def _compact_record_ids(con: sqlite3.Connection) -> None:
+    """把 records.id 连续重排为 1..N（调用方必须已持有 _lock 并处于同一事务）。
+
+    两阶段更新，先挪到负数临时 ID，避免 UPDATE 到尚未腾空的 id 撞主键。
+    同步重置 sqlite_sequence，保证下一条新记录从 N+1 开始。
+    """
+    rows = con.execute("SELECT id FROM records ORDER BY id").fetchall()
+    moves = [(row["id"], new) for new, row in enumerate(rows, 1) if row["id"] != new]
+    for old, new in moves:
+        con.execute("UPDATE records SET id=? WHERE id=?", (-new, old))
+    for old, new in moves:
+        con.execute("UPDATE records SET id=? WHERE id=?", (new, -new))
+    con.execute("DELETE FROM sqlite_sequence WHERE name='records'")
+    con.execute("INSERT INTO sqlite_sequence(name, seq) VALUES('records', ?)", (len(rows),))
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -411,19 +463,25 @@ def get_record(record_id: int):
 
 
 def delete_record(record_id: int) -> bool:
-    with _lock:
-        con = _con()
-        try:
-            cur = con.execute("DELETE FROM records WHERE id=?", (record_id,))
-            con.commit()
-            return cur.rowcount > 0
-        finally:
-            con.close()
+    """删除单条记录；和批量删除一样，删除后把剩余 ID 连续递补。"""
+    return delete_records([record_id]) > 0
 
 
 def delete_records(ids: list) -> int:
-    """按 id 批量删除核查记录（记录页「删除选中」用）。返回实际删除条数。"""
-    ids = [int(i) for i in (ids or []) if str(i).strip().lstrip("-").isdigit()]
+    """按 id 批量删除核查记录（记录页「删除选中」用）。返回实际删除条数。
+
+    删除和 ID 递补在同一个事务/同一把锁里完成：大 ID 往小 ID 补，
+    剩余记录始终保持 1..N 连续，下一条新增记录从 N+1 开始。
+    """
+    raw_ids = ids or []
+    ids, seen = [], set()
+    for item in raw_ids:
+        s = str(item).strip()
+        if s.isdigit():
+            v = int(s)
+            if v > 0 and v not in seen:
+                seen.add(v)
+                ids.append(v)
     if not ids:
         return 0
     marks = ",".join("?" * len(ids))
@@ -431,8 +489,11 @@ def delete_records(ids: list) -> int:
         con = _con()
         try:
             cur = con.execute(f"DELETE FROM records WHERE id IN ({marks})", ids)
+            deleted = cur.rowcount
+            if deleted:
+                _compact_record_ids(con)
             con.commit()
-            return cur.rowcount
+            return deleted
         finally:
             con.close()
 
