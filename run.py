@@ -17,6 +17,7 @@
   GET  /api/export?conclusion=导出核查结果 Excel（默认"通过"，12 列内嵌截图）
 """
 import asyncio
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -291,6 +292,97 @@ def api_history_clear(body: dict):
 def api_history_backfill_standard_addresses():
     """把 Smarty 绿卡里已保存的 USPS 标准地址回填到记录地址（幂等，可重复执行）。"""
     return {"ok": True, **store.backfill_standard_addresses()}
+
+
+# ---------- 批量纠正地址（调用 Smarty，后台任务） ----------
+
+_addr_correct_lock = threading.Lock()
+_addr_correct_job = {
+    "running": False, "finished": False, "stop": False,
+    "total": 0, "done": 0, "corrected": 0, "cached": 0, "failed": 0,
+    "error": "", "samples": [],
+}
+
+
+def _addr_correct_snapshot() -> dict:
+    with _addr_correct_lock:
+        return {k: (list(v) if isinstance(v, list) else v)
+                for k, v in _addr_correct_job.items()}
+
+
+def _addr_correct_worker() -> None:
+    """逐条调用 Smarty 拿 USPS 标准地址并写回 records.address。
+
+    保留 address_norm 原值，楼栋去重/缓存 key 不受影响；遇到 402/额度耗尽立即停，
+    避免几百条记录继续白跑。
+    """
+    try:
+        recs = store.list_records()
+        with _addr_correct_lock:
+            _addr_correct_job["total"] = len(recs)
+        for rec in recs:
+            with _addr_correct_lock:
+                if _addr_correct_job["stop"]:
+                    break
+            res = smarty.standardize_address(rec.get("address") or "",
+                                             tag=f"r{rec['id']}")
+            if res.get("status") == "quota":
+                with _addr_correct_lock:
+                    _addr_correct_job["error"] = res.get("message") or "Smarty 额度/订阅不可用"
+                break
+            std = res.get("standard") or ""
+            if std and std != (rec.get("address") or ""):
+                store.set_record_display_address(rec["id"], std)
+                with _addr_correct_lock:
+                    _addr_correct_job["corrected"] += 1
+                    if len(_addr_correct_job["samples"]) < 8:
+                        _addr_correct_job["samples"].append(
+                            {"id": rec["id"], "from": rec.get("address") or "", "to": std})
+            elif res.get("cached"):
+                with _addr_correct_lock:
+                    _addr_correct_job["cached"] += 1
+            else:
+                with _addr_correct_lock:
+                    _addr_correct_job["failed"] += 1
+            with _addr_correct_lock:
+                _addr_correct_job["done"] += 1
+    except Exception as e:
+        with _addr_correct_lock:
+            _addr_correct_job["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        with _addr_correct_lock:
+            _addr_correct_job["running"] = False
+            _addr_correct_job["finished"] = True
+
+
+@app.post("/api/history/correct-addresses")
+def api_history_correct_addresses():
+    """启动一键纠正全部核查记录地址（后台任务，立即返回进度句柄）。"""
+    with _addr_correct_lock:
+        if _addr_correct_job["running"]:
+            raise HTTPException(409, "地址纠正任务正在运行")
+        _addr_correct_job.update({
+            "running": True, "finished": False, "stop": False,
+            "total": 0, "done": 0, "corrected": 0, "cached": 0, "failed": 0,
+            "error": "", "samples": [],
+        })
+        threading.Thread(target=_addr_correct_worker, daemon=True,
+                         name="address-correct").start()
+    return _addr_correct_snapshot()
+
+
+@app.get("/api/history/correct-addresses/status")
+def api_history_correct_addresses_status():
+    """查询一键纠正地址任务进度。"""
+    return _addr_correct_snapshot()
+
+
+@app.post("/api/history/correct-addresses/stop")
+def api_history_correct_addresses_stop():
+    """请求停止一键纠正地址任务（当前这条处理完后停）。"""
+    with _addr_correct_lock:
+        _addr_correct_job["stop"] = True
+    return {"ok": True}
 
 
 # ---------- 调试 ----------

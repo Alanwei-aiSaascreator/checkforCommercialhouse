@@ -198,6 +198,66 @@ def _suffix_changed(address: str, components: dict) -> str:
     return ""
 
 
+def standardize_address(address: str, tag: str = "smarty") -> dict:
+    """只拿 USPS 标准地址，不渲染截图、不写记录——批量纠正地址用。
+
+    返回 {status, standard, cached, message}。status 与 verify_address 对齐：
+    pass / missing / fail / suspect / quota。缓存命中的标准地址直接复用，不耗额度。
+    """
+    norm = store.normalize(address)
+    cached = store.smarty_cache_get(norm)
+    if cached and cached.get("standard"):
+        return {"status": cached.get("status") or "pass", "standard": cached["standard"],
+                "cached": True, "message": "Smarty 缓存命中（未耗额度）"}
+
+    if not (config.SMARTY_AUTH_ID and config.SMARTY_AUTH_TOKEN):
+        return {"status": "suspect", "standard": "", "cached": False,
+                "message": "未配置 Smarty 密钥（SMARTY_AUTH_ID / SMARTY_AUTH_TOKEN）"}
+    if store.quota_today() >= config.SMARTY_DAILY_LIMIT:
+        return {"status": "quota", "standard": "", "cached": False,
+                "message": _quota_message()}
+
+    try:
+        r = _smarty_query(address)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 402:
+            detail = (e.response.text or "").strip()[:300]
+            return {"status": "quota", "standard": "", "cached": False,
+                    "message": f"Smarty 返回 402（账号订阅/额度不可用）：{detail}"}
+        if e.response.status_code == 401:
+            return {"status": "suspect", "standard": "", "cached": False,
+                    "message": "Smarty 认证失败（401），请检查密钥"}
+        return {"status": "suspect", "standard": "", "cached": False,
+                "message": f"Smarty API 请求失败: {e}"}
+    except Exception as e:
+        return {"status": "suspect", "standard": "", "cached": False,
+                "message": f"Smarty API 请求异常: {e}"}
+
+    store.quota_incr()
+    if not r:
+        store.smarty_cache_put(norm, "fail")
+        return {"status": "fail", "standard": "", "cached": False,
+                "message": "Smarty 无返回候选"}
+
+    analysis = r.get("analysis") or {}
+    dpv = analysis.get("dpv_match_code") or analysis.get("dpv_match", "")
+    fn = analysis.get("dpv_footnotes") or ""
+    foot = ",".join(fn) if isinstance(fn, list) else str(fn)
+    comp = r.get("components") or {}
+    city = (comp.get("city_name") or comp.get("default_city_name")
+            or comp.get("city") or "")
+    state = (comp.get("state_abbreviation") or comp.get("state") or "")
+    zipcode = comp.get("zipcode", "") + (f"-{comp['plus4_code']}" if comp.get("plus4_code") else "")
+    standard = f"{r.get('delivery_line_1', '')}, {city} {state} {zipcode}".strip(" ,")
+
+    status = ("pass" if dpv in ("Y", "S") else
+              "missing" if dpv == "D" or "N1" in foot.upper() else "fail")
+    if status in ("pass", "missing"):
+        store.smarty_cache_put(norm, status, standard)
+    return {"status": status, "standard": standard, "cached": False,
+            "message": f"dpv={dpv or 'N'} footnotes={foot or '无'}"}
+
+
 def verify_address(address: str, tag: str = "smarty") -> dict:
     norm = store.normalize(address)
 

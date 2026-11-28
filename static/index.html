@@ -333,6 +333,8 @@
           <span id="recIdPickInfo" style="font-size:12px;color:var(--muted)"></span>
           <button class="btn sm" id="exportPickedBtn">导出选中</button>
           <button class="btn sm red" id="deletePickedBtn">删除选中</button>
+          <button class="btn sm" id="correctAddressesBtn" title="调用 Smarty 一次性纠正全部核查记录地址">批量纠正地址</button>
+          <span id="addrCorrectInfo" style="font-size:12px;color:var(--muted)"></span>
           <button class="btn sm" id="exportBtn">导出Excel（通过记录）</button>
           <button class="btn sm red" id="clearHistoryBtn">清空历史</button>
         </div>
@@ -926,6 +928,34 @@ $("#deletePickedBtn").onclick = async () => {
   clearRecIdPicked();
   loadRecords();
   refreshRecBadge();
+};
+/* 一键调用 Smarty 批量纠正全部核查记录地址（后台任务 + 进度轮询） */
+let addrCorrectTimer = null;
+$("#correctAddressesBtn").onclick = async () => {
+  if (!confirm("确认调用 Smarty 一次性纠正全部核查记录地址？\n会按 Smarty 实际用量计费；遇到 402/额度耗尽会自动停止。")) return;
+  const r = await fetch("/api/history/correct-addresses", {method: "POST"});
+  if (!r.ok) return alert((await r.json().catch(() => ({}))).detail || "启动失败");
+  const d = await r.json();
+  const info = $("#addrCorrectInfo");
+  if (info) info.textContent = `正在纠正 0/${d.total} · 已改 0 条`;
+  if (addrCorrectTimer) clearInterval(addrCorrectTimer);
+  addrCorrectTimer = setInterval(async () => {
+    try {
+      const s = await (await fetch("/api/history/correct-addresses/status")).json();
+      if (info) info.textContent = s.running
+        ? `正在纠正 ${s.done}/${s.total} · 已改 ${s.corrected} 条`
+        : `完成：处理 ${s.done}/${s.total}，纠正 ${s.corrected} 条${s.error ? " · " + s.error : ""}`;
+      if (!s.running) {
+        clearInterval(addrCorrectTimer); addrCorrectTimer = null;
+        alert(`地址纠正完成：处理 ${s.done}/${s.total} 条，纠正 ${s.corrected} 条`
+              + (s.error ? `\n中断原因：${s.error}` : ""));
+        loadRecords();
+      }
+    } catch (e) {
+      clearInterval(addrCorrectTimer); addrCorrectTimer = null;
+      if (info) info.textContent = "进度查询失败";
+    }
+  }, 2000);
 };
 /* 按日期筛选里选中的日期勾选（不是字面意义的“今天”） */
 $("#pickTodayBtn").onclick = () => {
